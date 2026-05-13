@@ -1,6 +1,6 @@
-use axum::{extract::State, response::Json, routing::get, Router};
-use models::common::{ModelInfo, ModelList};
 use crate::state::AppState;
+use axum::{Router, extract::State, response::Json, routing::get};
+use models::common::{ModelInfo, ModelList};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -16,7 +16,10 @@ async fn list_models(State(_state): State<AppState>) -> Json<ModelList> {
     })
 }
 
-async fn get_model(State(_state): State<AppState>, axum::extract::Path(_model_id): axum::extract::Path<String>) -> Json<ModelInfo> {
+async fn get_model(
+    State(_state): State<AppState>,
+    axum::extract::Path(_model_id): axum::extract::Path<String>,
+) -> Json<ModelInfo> {
     Json(ModelInfo {
         id: "placeholder".into(),
         object: "model".into(),

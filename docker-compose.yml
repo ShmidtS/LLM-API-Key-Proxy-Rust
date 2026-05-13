@@ -1,0 +1,18 @@
+services:
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      RUST_LOG: ${RUST_LOG:-proxy_app=info,tower_http=info}
+    volumes:
+      - proxy-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  proxy-data:

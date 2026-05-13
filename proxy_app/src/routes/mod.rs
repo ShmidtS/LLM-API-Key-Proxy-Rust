@@ -1,3 +1,14 @@
+pub mod admin;
+pub mod agents;
+pub mod anthropic;
+pub mod audio;
+pub mod batches;
 pub mod chat;
+pub mod embeddings;
+pub mod files;
 pub mod health;
+pub mod images;
 pub mod models;
+pub mod moderation;
+pub mod tools;
+pub mod video;

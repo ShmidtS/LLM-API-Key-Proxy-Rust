@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 rotator = { path = "../crates/rotator" }
 models = { path = "../crates/models" }
-config = { path = "../crates/config" }
+proxy_config = { path = "../crates/config" }
 axum = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }

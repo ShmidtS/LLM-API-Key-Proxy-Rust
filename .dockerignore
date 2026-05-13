@@ -1,0 +1,16 @@
+target/
+.git/
+.gitignore
+.omc/
+.claude/
+*.md
+Dockerfile
+docker-compose*.yml
+.env
+.env.*
+data/
+*.log
+*.tmp
+.cache/
+.vscode/
+.idea/

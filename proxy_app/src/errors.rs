@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use models::common::{ApiError, ErrorResponse};
 
@@ -22,7 +22,10 @@ impl IntoResponse for AppError {
             AppError::NotFound => (StatusCode::NOT_FOUND, "Not found".into()),
             AppError::Internal(msg) => {
                 tracing::error!("internal error: {}", msg);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".into())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal server error".into(),
+                )
             }
             AppError::Rotator(e) => {
                 tracing::error!("rotator error: {}", e);

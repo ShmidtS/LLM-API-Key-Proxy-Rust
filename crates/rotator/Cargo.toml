@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 models = { path = "../models" }
-config = { path = "../config" }
+proxy_config = { path = "../config" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

@@ -6,7 +6,7 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum ConfigError {
     #[error("failed to load config: {0}")]
-    Load(#[from] config::ConfigError),
+    Load(#[from] external_config::ConfigError),
     #[error("env file not found: {0}")]
     EnvFile(String),
 }
@@ -15,8 +15,8 @@ pub fn load_from_env() -> Result<proxy::ProxyConfig, ConfigError> {
     if Path::new(".env").exists() {
         let _ = dotenvy::from_path(".env");
     }
-    let cfg = config::Config::builder()
-        .add_source(config::Environment::default().separator("__"))
+    let cfg = external_config::Config::builder()
+        .add_source(external_config::Environment::default().separator("__"))
         .build()?;
     Ok(cfg.try_deserialize()?)
 }

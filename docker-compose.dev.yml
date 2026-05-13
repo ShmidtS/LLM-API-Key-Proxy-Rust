@@ -1,0 +1,7 @@
+services:
+  proxy:
+    environment:
+      RUST_LOG: ${RUST_LOG:-proxy_app=debug,tower_http=debug}
+      RUST_BACKTRACE: ${RUST_BACKTRACE:-1}
+    volumes:
+      - ./data:/app/data

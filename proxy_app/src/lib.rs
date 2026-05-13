@@ -19,9 +19,25 @@ pub fn build_app() -> axum::Router {
         .expose_headers(Any);
 
     axum::Router::new()
-        .route("/", axum::routing::get(|| async { axum::Json(serde_json::json!({"Status": "API Key Proxy is running"})) }))
+        .route(
+            "/",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"Status": "API Key Proxy is running"}))
+            }),
+        )
         .merge(routes::chat::router())
+        .merge(routes::embeddings::router())
+        .merge(routes::anthropic::router())
         .merge(routes::models::router())
+        .merge(routes::files::router())
+        .merge(routes::batches::router())
+        .merge(routes::admin::router())
+        .merge(routes::tools::router())
+        .merge(routes::agents::router())
+        .merge(routes::audio::router())
+        .merge(routes::images::router())
+        .merge(routes::video::router())
+        .merge(routes::moderation::router())
         .layer(cors)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
