@@ -1,0 +1,28 @@
+/target
+**/*.rs.bk
+Cargo.lock
+dist/
+*.log
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Agentic tools
+.omc/
+.memorious/
+context_portal/
+
+oauth_creds/
+.vscode/
+.serena/
+AGENTS.md
+tests/
+context-mode/
+CONTEXT.md
+superpowers/
