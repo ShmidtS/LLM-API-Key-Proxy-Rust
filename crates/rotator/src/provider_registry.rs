@@ -495,16 +495,14 @@ fn provider_display_name(id: &str) -> String {
 
 fn provider_endpoints(id: &str) -> Vec<String> {
     let endpoints = match id {
-        "openai" => [
-            "/chat/completions",
-            "/embeddings",
-            "/images/generations",
-        ]
-        .as_slice(),
+        "openai" => ["/chat/completions", "/embeddings", "/images/generations"].as_slice(),
         _ => ["/chat/completions"].as_slice(),
     };
 
-    endpoints.iter().map(|endpoint| (*endpoint).to_owned()).collect()
+    endpoints
+        .iter()
+        .map(|endpoint| (*endpoint).to_owned())
+        .collect()
 }
 
 fn provider_features(id: &str) -> Vec<String> {
@@ -514,7 +512,10 @@ fn provider_features(id: &str) -> Vec<String> {
         _ => ["chat", "streaming"].as_slice(),
     };
 
-    features.iter().map(|feature| (*feature).to_owned()).collect()
+    features
+        .iter()
+        .map(|feature| (*feature).to_owned())
+        .collect()
 }
 
 #[cfg(test)]

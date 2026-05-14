@@ -23,6 +23,8 @@ oauth_creds/
 .serena/
 AGENTS.md
 tests/
+!proxy_app/tests/
+!proxy_app/tests/foundation_parity_test.rs
 context-mode/
 CONTEXT.md
 superpowers/

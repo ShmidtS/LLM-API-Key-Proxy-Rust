@@ -8,11 +8,12 @@ license.workspace = true
 [dependencies]
 rotator = { path = "../crates/rotator" }
 models = { path = "../crates/models" }
-proxy_config = { path = "../crates/config" }
+proxy_config = { package = "config", path = "../crates/config" }
 axum = { workspace = true }
 tokio = { workspace = true }
-tower = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 tower-http = { workspace = true }
+uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

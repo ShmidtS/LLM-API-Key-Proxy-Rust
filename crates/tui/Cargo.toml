@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 rotator = { path = "../rotator" }
-proxy_config = { path = "../config" }
+proxy_config = { package = "config", path = "../config" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 ratatui = { workspace = true }

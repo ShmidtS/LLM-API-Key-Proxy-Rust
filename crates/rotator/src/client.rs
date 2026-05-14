@@ -220,6 +220,54 @@ impl RotatorClient {
         result.map_err(|e| RotatorError::Http(e.to_string()))
     }
 
+    pub async fn get_with_query(
+        &self,
+        provider: &str,
+        path: &str,
+        query: &[(String, String)],
+    ) -> Result<reqwest::Response> {
+        let cred = self
+            .credentials
+            .acquire_least_loaded(provider)
+            .ok_or_else(|| RotatorError::NoCredentials(provider.to_string()))?;
+        let permit = CredentialPermit::new(self.credentials.clone(), provider, cred.key.clone());
+
+        let client = self.http_pool.get_or_create(provider);
+        let url = format!(
+            "{}/{}",
+            self.resolve_base_url(provider),
+            path.trim_start_matches('/')
+        );
+        let request = self.apply_auth_headers(provider, client.get(&url), permit.key());
+        let result = request.query(query).send().await;
+
+        result.map_err(|e| RotatorError::Http(e.to_string()))
+    }
+
+    pub async fn delete_with_query(
+        &self,
+        provider: &str,
+        path: &str,
+        query: &[(String, String)],
+    ) -> Result<reqwest::Response> {
+        let cred = self
+            .credentials
+            .acquire_least_loaded(provider)
+            .ok_or_else(|| RotatorError::NoCredentials(provider.to_string()))?;
+        let permit = CredentialPermit::new(self.credentials.clone(), provider, cred.key.clone());
+
+        let client = self.http_pool.get_or_create(provider);
+        let url = format!(
+            "{}/{}",
+            self.resolve_base_url(provider),
+            path.trim_start_matches('/')
+        );
+        let request = self.apply_auth_headers(provider, client.delete(&url), permit.key());
+        let result = request.query(query).send().await;
+
+        result.map_err(|e| RotatorError::Http(e.to_string()))
+    }
+
     pub fn transform_request(provider: &str, body: &mut serde_json::Value) {
         match provider {
             "anthropic" => {

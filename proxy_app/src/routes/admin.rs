@@ -20,7 +20,7 @@ pub fn router() -> Router<AppState> {
         .route("/v1/cost-estimate", post(cost_estimate))
 }
 
-async fn stats(State(state): State<AppState>) -> Json<Value> {
+async fn stats(State(state): State<AppState>, body: Option<Json<Value>>) -> Json<Value> {
     let credentials = &state.rotator.credentials;
     let model_cache = state.model_cache.read().await;
     let usage = state.rotator.usage_entries();
@@ -74,6 +74,12 @@ async fn stats(State(state): State<AppState>) -> Json<Value> {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
         }));
+    }
+
+    if let Some(Json(filter)) = body
+        && let Some(provider_id) = filter.get("provider").and_then(Value::as_str)
+    {
+        providers.retain(|p| p.get("id").and_then(Value::as_str) == Some(provider_id));
     }
 
     providers.sort_by(|left, right| {

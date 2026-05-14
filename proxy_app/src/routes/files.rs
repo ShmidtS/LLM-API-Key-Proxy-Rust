@@ -1,6 +1,7 @@
 use crate::errors::AppError;
 use crate::routes::utils::upstream_response;
 use crate::state::AppState;
+use axum::extract::Query;
 use axum::response::Response;
 use axum::{
     Router,
@@ -9,6 +10,7 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::Value;
+use std::collections::HashMap;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -28,8 +30,15 @@ async fn upload_file(
     upstream_response(upstream).await
 }
 
-async fn list_files(State(state): State<AppState>) -> Result<Response, AppError> {
-    let upstream = state.rotator.get("openai", "files").await?;
+async fn list_files(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    let query_vec = params.into_iter().collect::<Vec<_>>();
+    let upstream = state
+        .rotator
+        .get_with_query("openai", "files", &query_vec)
+        .await?;
     upstream_response(upstream).await
 }
 

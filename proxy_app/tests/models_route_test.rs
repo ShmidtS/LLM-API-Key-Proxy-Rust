@@ -1,0 +1,145 @@
+use axum::{
+    body::{Body, to_bytes},
+    http::Request,
+};
+use reqwest::StatusCode;
+use rotator::{
+    AuthType, CredentialManager, HttpClientPool, ProviderDefinition, ProviderRegistry,
+    RotatorClient,
+};
+use serde_json::Value;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
+use tower::ServiceExt;
+
+async fn model_server(status: StatusCode, body: &'static str) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let count_clone = count.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            count_clone.fetch_add(1, Ordering::SeqCst);
+            let mut buffer = [0; 1024];
+            let _ = socket.read(&mut buffer).await;
+            let response = format!(
+                "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("OK"),
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+    });
+
+    (format!("http://{addr}/v1"), count)
+}
+
+fn test_state(providers: Vec<(&str, String)>) -> proxy_app::state::AppState {
+    let registry = Arc::new(ProviderRegistry::default());
+    let credentials = CredentialManager::new();
+
+    for (id, base_url) in providers {
+        registry.register(ProviderDefinition {
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            base_url,
+            auth_type: AuthType::ApiKey,
+            model_patterns: vec![],
+            endpoints: vec!["/chat/completions".to_owned()],
+            features: vec!["chat".to_owned()],
+            model_count: 1,
+            timeout_secs: 30,
+            default_headers: HashMap::new(),
+        });
+        credentials.register_keys(id.to_owned(), vec![format!("{id}-key")], 10);
+    }
+
+    let rotator = RotatorClient::new(
+        credentials,
+        HttpClientPool::new(30),
+        registry.clone(),
+        Arc::new(rotator::RateLimiterRegistry::new()),
+        Arc::new(rotator::CooldownManager::new()),
+        Arc::new(rotator::CircuitBreakerRegistry::new()),
+        None,
+        0,
+    );
+    proxy_app::state::AppState::with_parts(rotator, registry)
+}
+
+async fn get_models(state: proxy_app::state::AppState) -> Value {
+    let response = proxy_app::build_app_with_state(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn models_route_parses_openai_gemini_and_partial_failure() {
+    let (openai_url, _) = model_server(StatusCode::OK, r#"{"data":[{"id":"gpt-4"}]}"#).await;
+    let (gemini_url, _) = model_server(
+        StatusCode::OK,
+        r#"{"models":[{"name":"models/gemini-pro"}]}"#,
+    )
+    .await;
+    let (broken_url, _) =
+        model_server(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"boom"}"#).await;
+
+    let body = get_models(test_state(vec![
+        ("openai", openai_url),
+        ("gemini", gemini_url),
+        ("broken", broken_url),
+    ]))
+    .await;
+
+    let ids: Vec<_> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| model["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"gpt-4"));
+    assert!(ids.contains(&"models/gemini-pro"));
+    assert!(!ids.contains(&"boom"));
+}
+
+#[tokio::test]
+async fn models_route_uses_warm_cache() {
+    let (openai_url, request_count) =
+        model_server(StatusCode::OK, r#"{"data":[{"id":"gpt-4"}]}"#).await;
+    let state = test_state(vec![("openai", openai_url)]);
+
+    let first = get_models(state.clone()).await;
+    assert_eq!(first["data"].as_array().unwrap().len(), 1);
+
+    let started = Instant::now();
+    let second = get_models(state).await;
+
+    assert_eq!(second["data"].as_array().unwrap().len(), 1);
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    assert!(started.elapsed() < Duration::from_millis(100));
+}

@@ -20,7 +20,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/models", get(list_models))
         .route("/api/v1/models", get(list_models))
-        .route("/v1/models/{model_id}", get(get_model))
+        .route("/v1/models/{*model_id}", get(get_model))
         .route("/v1/providers", get(list_providers))
         .route("/api/tags", get(ollama_tags))
 }
