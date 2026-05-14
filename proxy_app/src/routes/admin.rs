@@ -62,7 +62,11 @@ async fn stats(State(state): State<AppState>) -> Json<Value> {
 
         providers.push(json!({
             "id": provider.id.clone(),
+            "display_name": provider.display_name.clone(),
             "base_url": provider.base_url.clone(),
+            "endpoints": provider.endpoints.clone(),
+            "features": provider.features.clone(),
+            "model_count": provider.model_count,
             "status": circuit_status_label(state.rotator.circuit_state(&provider.id)),
             "latency_ms": state.rotator.last_latency_ms(&provider.id),
             "cached_models": cached_models,
@@ -96,30 +100,16 @@ fn circuit_status_label(state: CircuitState) -> &'static str {
 #[derive(Deserialize)]
 struct TokenCountRequest {
     model: String,
-    messages: Vec<TokenCountMessage>,
-}
-
-#[derive(Deserialize)]
-struct TokenCountMessage {
-    content: Option<Value>,
+    messages: Vec<Value>,
 }
 
 async fn token_count(
     State(_state): State<AppState>,
     Json(req): Json<TokenCountRequest>,
 ) -> Json<Value> {
-    let _model = req.model;
-    let chars = req
-        .messages
-        .iter()
-        .filter_map(|message| message.content.as_ref())
-        .map(|content| match content {
-            Value::String(text) => text.chars().count(),
-            other => other.to_string().chars().count(),
-        })
-        .sum::<usize>();
+    let token_count = rotator::tokenizer::count_chat_tokens(&req.messages, &req.model);
 
-    Json(json!({"token_count": chars.div_ceil(4)}))
+    Json(json!({"token_count": token_count}))
 }
 
 #[derive(Deserialize)]

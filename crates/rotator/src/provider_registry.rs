@@ -12,9 +12,13 @@ pub enum AuthType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderDefinition {
     pub id: String,
+    pub display_name: String,
     pub base_url: String,
     pub auth_type: AuthType,
     pub model_patterns: Vec<String>,
+    pub endpoints: Vec<String>,
+    pub features: Vec<String>,
+    pub model_count: usize,
     pub timeout_secs: u64,
     pub default_headers: HashMap<String, String>,
 }
@@ -90,6 +94,25 @@ impl ProviderRegistry {
                 })
                 .or_else(|| self.get(&id).map(|def| def.model_patterns))
                 .unwrap_or_default();
+            let display_name = std::env::var(format!("PROXY_{provider_key}_DISPLAY_NAME"))
+                .ok()
+                .or_else(|| self.get(&id).map(|def| def.display_name))
+                .unwrap_or_else(|| id.clone());
+            let endpoints = std::env::var(format!("PROXY_{provider_key}_ENDPOINTS"))
+                .ok()
+                .map(|endpoints| parse_csv_list(&endpoints))
+                .or_else(|| self.get(&id).map(|def| def.endpoints))
+                .unwrap_or_default();
+            let features = std::env::var(format!("PROXY_{provider_key}_FEATURES"))
+                .ok()
+                .map(|features| parse_csv_list(&features))
+                .or_else(|| self.get(&id).map(|def| def.features))
+                .unwrap_or_default();
+            let model_count = std::env::var(format!("PROXY_{provider_key}_MODEL_COUNT"))
+                .ok()
+                .and_then(|count| count.parse().ok())
+                .or_else(|| self.get(&id).map(|def| def.model_count))
+                .unwrap_or_default();
             let timeout_secs = std::env::var(format!("PROXY_{provider_key}_TIMEOUT"))
                 .ok()
                 .and_then(|timeout| timeout.parse().ok())
@@ -102,9 +125,13 @@ impl ProviderRegistry {
 
             self.register(ProviderDefinition {
                 id,
+                display_name,
                 base_url,
                 auth_type,
                 model_patterns,
+                endpoints,
+                features,
+                model_count,
                 timeout_secs,
                 default_headers,
             });
@@ -119,6 +146,18 @@ impl ProviderRegistry {
             .collect();
         providers.sort_by(|left, right| left.id.cmp(&right.id));
         providers
+    }
+
+    pub fn get_provider_endpoints(&self, id: &str) -> Option<Vec<String>> {
+        self.get(id).map(|def| def.endpoints)
+    }
+
+    pub fn get_provider_features(&self, id: &str) -> Option<Vec<String>> {
+        self.get(id).map(|def| def.features)
+    }
+
+    pub fn get_provider_catalog(&self) -> Vec<ProviderDefinition> {
+        self.all_providers()
     }
 
     pub fn find_provider_for_model(&self, model: &str) -> Option<String> {
@@ -171,6 +210,15 @@ fn parse_model_filter_env(key: &str) -> Option<Vec<Regex>> {
             .collect();
         (!patterns.is_empty()).then_some(patterns)
     })
+}
+
+fn parse_csv_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn parse_provider_models_env() -> HashMap<String, Vec<String>> {
@@ -417,18 +465,56 @@ fn provider(
 ) -> ProviderDefinition {
     ProviderDefinition {
         id: id.to_owned(),
+        display_name: provider_display_name(id),
         base_url: base_url.to_owned(),
         auth_type,
         model_patterns: model_patterns
             .iter()
             .map(|pattern| (*pattern).to_owned())
             .collect(),
+        endpoints: provider_endpoints(id),
+        features: provider_features(id),
+        model_count: model_patterns.len(),
         timeout_secs,
         default_headers: default_headers
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect(),
     }
+}
+
+fn provider_display_name(id: &str) -> String {
+    match id {
+        "openai" => "OpenAI",
+        "gemini" => "Gemini",
+        "anthropic" => "Anthropic",
+        other => other,
+    }
+    .to_owned()
+}
+
+fn provider_endpoints(id: &str) -> Vec<String> {
+    let endpoints = match id {
+        "openai" => [
+            "/chat/completions",
+            "/embeddings",
+            "/images/generations",
+        ]
+        .as_slice(),
+        _ => ["/chat/completions"].as_slice(),
+    };
+
+    endpoints.iter().map(|endpoint| (*endpoint).to_owned()).collect()
+}
+
+fn provider_features(id: &str) -> Vec<String> {
+    let features = match id {
+        "openai" => ["chat", "streaming", "embeddings", "vision", "images"].as_slice(),
+        "anthropic" => ["chat", "streaming", "vision"].as_slice(),
+        _ => ["chat", "streaming"].as_slice(),
+    };
+
+    features.iter().map(|feature| (*feature).to_owned()).collect()
 }
 
 #[cfg(test)]

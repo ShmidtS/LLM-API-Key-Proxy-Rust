@@ -9,6 +9,7 @@ pub mod model_parser;
 pub mod provider_registry;
 pub mod providers;
 pub mod rate_limiter;
+pub mod tokenizer;
 pub mod usage;
 
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerRegistry, CircuitState};

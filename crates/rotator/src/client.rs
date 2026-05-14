@@ -351,9 +351,13 @@ mod tests {
         let registry = Arc::new(ProviderRegistry::default());
         registry.register(ProviderDefinition {
             id: "test".to_string(),
+            display_name: "test".to_string(),
             base_url: format!("http://{addr}/v1"),
             auth_type: AuthType::ApiKey,
             model_patterns: Vec::new(),
+            endpoints: vec!["/chat/completions".to_string()],
+            features: vec!["chat".to_string()],
+            model_count: 1,
             timeout_secs: 60,
             default_headers: HashMap::new(),
         });

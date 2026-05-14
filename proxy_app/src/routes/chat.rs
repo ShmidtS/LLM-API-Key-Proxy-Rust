@@ -2,7 +2,7 @@ use crate::errors::AppError;
 use crate::routes::utils::upstream_response;
 use crate::state::AppState;
 use axum::body::Body;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Router, extract::State, response::Json, routing::post};
 use futures::StreamExt;
@@ -29,6 +29,13 @@ async fn chat_completions(
         .resolve_provider_by_model(&req.model)
         .unwrap_or("openai");
     let body = serde_json::to_value(&req)?;
+    let input_tokens = body
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .map(|messages| rotator::tokenizer::count_chat_tokens(messages, &req.model))
+        .unwrap_or(0);
+    let input_tokens_header = HeaderValue::from_str(&input_tokens.to_string())
+        .unwrap_or_else(|_| HeaderValue::from_static("0"));
 
     if req.stream == Some(true) {
         let upstream = state
@@ -44,6 +51,7 @@ async fn chat_completions(
         if let Some(ct) = headers.get(header::CONTENT_TYPE) {
             builder = builder.header(header::CONTENT_TYPE, ct);
         }
+        builder = builder.header("x-input-tokens", input_tokens_header);
         return Ok(builder.body(Body::from_stream(stream)).unwrap());
     }
 
@@ -51,5 +59,9 @@ async fn chat_completions(
         .rotator
         .request(provider, "chat/completions", body)
         .await?;
-    upstream_response(resp).await
+    let mut response = upstream_response(resp).await?;
+    response
+        .headers_mut()
+        .insert("x-input-tokens", input_tokens_header);
+    Ok(response)
 }
