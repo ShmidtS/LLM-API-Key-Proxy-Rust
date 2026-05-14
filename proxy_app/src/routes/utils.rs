@@ -1,7 +1,13 @@
 use crate::errors::AppError;
+use axum::Json;
 use axum::body::Body;
 use axum::http::{StatusCode, header};
 use axum::response::Response;
+use serde_json::{Value, json};
+
+pub fn not_implemented() -> Json<Value> {
+    Json(json!({"error": "Not Implemented"}))
+}
 
 pub async fn upstream_response(upstream: reqwest::Response) -> Result<Response, AppError> {
     let status = StatusCode::from_u16(upstream.status().as_u16())

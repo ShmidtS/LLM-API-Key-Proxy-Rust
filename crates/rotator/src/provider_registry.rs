@@ -22,11 +22,19 @@ pub struct ProviderDefinition {
 #[derive(Debug, Default)]
 pub struct ProviderRegistry {
     providers: DashMap<String, ProviderDefinition>,
+    provider_models: HashMap<String, Vec<String>>,
+    allowlist: Option<Vec<Regex>>,
+    denylist: Option<Vec<Regex>>,
 }
 
 impl ProviderRegistry {
     pub fn new() -> Self {
-        let registry = Self::default();
+        let registry = Self {
+            providers: DashMap::new(),
+            provider_models: parse_provider_models_env(),
+            allowlist: None,
+            denylist: None,
+        };
         for provider in default_provider_definitions() {
             registry.register(provider);
         }
@@ -52,7 +60,10 @@ impl ProviderRegistry {
     ///   PROXY_<PROVIDER>_MODELS=pattern1,pattern2
     ///   PROXY_<PROVIDER>_TIMEOUT=60
     /// If a variable is set for a provider already in the default registry, it overrides the default.
-    pub fn load_from_env(&self) {
+    pub fn load_from_env(&mut self) {
+        self.allowlist = parse_model_filter_env("MODEL_ALLOWLIST");
+        self.denylist = parse_model_filter_env("MODEL_DENYLIST");
+
         for (key, base_url) in std::env::vars() {
             let Some(provider_key) = key
                 .strip_prefix("PROXY_")
@@ -120,6 +131,96 @@ impl ProviderRegistry {
                 .then_some(provider.id)
         })
     }
+
+    pub fn resolve_provider_by_model(&self, model: &str) -> Option<&str> {
+        self.provider_models
+            .iter()
+            .find_map(|(provider, models)| {
+                models
+                    .iter()
+                    .any(|name| name == model)
+                    .then_some(provider.as_str())
+            })
+            .or_else(|| prefix_provider_for_model(model))
+    }
+
+    pub fn is_model_allowed(&self, model: &str) -> bool {
+        if let Some(allowlist) = &self.allowlist
+            && !allowlist.iter().any(|regex| regex.is_match(model))
+        {
+            return false;
+        }
+
+        if let Some(denylist) = &self.denylist
+            && denylist.iter().any(|regex| regex.is_match(model))
+        {
+            return false;
+        }
+
+        true
+    }
+}
+
+fn parse_model_filter_env(key: &str) -> Option<Vec<Regex>> {
+    std::env::var(key).ok().and_then(|value| {
+        let patterns: Vec<_> = value
+            .split(',')
+            .map(str::trim)
+            .filter(|pattern| !pattern.is_empty())
+            .filter_map(|pattern| Regex::new(pattern).ok())
+            .collect();
+        (!patterns.is_empty()).then_some(patterns)
+    })
+}
+
+fn parse_provider_models_env() -> HashMap<String, Vec<String>> {
+    std::env::var("PROVIDER_MODELS")
+        .ok()
+        .map(|value| {
+            value
+                .split(';')
+                .filter_map(|entry| {
+                    let (provider, models) = entry.split_once('=')?;
+                    let models: Vec<_> = models
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|model| !model.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect();
+                    (!provider.trim().is_empty() && !models.is_empty())
+                        .then_some((provider.trim().to_owned(), models))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn prefix_provider_for_model(model: &str) -> Option<&'static str> {
+    [
+        ("gpt-", "openai"),
+        ("o1-", "openai"),
+        ("o3-", "openai"),
+        ("o4-", "openai"),
+        ("text-embedding-", "openai"),
+        ("dall-e-", "openai"),
+        ("claude-", "anthropic"),
+        ("gemini_cli/", "gemini_cli"),
+        ("gemini-", "gemini"),
+        ("gemini", "gemini"),
+        ("models/gemini-", "gemini"),
+        ("grok-", "xai"),
+        ("xai/", "xai"),
+        ("qwen-", "qwen"),
+        ("qwq-", "qwen"),
+        ("qwen/", "qwen"),
+        ("qwen_code/", "qwen_code"),
+        ("qwen3-coder", "qwen_code"),
+        ("zai/", "zai"),
+        ("glm-", "zai"),
+        ("GLM-", "zai"),
+    ]
+    .into_iter()
+    .find_map(|(prefix, provider)| model.starts_with(prefix).then_some(provider))
 }
 
 fn parse_auth_type(value: &str) -> Option<AuthType> {
@@ -411,6 +512,37 @@ mod tests {
     }
 
     #[test]
+    fn resolve_provider_by_model_uses_env_overrides_before_prefix_fallback() {
+        unsafe {
+            std::env::set_var(
+                "PROVIDER_MODELS",
+                "custom=gpt-4o-mini,exact-model;other=claude-custom",
+            );
+        }
+
+        let mut registry = ProviderRegistry::new();
+        registry.load_from_env();
+
+        assert_eq!(
+            registry.resolve_provider_by_model("gpt-4o-mini"),
+            Some("custom")
+        );
+        assert_eq!(
+            registry.resolve_provider_by_model("claude-3-5-sonnet-20241022"),
+            Some("anthropic")
+        );
+        assert_eq!(
+            registry.resolve_provider_by_model("text-embedding-3-small"),
+            Some("openai")
+        );
+        assert_eq!(registry.resolve_provider_by_model("unknown-model"), None);
+
+        unsafe {
+            std::env::remove_var("PROVIDER_MODELS");
+        }
+    }
+
+    #[test]
     fn load_from_env_overrides_defaults() {
         unsafe {
             std::env::set_var("PROXY_OPENAI_URL", "https://override.example/v1");
@@ -419,7 +551,7 @@ mod tests {
             std::env::set_var("PROXY_OPENAI_TIMEOUT", "45");
         }
 
-        let registry = ProviderRegistry::new();
+        let mut registry = ProviderRegistry::new();
         registry.load_from_env();
 
         let provider = registry.get("openai").expect("openai provider exists");
@@ -436,6 +568,28 @@ mod tests {
             std::env::remove_var("PROXY_OPENAI_AUTH");
             std::env::remove_var("PROXY_OPENAI_MODELS");
             std::env::remove_var("PROXY_OPENAI_TIMEOUT");
+        }
+    }
+
+    #[test]
+    fn model_filters_require_allowlist_match_before_denylist() {
+        unsafe {
+            std::env::set_var("MODEL_ALLOWLIST", "^gpt-4.*,^claude-.*");
+            std::env::set_var("MODEL_DENYLIST", "gpt-4-vision.*,claude-2.*");
+        }
+
+        let mut registry = ProviderRegistry::new();
+        registry.load_from_env();
+
+        assert!(registry.is_model_allowed("gpt-4o-mini"));
+        assert!(registry.is_model_allowed("claude-3-5-sonnet-20241022"));
+        assert!(!registry.is_model_allowed("gpt-4-vision-preview"));
+        assert!(!registry.is_model_allowed("claude-2.1"));
+        assert!(!registry.is_model_allowed("gemini-2.5-flash"));
+
+        unsafe {
+            std::env::remove_var("MODEL_ALLOWLIST");
+            std::env::remove_var("MODEL_DENYLIST");
         }
     }
 }

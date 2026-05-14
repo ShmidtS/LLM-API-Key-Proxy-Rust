@@ -7,7 +7,6 @@ use axum::{Router, middleware::from_fn};
 use tower_http::{
     compression::CompressionLayer,
     cors::{Any, CorsLayer},
-    trace::TraceLayer,
 };
 
 pub fn build_app() -> Router {
@@ -50,6 +49,6 @@ pub fn build_app_with_state(app_state: state::AppState) -> Router {
         .layer(from_fn(middleware::security_headers))
         .layer(cors)
         .layer(CompressionLayer::new())
-        .layer(TraceLayer::new_for_http())
+        .layer(from_fn(middleware::log_requests))
         .with_state(app_state)
 }

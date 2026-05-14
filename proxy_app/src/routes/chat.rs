@@ -1,11 +1,12 @@
 use crate::errors::AppError;
+use crate::routes::utils::upstream_response;
 use crate::state::AppState;
 use axum::body::Body;
-use axum::http::header;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Router, extract::State, response::Json, routing::post};
 use futures::StreamExt;
-use models::chat::{ChatCompletionRequest, ChatCompletionResponse};
+use models::chat::ChatCompletionRequest;
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
@@ -15,16 +16,24 @@ async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, AppError> {
+    if !state.registry.is_model_allowed(&req.model) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Model not allowed"})),
+        )
+            .into_response());
+    }
+
     let provider = state
         .registry
-        .find_provider_for_model(&req.model)
-        .unwrap_or_else(|| "openai".to_owned());
+        .resolve_provider_by_model(&req.model)
+        .unwrap_or("openai");
     let body = serde_json::to_value(&req)?;
 
     if req.stream == Some(true) {
         let upstream = state
             .rotator
-            .request(&provider, "chat/completions", body)
+            .request(provider, "chat/completions", body)
             .await?;
         let status = upstream.status();
         let headers = upstream.headers().clone();
@@ -40,11 +49,7 @@ async fn chat_completions(
 
     let resp = state
         .rotator
-        .request(&provider, "chat/completions", body)
+        .request(provider, "chat/completions", body)
         .await?;
-    let data: ChatCompletionResponse = resp
-        .json()
-        .await
-        .map_err(|e| rotator::RotatorError::Http(e.to_string()))?;
-    Ok(Json(data).into_response())
+    upstream_response(resp).await
 }

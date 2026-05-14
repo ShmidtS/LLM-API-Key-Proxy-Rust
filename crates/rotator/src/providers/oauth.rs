@@ -1,9 +1,12 @@
+use super::{Provider, list_data_models, send_json_request};
 use crate::error::{Result, RotatorError};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::future::Future;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthToken {
@@ -74,6 +77,154 @@ impl OAuthFlow for IflowOAuthFlow {
     }
 }
 
+#[derive(Debug)]
+struct OAuthTokenState {
+    token: OAuthToken,
+    token_expiry: Option<Instant>,
+}
+
+#[derive(Debug)]
+pub struct OAuthProvider {
+    id: String,
+    base_url: String,
+    token_endpoint: String,
+    client_id: String,
+    client_secret: Option<String>,
+    pub token_expiry: Option<Instant>,
+    token_state: Mutex<OAuthTokenState>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefreshTokenResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_in: Option<u64>,
+    token_type: Option<String>,
+}
+
+impl OAuthProvider {
+    pub fn new(
+        id: impl Into<String>,
+        base_url: impl Into<String>,
+        token_endpoint: impl Into<String>,
+        client_id: impl Into<String>,
+        client_secret: Option<String>,
+        token: OAuthToken,
+        token_expiry: Option<Instant>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            base_url: base_url.into(),
+            token_endpoint: token_endpoint.into(),
+            client_id: client_id.into(),
+            client_secret,
+            token_expiry,
+            token_state: Mutex::new(OAuthTokenState {
+                token,
+                token_expiry,
+            }),
+        }
+    }
+
+    pub async fn refresh_token_if_needed(&self, client: &reqwest::Client) -> Result<OAuthToken> {
+        let mut state = self.token_state.lock().await;
+        if state
+            .token_expiry
+            .is_none_or(|expiry| expiry > Instant::now())
+        {
+            return Ok(state.token.clone());
+        }
+
+        let refresh_token = state
+            .token
+            .refresh_token
+            .clone()
+            .ok_or_else(|| RotatorError::Other("missing OAuth refresh token".to_owned()))?;
+        let mut form = vec![
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token.as_str()),
+            ("client_id", self.client_id.as_str()),
+        ];
+        if let Some(client_secret) = self.client_secret.as_deref() {
+            form.push(("client_secret", client_secret));
+        }
+
+        let refreshed: RefreshTokenResponse = client
+            .post(&self.token_endpoint)
+            .form(&form)
+            .send()
+            .await?
+            .error_for_status()
+            .map_err(|error| RotatorError::Http(error.to_string()))?
+            .json()
+            .await?;
+        let token_expiry = refreshed
+            .expires_in
+            .map(|expires_in| Instant::now() + Duration::from_secs(expires_in));
+        let token = OAuthToken {
+            access_token: refreshed.access_token,
+            refresh_token: refreshed
+                .refresh_token
+                .or_else(|| state.token.refresh_token.clone()),
+            expires_at: None,
+            token_type: refreshed.token_type.unwrap_or_else(|| "Bearer".to_owned()),
+        };
+
+        state.token = token.clone();
+        state.token_expiry = token_expiry;
+        Ok(token)
+    }
+
+    pub async fn auth_headers(&self, client: &reqwest::Client) -> Result<Vec<(String, String)>> {
+        let token = self.refresh_token_if_needed(client).await?;
+        Ok(auth_headers_oauth(&token))
+    }
+}
+
+#[async_trait]
+impl Provider for OAuthProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    fn auth_headers(&self, api_key: &str) -> Vec<(String, String)> {
+        vec![("authorization".to_owned(), format!("Bearer {api_key}"))]
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    async fn request(
+        &self,
+        client: &reqwest::Client,
+        path: &str,
+        body: serde_json::Value,
+        _api_key: &str,
+    ) -> Result<reqwest::Response> {
+        send_json_request(
+            client,
+            &self.base_url,
+            path,
+            body,
+            self.auth_headers(client).await?,
+        )
+        .await
+    }
+
+    async fn list_models(
+        &self,
+        client: &reqwest::Client,
+        _api_key: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        list_data_models(client, &self.base_url, self.auth_headers(client).await?).await
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct OAuthManager {
     tokens: DashMap<String, OAuthToken>,
@@ -122,7 +273,7 @@ impl OAuthManager {
 
 pub fn auth_headers_oauth(token: &OAuthToken) -> Vec<(String, String)> {
     vec![(
-        "Authorization".to_owned(),
+        "authorization".to_owned(),
         format!("Bearer {}", token.access_token),
     )]
 }
@@ -209,13 +360,69 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn oauth_provider_posts_refresh_request_when_token_expired() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = Arc::clone(&calls);
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            server_calls.fetch_add(1, Ordering::SeqCst);
+            let mut buffer = [0; 2048];
+            let size = socket.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..size]);
+            assert!(request.starts_with("POST /token HTTP/1.1"));
+            assert!(request.contains("grant_type=refresh_token"));
+            assert!(request.contains("refresh_token=old-refresh"));
+            let body = r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600,"token_type":"Bearer"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let provider = OAuthProvider::new(
+            "oauth-test",
+            format!("http://{addr}/v1"),
+            format!("http://{addr}/token"),
+            "client-id",
+            Some("client-secret".to_owned()),
+            OAuthToken {
+                access_token: "old-access".to_owned(),
+                refresh_token: Some("old-refresh".to_owned()),
+                expires_at: None,
+                token_type: "Bearer".to_owned(),
+            },
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+        );
+        let client = reqwest::Client::new();
+
+        let headers = provider
+            .auth_headers(&client)
+            .await
+            .expect("refresh succeeds");
+
+        assert_eq!(
+            headers,
+            vec![("authorization".to_owned(), "Bearer new-access".to_owned())]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn builds_oauth_auth_header() {
         let token = token("access", None);
 
         assert_eq!(
             auth_headers_oauth(&token),
-            vec![("Authorization".to_owned(), "Bearer access".to_owned())]
+            vec![("authorization".to_owned(), "Bearer access".to_owned())]
         );
     }
 

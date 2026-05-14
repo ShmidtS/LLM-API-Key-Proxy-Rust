@@ -1,17 +1,20 @@
 use crate::errors::AppError;
-use crate::routes::utils::upstream_response;
+use crate::routes::utils::{not_implemented, upstream_response};
 use crate::state::AppState;
+use axum::http::StatusCode;
 use axum::response::Response;
 use axum::{
     Router,
-    extract::{Path, State},
+    extract::State,
     response::Json,
     routing::{get, post},
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/images/generations", post(generations))
+        .route("/images/{image_id}", get(get_image))
         .route("/v1/images/generations", post(generations))
         .route("/v1/images/generations/async", post(async_generations))
         .route("/v1/images/edits", post(edits))
@@ -26,8 +29,8 @@ async fn generations(
     proxy_image_request(state, "images/generations", req).await
 }
 
-async fn async_generations() -> Json<Value> {
-    Json(json!({"id": "img_placeholder", "object": "image.generation"}))
+async fn async_generations() -> (StatusCode, Json<Value>) {
+    (StatusCode::NOT_IMPLEMENTED, not_implemented())
 }
 
 async fn edits(
@@ -44,8 +47,8 @@ async fn variations(
     proxy_image_request(state, "images/variations", req).await
 }
 
-async fn get_image(Path(image_id): Path<String>) -> Json<Value> {
-    Json(json!({"object": "placeholder", "route": "images.get", "id": image_id}))
+async fn get_image() -> (StatusCode, Json<Value>) {
+    (StatusCode::NOT_IMPLEMENTED, not_implemented())
 }
 
 async fn proxy_image_request(

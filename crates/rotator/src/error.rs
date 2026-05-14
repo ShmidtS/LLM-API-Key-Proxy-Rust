@@ -5,7 +5,7 @@ pub enum RotatorError {
     #[error("no credentials available for provider: {0}")]
     NoCredentials(String),
     #[error("circuit breaker open for provider: {0}")]
-    CircuitBreakerOpen(String),
+    CircuitOpen(String),
     #[error("rate limited for provider: {0}, retry after: {1:?}")]
     RateLimited(String, Option<u64>),
     #[error("http error: {0}")]

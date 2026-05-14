@@ -14,7 +14,38 @@ pub struct CredentialEntry {
 
 #[derive(Debug, Clone, Default)]
 pub struct CredentialManager {
-    credentials: Arc<DashMap<String, Vec<CredentialEntry>>>,
+    pub credentials: Arc<DashMap<String, Vec<CredentialEntry>>>,
+}
+
+#[derive(Debug)]
+pub struct CredentialPermit {
+    manager: Arc<CredentialManager>,
+    provider: String,
+    key: String,
+}
+
+impl CredentialPermit {
+    pub fn new(
+        manager: Arc<CredentialManager>,
+        provider: impl Into<String>,
+        key: impl Into<String>,
+    ) -> Self {
+        Self {
+            manager,
+            provider: provider.into(),
+            key: key.into(),
+        }
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+impl Drop for CredentialPermit {
+    fn drop(&mut self) {
+        self.manager.decrement(&self.provider, &self.key);
+    }
 }
 
 impl CredentialManager {
@@ -75,19 +106,30 @@ impl CredentialManager {
     }
 
     pub fn acquire_least_loaded(&self, provider: &str) -> Option<CredentialEntry> {
+        self.acquire_least_loaded_where(provider, |_| true)
+    }
+
+    pub(crate) fn acquire_least_loaded_where<F>(
+        &self,
+        provider: &str,
+        is_available: F,
+    ) -> Option<CredentialEntry>
+    where
+        F: Fn(&str) -> bool,
+    {
         let entries = self.credentials.get(provider)?;
         loop {
             let entry = entries
                 .iter()
                 .filter_map(|e| {
                     let current = e.current_requests.load(Ordering::Acquire);
-                    (current < e.concurrent_limit).then_some((current, e))
+                    (current < e.concurrent_limit && is_available(&e.key)).then_some((current, e))
                 })
                 .min_by_key(|(current, _)| *current)?
                 .1
                 .clone();
             let current = entry.current_requests.load(Ordering::Acquire);
-            if current >= entry.concurrent_limit {
+            if current >= entry.concurrent_limit || !is_available(&entry.key) {
                 continue;
             }
             if entry

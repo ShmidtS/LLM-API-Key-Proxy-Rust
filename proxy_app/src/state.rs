@@ -1,4 +1,7 @@
-use rotator::{CredentialManager, HttpClientPool, ProviderRegistry, RotatorClient};
+use rotator::{
+    CircuitBreakerRegistry, CooldownManager, CredentialManager, HttpClientPool, ProviderRegistry,
+    RateLimiterRegistry, RotatorClient, UsageManager,
+};
 use std::{collections::HashMap, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
 
@@ -21,9 +24,23 @@ impl AppState {
     pub fn new() -> Self {
         let creds = CredentialManager::from_env();
         let pool = HttpClientPool::new(30);
-        let registry = Arc::new(ProviderRegistry::new());
+        let mut registry = ProviderRegistry::new();
         registry.load_from_env();
-        let client = RotatorClient::new(creds, pool, registry.clone(), 3);
+        let registry = Arc::new(registry);
+        let rate_limiter = Arc::new(RateLimiterRegistry::new());
+        let cooldown = Arc::new(CooldownManager::new());
+        let circuit_breakers = Arc::new(CircuitBreakerRegistry::new());
+        let usage_manager = Arc::new(UsageManager::new());
+        let client = RotatorClient::new(
+            creds,
+            pool,
+            registry.clone(),
+            rate_limiter,
+            cooldown,
+            circuit_breakers,
+            Some(usage_manager),
+            3,
+        );
         Self::with_parts(client, registry)
     }
 
