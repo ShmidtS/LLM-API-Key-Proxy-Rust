@@ -18,7 +18,9 @@ pub use error::{Result, RotatorError};
 pub use http_pool::HttpClientPool;
 pub use model_info::{ModelInfoService, ModelMetadata};
 pub use provider_registry::{AuthType, ProviderDefinition, ProviderRegistry};
-pub use providers::oauth::{OAuthManager, OAuthToken};
+pub use providers::oauth::{
+    GoogleOAuthFlow, IflowOAuthFlow, OAuthFlow, OAuthManager, OAuthToken, QwenOAuthFlow,
+};
 pub use providers::{Provider, ProviderManager};
 pub use rate_limiter::{RateLimiterRegistry, TokenBucket};
 pub use usage::{UsageEntry, UsageManager};

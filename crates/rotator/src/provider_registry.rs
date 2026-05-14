@@ -45,6 +45,61 @@ impl ProviderRegistry {
         self.get(id).map(|def| def.base_url)
     }
 
+    /// Load provider definitions from environment variables.
+    /// Variables are expected in the form:
+    ///   PROXY_<PROVIDER>_URL=https://...
+    ///   PROXY_<PROVIDER>_AUTH=api_key|bearer|oauth
+    ///   PROXY_<PROVIDER>_MODELS=pattern1,pattern2
+    ///   PROXY_<PROVIDER>_TIMEOUT=60
+    /// If a variable is set for a provider already in the default registry, it overrides the default.
+    pub fn load_from_env(&self) {
+        for (key, base_url) in std::env::vars() {
+            let Some(provider_key) = key
+                .strip_prefix("PROXY_")
+                .and_then(|key| key.strip_suffix("_URL"))
+            else {
+                continue;
+            };
+
+            let id = provider_key.to_ascii_lowercase();
+            let auth_type = std::env::var(format!("PROXY_{provider_key}_AUTH"))
+                .ok()
+                .and_then(|auth| parse_auth_type(&auth))
+                .or_else(|| self.get(&id).map(|def| def.auth_type))
+                .unwrap_or(AuthType::ApiKey);
+            let model_patterns = std::env::var(format!("PROXY_{provider_key}_MODELS"))
+                .ok()
+                .map(|models| {
+                    models
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|model| !model.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .or_else(|| self.get(&id).map(|def| def.model_patterns))
+                .unwrap_or_default();
+            let timeout_secs = std::env::var(format!("PROXY_{provider_key}_TIMEOUT"))
+                .ok()
+                .and_then(|timeout| timeout.parse().ok())
+                .or_else(|| self.get(&id).map(|def| def.timeout_secs))
+                .unwrap_or(60);
+            let default_headers = self
+                .get(&id)
+                .map(|def| def.default_headers)
+                .unwrap_or_default();
+
+            self.register(ProviderDefinition {
+                id,
+                base_url,
+                auth_type,
+                model_patterns,
+                timeout_secs,
+                default_headers,
+            });
+        }
+    }
+
     pub fn all_providers(&self) -> Vec<ProviderDefinition> {
         let mut providers: Vec<_> = self
             .providers
@@ -64,6 +119,15 @@ impl ProviderRegistry {
                 .any(|regex| regex.is_match(model))
                 .then_some(provider.id)
         })
+    }
+}
+
+fn parse_auth_type(value: &str) -> Option<AuthType> {
+    match value.to_ascii_lowercase().as_str() {
+        "api_key" => Some(AuthType::ApiKey),
+        "oauth" => Some(AuthType::OAuth),
+        "bearer" => Some(AuthType::Bearer),
+        _ => None,
     }
 }
 
@@ -344,5 +408,34 @@ mod tests {
                 .as_deref(),
             Some("anthropic")
         );
+    }
+
+    #[test]
+    fn load_from_env_overrides_defaults() {
+        unsafe {
+            std::env::set_var("PROXY_OPENAI_URL", "https://override.example/v1");
+            std::env::set_var("PROXY_OPENAI_AUTH", "bearer");
+            std::env::set_var("PROXY_OPENAI_MODELS", "^override/.*,^custom-.*");
+            std::env::set_var("PROXY_OPENAI_TIMEOUT", "45");
+        }
+
+        let registry = ProviderRegistry::new();
+        registry.load_from_env();
+
+        let provider = registry.get("openai").expect("openai provider exists");
+        assert_eq!(provider.base_url, "https://override.example/v1");
+        assert_eq!(provider.auth_type, AuthType::Bearer);
+        assert_eq!(
+            provider.model_patterns,
+            vec!["^override/.*".to_owned(), "^custom-.*".to_owned()]
+        );
+        assert_eq!(provider.timeout_secs, 45);
+
+        unsafe {
+            std::env::remove_var("PROXY_OPENAI_URL");
+            std::env::remove_var("PROXY_OPENAI_AUTH");
+            std::env::remove_var("PROXY_OPENAI_MODELS");
+            std::env::remove_var("PROXY_OPENAI_TIMEOUT");
+        }
     }
 }

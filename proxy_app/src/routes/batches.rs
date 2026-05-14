@@ -1,3 +1,7 @@
+use crate::errors::AppError;
+use crate::routes::utils::upstream_response;
+use crate::state::AppState;
+use axum::response::Response;
 use axum::{
     Router,
     extract::{Path, State},
@@ -6,8 +10,6 @@ use axum::{
 };
 use serde_json::{Value, json};
 
-use crate::state::AppState;
-
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/batches", post(create_batch).get(list_batches))
@@ -15,23 +17,38 @@ pub fn router() -> Router<AppState> {
         .route("/v1/batches/{batch_id}/cancel", post(cancel_batch))
 }
 
-async fn create_batch(State(_state): State<AppState>) -> Json<Value> {
-    Json(json!({"object": "placeholder", "route": "batches.create"}))
+async fn create_batch(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> Result<Response, AppError> {
+    let upstream = state.rotator.request("openai", "batches", req).await?;
+    upstream_response(upstream).await
 }
 
-async fn list_batches(State(_state): State<AppState>) -> Json<Value> {
-    Json(json!({"object": "placeholder", "route": "batches.list", "data": []}))
+async fn list_batches(State(state): State<AppState>) -> Result<Response, AppError> {
+    let upstream = state.rotator.get("openai", "batches").await?;
+    upstream_response(upstream).await
 }
 
 async fn retrieve_batch(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(batch_id): Path<String>,
-) -> Json<Value> {
-    Json(json!({"object": "placeholder", "route": "batches.retrieve", "id": batch_id}))
+) -> Result<Response, AppError> {
+    let upstream = state
+        .rotator
+        .get("openai", &format!("batches/{batch_id}"))
+        .await?;
+    upstream_response(upstream).await
 }
 
-async fn cancel_batch(State(_state): State<AppState>, Path(batch_id): Path<String>) -> Json<Value> {
-    Json(
-        json!({"object": "placeholder", "route": "batches.cancel", "id": batch_id, "cancelled": true}),
-    )
+async fn cancel_batch(
+    State(state): State<AppState>,
+    Path(batch_id): Path<String>,
+) -> Result<Response, AppError> {
+    let upstream = state
+        .rotator
+        .request("openai", &format!("batches/{batch_id}/cancel"), json!({}))
+        .await?;
+    upstream_response(upstream).await
 }
+

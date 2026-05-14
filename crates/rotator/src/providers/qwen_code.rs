@@ -1,41 +1,36 @@
-use super::Provider;
+use super::{Provider, bearer_auth_headers, list_data_models, send_json_request};
 use crate::error::Result;
-use crate::providers::openai::OpenAiProvider;
 use async_trait::async_trait;
 
 #[derive(Debug, Clone)]
-pub struct GeminiProvider {
-    inner: OpenAiProvider,
+pub struct QwenCodeProvider {
+    base_url: String,
 }
 
-impl GeminiProvider {
+impl QwenCodeProvider {
     pub fn new() -> Self {
-        Self::new_with_base_url("https://generativelanguage.googleapis.com/v1beta")
-    }
-
-    pub fn new_with_base_url(base_url: impl Into<String>) -> Self {
         Self {
-            inner: OpenAiProvider::new(base_url),
+            base_url: "https://portal.qwen.ai/v1".to_owned(),
         }
     }
 }
 
 #[async_trait]
-impl Provider for GeminiProvider {
+impl Provider for QwenCodeProvider {
     fn id(&self) -> &str {
-        "gemini"
+        "qwen_code"
     }
 
     fn base_url(&self) -> &str {
-        self.inner.base_url()
+        &self.base_url
     }
 
     fn auth_headers(&self, api_key: &str) -> Vec<(String, String)> {
-        self.inner.auth_headers(api_key)
+        bearer_auth_headers(api_key)
     }
 
     fn supports_streaming(&self) -> bool {
-        self.inner.supports_streaming()
+        true
     }
 
     async fn request(
@@ -45,7 +40,14 @@ impl Provider for GeminiProvider {
         body: serde_json::Value,
         api_key: &str,
     ) -> Result<reqwest::Response> {
-        self.inner.request(client, path, body, api_key).await
+        send_json_request(
+            client,
+            &self.base_url,
+            path,
+            body,
+            self.auth_headers(api_key),
+        )
+        .await
     }
 
     async fn list_models(
@@ -53,7 +55,7 @@ impl Provider for GeminiProvider {
         client: &reqwest::Client,
         api_key: &str,
     ) -> Result<Vec<serde_json::Value>> {
-        self.inner.list_models(client, api_key).await
+        list_data_models(client, &self.base_url, self.auth_headers(api_key)).await
     }
 }
 
@@ -62,14 +64,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gemini_provider_exposes_expected_metadata_and_auth() {
-        let provider = GeminiProvider::new();
+    fn qwen_code_provider_exposes_expected_metadata_and_auth() {
+        let provider = QwenCodeProvider::new();
 
-        assert_eq!(provider.id(), "gemini");
-        assert_eq!(
-            provider.base_url(),
-            "https://generativelanguage.googleapis.com/v1beta"
-        );
+        assert_eq!(provider.id(), "qwen_code");
+        assert_eq!(provider.base_url(), "https://portal.qwen.ai/v1");
         assert_eq!(
             provider.auth_headers("test-key"),
             vec![("authorization".to_owned(), "Bearer test-key".to_owned())]

@@ -1,9 +1,10 @@
 use crate::errors::AppError;
 use crate::state::AppState;
 use axum::body::Body;
-use axum::response::IntoResponse;
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
 use axum::{Router, extract::State, response::Json, routing::post};
-use axum::http::{StatusCode, header};
+use futures::StreamExt;
 use models::chat::{ChatCompletionRequest, ChatCompletionResponse};
 
 pub fn router() -> Router<AppState> {
@@ -13,23 +14,33 @@ pub fn router() -> Router<AppState> {
 async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
-) -> Result<axum::response::Response, AppError> {
+) -> Result<Response, AppError> {
+    let provider = state
+        .registry
+        .find_provider_for_model(&req.model)
+        .unwrap_or_else(|| "openai".to_owned());
+    let body = serde_json::to_value(&req)?;
+
     if req.stream == Some(true) {
-        let sse_body = "data: {\"id\":\"chatcmpl-placeholder\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"placeholder\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
-                        data: {\"id\":\"chatcmpl-placeholder\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"placeholder\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n\
-                        data: [DONE]\n\n";
-        return Ok(axum::response::Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .body(Body::from(sse_body))
-            .unwrap());
+        let upstream = state
+            .rotator
+            .request(&provider, "chat/completions", body)
+            .await?;
+        let status = upstream.status();
+        let headers = upstream.headers().clone();
+        let stream = upstream
+            .bytes_stream()
+            .map(|result| result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+        let mut builder = Response::builder().status(status);
+        if let Some(ct) = headers.get(header::CONTENT_TYPE) {
+            builder = builder.header(header::CONTENT_TYPE, ct);
+        }
+        return Ok(builder.body(Body::from_stream(stream)).unwrap());
     }
 
-    let provider = "openai";
-    let body = serde_json::to_value(&req)?;
     let resp = state
         .rotator
-        .request(provider, "chat/completions", body)
+        .request(&provider, "chat/completions", body)
         .await?;
     let data: ChatCompletionResponse = resp
         .json()

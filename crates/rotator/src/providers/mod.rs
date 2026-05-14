@@ -6,23 +6,71 @@ use dashmap::DashMap;
 use std::fmt::Debug;
 
 pub mod anthropic;
+pub mod antigravity;
 pub mod chutes;
 pub mod colin;
 pub mod elysiver;
-pub mod firmware;
 pub mod fireworks;
+pub mod firmware;
 pub mod gemini;
+pub mod gemini_cli;
 pub mod iflow;
 pub mod kilocode;
 pub mod nanogpt;
 pub mod nvidia;
 pub mod oauth;
-pub mod opencode;
 pub mod openai;
+pub mod opencode;
 pub mod openrouter;
 pub mod qwen;
+pub mod qwen_code;
 pub mod xai;
 pub mod zai;
+
+pub(crate) fn bearer_auth_headers(api_key: &str) -> Vec<(String, String)> {
+    vec![("authorization".to_owned(), format!("Bearer {api_key}"))]
+}
+
+pub(crate) async fn send_json_request(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+    body: serde_json::Value,
+    headers: Vec<(String, String)>,
+) -> Result<reqwest::Response> {
+    let url = format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+    let mut request = client.post(url).json(&body);
+
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+
+    Ok(request.send().await?)
+}
+
+pub(crate) async fn list_data_models(
+    client: &reqwest::Client,
+    base_url: &str,
+    headers: Vec<(String, String)>,
+) -> Result<Vec<serde_json::Value>> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let mut request = client.get(url);
+
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+
+    let value: serde_json::Value = request.send().await?.json().await?;
+    Ok(value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
 
 #[async_trait]
 pub trait Provider: Send + Sync + Debug {
@@ -46,6 +94,26 @@ pub trait Provider: Send + Sync + Debug {
         client: &reqwest::Client,
         api_key: &str,
     ) -> Result<Vec<serde_json::Value>>;
+
+    /// Alias for list_models for backward compatibility
+    async fn get_models(
+        &self,
+        client: &reqwest::Client,
+        api_key: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        self.list_models(client, api_key).await
+    }
+
+    /// Stream a request. Default implementation delegates to request().
+    async fn stream(
+        &self,
+        client: &reqwest::Client,
+        path: &str,
+        body: serde_json::Value,
+        api_key: &str,
+    ) -> Result<reqwest::Response> {
+        self.request(client, path, body, api_key).await
+    }
 }
 
 #[derive(Debug, Default)]
@@ -62,7 +130,10 @@ impl ProviderManager {
         self.providers.insert(id, provider);
     }
 
-    pub fn get(&self, id: &str) -> Option<dashmap::mapref::one::Ref<'_, String, Box<dyn Provider>>> {
+    pub fn get(
+        &self,
+        id: &str,
+    ) -> Option<dashmap::mapref::one::Ref<'_, String, Box<dyn Provider>>> {
         self.providers.get(id)
     }
 
@@ -86,9 +157,9 @@ impl ProviderManager {
         let provider_id = self
             .resolve_provider_for_model(model, registry)
             .ok_or_else(|| RotatorError::Other(format!("no provider found for model: {model}")))?;
-        let provider = self
-            .get(&provider_id)
-            .ok_or_else(|| RotatorError::Other(format!("provider not registered: {provider_id}")))?;
+        let provider = self.get(&provider_id).ok_or_else(|| {
+            RotatorError::Other(format!("provider not registered: {provider_id}"))
+        })?;
         let credential = credentials
             .get_least_loaded(&provider_id)
             .ok_or_else(|| RotatorError::NoCredentials(provider_id.clone()))?;
@@ -141,6 +212,24 @@ mod tests {
             _api_key: &str,
         ) -> Result<Vec<serde_json::Value>> {
             unimplemented!()
+        }
+
+        async fn get_models(
+            &self,
+            client: &reqwest::Client,
+            api_key: &str,
+        ) -> Result<Vec<serde_json::Value>> {
+            self.list_models(client, api_key).await
+        }
+
+        async fn stream(
+            &self,
+            client: &reqwest::Client,
+            path: &str,
+            body: serde_json::Value,
+            api_key: &str,
+        ) -> Result<reqwest::Response> {
+            self.request(client, path, body, api_key).await
         }
     }
 

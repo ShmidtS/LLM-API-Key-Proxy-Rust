@@ -7,7 +7,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/tools/web-search", post(web_search))
         .route("/v1/tools/tokenizer", post(tokenizer))
-        .route("/v1/tools/layout", post(layout))
+        .route("/v1/tools/layout-parsing", post(layout))
         .route("/v1/tools/web-reader", post(web_reader))
 }
 

@@ -1,19 +1,16 @@
 use super::Provider;
 use crate::error::Result;
-use crate::provider_registry::AuthType;
 use async_trait::async_trait;
 
 #[derive(Debug, Clone)]
 pub struct KiloCodeProvider {
     base_url: String,
-    auth_type: AuthType,
 }
 
 impl KiloCodeProvider {
     pub fn new() -> Self {
         Self {
             base_url: "https://kilo.ai/api/openrouter".to_owned(),
-            auth_type: AuthType::ApiKey,
         }
     }
 }
@@ -29,14 +26,7 @@ impl Provider for KiloCodeProvider {
     }
 
     fn auth_headers(&self, api_key: &str) -> Vec<(String, String)> {
-        match self.auth_type {
-            AuthType::ApiKey | AuthType::Bearer => {
-                vec![("authorization".to_owned(), format!("Bearer {api_key}"))]
-            }
-            AuthType::OAuth => {
-                vec![("authorization".to_owned(), format!("Bearer {api_key}"))]
-            }
-        }
+        vec![("authorization".to_owned(), format!("Bearer {api_key}"))]
     }
 
     fn supports_streaming(&self) -> bool {
@@ -50,7 +40,11 @@ impl Provider for KiloCodeProvider {
         body: serde_json::Value,
         api_key: &str,
     ) -> Result<reqwest::Response> {
-        let url = format!("{}/{}", self.base_url.trim_end_matches('/'), path.trim_start_matches('/'));
+        let url = format!(
+            "{}/{}",
+            self.base_url.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        );
         let mut request = client.post(url).json(&body);
 
         for (name, value) in self.auth_headers(api_key) {

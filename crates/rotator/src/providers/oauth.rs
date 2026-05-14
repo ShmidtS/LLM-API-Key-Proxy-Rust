@@ -1,6 +1,8 @@
-use crate::error::Result;
+use crate::error::{Result, RotatorError};
+use async_trait::async_trait;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::fmt::Debug;
 use std::future::Future;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -9,6 +11,67 @@ pub struct OAuthToken {
     pub refresh_token: Option<String>,
     pub expires_at: Option<u64>,
     pub token_type: String,
+}
+
+#[async_trait]
+pub trait OAuthFlow: Send + Sync + Debug {
+    fn provider_id(&self) -> &str;
+    async fn authenticate(&self, client: &reqwest::Client) -> Result<OAuthToken>;
+    async fn refresh(&self, client: &reqwest::Client, token: &OAuthToken) -> Result<OAuthToken>;
+}
+
+#[derive(Debug, Default)]
+pub struct GoogleOAuthFlow;
+
+#[async_trait]
+impl OAuthFlow for GoogleOAuthFlow {
+    fn provider_id(&self) -> &str {
+        "gemini"
+    }
+
+    async fn authenticate(&self, _client: &reqwest::Client) -> Result<OAuthToken> {
+        Err(RotatorError::Other("OAuth flow not implemented".into()))
+    }
+
+    async fn refresh(&self, _client: &reqwest::Client, _token: &OAuthToken) -> Result<OAuthToken> {
+        Err(RotatorError::Other("OAuth refresh not implemented".into()))
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct QwenOAuthFlow;
+
+#[async_trait]
+impl OAuthFlow for QwenOAuthFlow {
+    fn provider_id(&self) -> &str {
+        "qwen"
+    }
+
+    async fn authenticate(&self, _client: &reqwest::Client) -> Result<OAuthToken> {
+        Err(RotatorError::Other("OAuth flow not implemented".into()))
+    }
+
+    async fn refresh(&self, _client: &reqwest::Client, _token: &OAuthToken) -> Result<OAuthToken> {
+        Err(RotatorError::Other("OAuth refresh not implemented".into()))
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct IflowOAuthFlow;
+
+#[async_trait]
+impl OAuthFlow for IflowOAuthFlow {
+    fn provider_id(&self) -> &str {
+        "iflow"
+    }
+
+    async fn authenticate(&self, _client: &reqwest::Client) -> Result<OAuthToken> {
+        Err(RotatorError::Other("OAuth flow not implemented".into()))
+    }
+
+    async fn refresh(&self, _client: &reqwest::Client, _token: &OAuthToken) -> Result<OAuthToken> {
+        Err(RotatorError::Other("OAuth refresh not implemented".into()))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -58,20 +121,18 @@ impl OAuthManager {
 }
 
 pub fn auth_headers_oauth(token: &OAuthToken) -> Vec<(String, String)> {
-    vec![
-        (
-            "Authorization".to_owned(),
-            format!("Bearer {}", token.access_token),
-        ),
-    ]
+    vec![(
+        "Authorization".to_owned(),
+        format!("Bearer {}", token.access_token),
+    )]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -156,5 +217,56 @@ mod tests {
             auth_headers_oauth(&token),
             vec![("Authorization".to_owned(), "Bearer access".to_owned())]
         );
+    }
+
+    #[tokio::test]
+    async fn google_oauth_flow_reports_provider_and_stub_errors() {
+        let flow = GoogleOAuthFlow::default();
+        let client = reqwest::Client::new();
+        let token = token("access", None);
+
+        assert_eq!(flow.provider_id(), "gemini");
+        assert!(matches!(
+            flow.authenticate(&client).await,
+            Err(crate::error::RotatorError::Other(message)) if message == "OAuth flow not implemented"
+        ));
+        assert!(matches!(
+            flow.refresh(&client, &token).await,
+            Err(crate::error::RotatorError::Other(message)) if message == "OAuth refresh not implemented"
+        ));
+    }
+
+    #[tokio::test]
+    async fn qwen_oauth_flow_reports_provider_and_stub_errors() {
+        let flow = QwenOAuthFlow::default();
+        let client = reqwest::Client::new();
+        let token = token("access", None);
+
+        assert_eq!(flow.provider_id(), "qwen");
+        assert!(matches!(
+            flow.authenticate(&client).await,
+            Err(crate::error::RotatorError::Other(message)) if message == "OAuth flow not implemented"
+        ));
+        assert!(matches!(
+            flow.refresh(&client, &token).await,
+            Err(crate::error::RotatorError::Other(message)) if message == "OAuth refresh not implemented"
+        ));
+    }
+
+    #[tokio::test]
+    async fn iflow_oauth_flow_reports_provider_and_stub_errors() {
+        let flow = IflowOAuthFlow::default();
+        let client = reqwest::Client::new();
+        let token = token("access", None);
+
+        assert_eq!(flow.provider_id(), "iflow");
+        assert!(matches!(
+            flow.authenticate(&client).await,
+            Err(crate::error::RotatorError::Other(message)) if message == "OAuth flow not implemented"
+        ));
+        assert!(matches!(
+            flow.refresh(&client, &token).await,
+            Err(crate::error::RotatorError::Other(message)) if message == "OAuth refresh not implemented"
+        ));
     }
 }

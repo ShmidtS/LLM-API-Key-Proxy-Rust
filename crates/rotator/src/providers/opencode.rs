@@ -1,19 +1,16 @@
 use super::Provider;
 use crate::error::Result;
-use crate::provider_registry::AuthType;
 use async_trait::async_trait;
 
 #[derive(Debug, Clone)]
 pub struct OpenCodeProvider {
     base_url: String,
-    auth_type: AuthType,
 }
 
 impl OpenCodeProvider {
     pub fn new() -> Self {
         Self {
             base_url: "https://opencode.ai/zen/v1".to_owned(),
-            auth_type: AuthType::ApiKey,
         }
     }
 }
@@ -29,16 +26,10 @@ impl Provider for OpenCodeProvider {
     }
 
     fn auth_headers(&self, api_key: &str) -> Vec<(String, String)> {
-        match self.auth_type {
-            AuthType::ApiKey | AuthType::Bearer => vec![
-                ("authorization".to_owned(), format!("Bearer {api_key}")),
-                ("HTTP-Referer".to_owned(), "https://opencode.ai".to_owned()),
-            ],
-            AuthType::OAuth => vec![
-                ("authorization".to_owned(), format!("Bearer {api_key}")),
-                ("HTTP-Referer".to_owned(), "https://opencode.ai".to_owned()),
-            ],
-        }
+        vec![
+            ("authorization".to_owned(), format!("Bearer {api_key}")),
+            ("HTTP-Referer".to_owned(), "https://opencode.ai".to_owned()),
+        ]
     }
 
     fn supports_streaming(&self) -> bool {
@@ -52,7 +43,11 @@ impl Provider for OpenCodeProvider {
         body: serde_json::Value,
         api_key: &str,
     ) -> Result<reqwest::Response> {
-        let url = format!("{}/{}", self.base_url.trim_end_matches('/'), path.trim_start_matches('/'));
+        let url = format!(
+            "{}/{}",
+            self.base_url.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        );
         let mut request = client.post(url).json(&body);
 
         for (name, value) in self.auth_headers(api_key) {

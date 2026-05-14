@@ -35,11 +35,27 @@ impl Default for ProxyConfig {
     }
 }
 
-fn default_host() -> String { "127.0.0.1".into() }
-fn default_port() -> u16 { 8000 }
-fn default_max_concurrent() -> usize { 1000 }
-fn default_backlog() -> u32 { 2048 }
-fn default_shutdown_timeout() -> u64 { 15 }
-fn default_global_timeout() -> u64 { 30 }
-fn default_gzip_min_size() -> usize { 2048 }
-fn default_gzip_level() -> u32 { 3 }
+fn default_host() -> String {
+    "127.0.0.1".into()
+}
+fn default_port() -> u16 {
+    8000
+}
+fn default_max_concurrent() -> usize {
+    1000
+}
+fn default_backlog() -> u32 {
+    2048
+}
+fn default_shutdown_timeout() -> u64 {
+    15
+}
+fn default_global_timeout() -> u64 {
+    30
+}
+fn default_gzip_min_size() -> usize {
+    2048
+}
+fn default_gzip_level() -> u32 {
+    3
+}

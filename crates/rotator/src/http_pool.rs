@@ -1,7 +1,7 @@
-use reqwest::{Client, ClientBuilder};
-use std::time::Duration;
-use std::sync::Arc;
 use dashmap::DashMap;
+use reqwest::{Client, ClientBuilder};
+use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct HttpClientPool {

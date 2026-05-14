@@ -10,5 +10,7 @@ pub mod health;
 pub mod images;
 pub mod models;
 pub mod moderation;
+pub mod responses;
 pub mod tools;
+pub mod utils;
 pub mod video;

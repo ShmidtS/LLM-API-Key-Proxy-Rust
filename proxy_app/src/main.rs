@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{env, net::SocketAddr};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -12,7 +12,9 @@ async fn main() {
         .init();
 
     let app = proxy_app::build_app();
-    let addr: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+    let host = env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
+    let port = env::var("PORT").unwrap_or_else(|_| "8000".to_owned());
+    let addr: SocketAddr = format!("{host}:{port}").parse().unwrap();
     tracing::info!("listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

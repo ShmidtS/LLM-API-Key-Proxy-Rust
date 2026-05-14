@@ -63,7 +63,10 @@ pub struct FunctionDefinition {
 #[serde(untagged)]
 pub enum ToolChoice {
     String(String),
-    Object { r#type: String, function: FunctionDefinition },
+    Object {
+        r#type: String,
+        function: FunctionDefinition,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
