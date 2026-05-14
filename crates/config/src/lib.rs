@@ -44,6 +44,7 @@ pub fn load_from_env() -> Result<proxy::ProxyConfig, ConfigError> {
     apply_env("GZIP_MIN_SIZE", &mut config.gzip_min_size)?;
     apply_env("GZIP_COMPRESSION_LEVEL", &mut config.gzip_compression_level)?;
     apply_optional_string_env("ADMIN_TOKEN", &mut config.admin_token);
+    apply_optional_string_env("PROXY_API_KEY", &mut config.proxy_api_key);
     apply_vec_env("API_KEYS", &mut config.api_keys);
     apply_env("AUTH_ENABLED", &mut config.auth_enabled)?;
     apply_vec_env("CORS_ALLOWED_ORIGINS", &mut config.cors_allowed_origins);
@@ -63,14 +64,23 @@ pub fn load_from_env() -> Result<proxy::ProxyConfig, ConfigError> {
     Ok(config)
 }
 
+fn trim_quotes(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+        .unwrap_or(value)
+}
+
 fn apply_env<T>(key: &str, target: &mut T) -> Result<(), ConfigError>
 where
     T: FromStr,
 {
     if let Ok(value) = env::var(key) {
-        *target = value.parse().map_err(|_| ConfigError::Parse {
+        let trimmed = trim_quotes(&value);
+        *target = trimmed.parse().map_err(|_| ConfigError::Parse {
             key: key.to_string(),
-            value,
+            value: trimmed.to_string(),
         })?;
     }
     Ok(())
@@ -78,7 +88,8 @@ where
 
 fn apply_optional_string_env(key: &str, target: &mut Option<String>) {
     if let Ok(value) = env::var(key) {
-        *target = if value.is_empty() { None } else { Some(value) };
+        let trimmed = trim_quotes(&value);
+        *target = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
     }
 }
 
@@ -87,6 +98,7 @@ fn apply_vec_env(key: &str, target: &mut Vec<String>) {
         *target = value
             .split(',')
             .map(str::trim)
+            .map(trim_quotes)
             .filter(|item| !item.is_empty())
             .map(ToString::to_string)
             .collect();

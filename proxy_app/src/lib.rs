@@ -1,3 +1,4 @@
+pub mod compat;
 pub mod errors;
 pub mod middleware;
 pub mod routes;

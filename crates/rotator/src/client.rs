@@ -4,7 +4,9 @@ use crate::credentials::{CredentialManager, CredentialPermit};
 use crate::error::{Result, RotatorError};
 use crate::http_pool::HttpClientPool;
 use crate::provider_registry::{AuthType, ProviderRegistry};
+use crate::provider_utils::extract_usage;
 use crate::rate_limiter::RateLimiterRegistry;
+use crate::throttle::{ThrottleReason, classify_throttle_with_headers};
 use crate::usage::UsageManager;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -22,21 +24,6 @@ pub struct RotatorClient {
     usage_manager: Option<Arc<UsageManager>>,
     last_latency_ms: Arc<DashMap<String, u64>>,
     max_retries: usize,
-}
-
-fn extract_usage_tokens(json: &serde_json::Value) -> Option<(u32, u32)> {
-    let usage = json.get("usage")?;
-    let prompt = usage
-        .get("prompt_tokens")
-        .or_else(|| usage.get("input_tokens"))?
-        .as_u64()
-        .and_then(|value| u32::try_from(value).ok())?;
-    let completion = usage
-        .get("completion_tokens")
-        .or_else(|| usage.get("output_tokens"))?
-        .as_u64()
-        .and_then(|value| u32::try_from(value).ok())?;
-    Some((prompt, completion))
 }
 
 impl RotatorClient {
@@ -115,33 +102,48 @@ impl RotatorClient {
                         .await;
                 }
                 Ok(resp) if resp.status().as_u16() == 429 => {
-                    let retry_after = resp
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse().ok());
-                    warn!(provider, attempt, "rate limited, retrying...");
+                    let headers = resp.headers().clone();
+                    let body = resp
+                        .json::<serde_json::Value>()
+                        .await
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    let (reason, retry_after) =
+                        classify_throttle_with_headers(429, Some(&headers), &body);
+                    warn!(provider, attempt, ?reason, "throttled, retrying...");
                     if attempt < self.max_retries {
-                        if let Some(secs) = retry_after {
-                            tokio::time::sleep(Duration::from_secs(secs)).await;
-                        } else {
-                            tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1)))
-                                .await;
-                        }
+                        let delay = retry_after
+                            .unwrap_or_else(|| Duration::from_millis(500 * (attempt as u64 + 1)));
+                        self.cooldown.add_cooldown(provider, permit.key(), delay);
+                        tokio::time::sleep(delay).await;
                         continue;
                     }
-                    return Err(RotatorError::RateLimited(provider.to_string(), retry_after));
+                    return Err(RotatorError::RateLimited(
+                        provider.to_string(),
+                        retry_after.map(|duration| duration.as_secs()),
+                    ));
                 }
                 Ok(resp) if resp.status().is_server_error() => {
                     let status = resp.status();
                     self.circuit_breakers.record_failure(provider);
-                    self.cooldown
-                        .add_cooldown(provider, permit.key(), Duration::from_secs(5));
                     error!(provider, attempt, status = %status, "server error, retrying...");
                     if attempt < self.max_retries {
-                        tokio::time::sleep(Duration::from_millis(300 * (attempt as u64 + 1))).await;
+                        let headers = resp.headers().clone();
+                        let body = resp
+                            .json::<serde_json::Value>()
+                            .await
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                        let (reason, retry_after) =
+                            classify_throttle_with_headers(status.as_u16(), Some(&headers), &body);
+                        let delay = retry_after.unwrap_or_else(|| match reason {
+                            ThrottleReason::ServerOverload => Duration::from_secs(5),
+                            _ => Duration::from_millis(300 * (attempt as u64 + 1)),
+                        });
+                        self.cooldown.add_cooldown(provider, permit.key(), delay);
+                        tokio::time::sleep(delay).await;
                         continue;
                     }
+                    self.cooldown
+                        .add_cooldown(provider, permit.key(), Duration::from_secs(5));
                     return Ok(resp);
                 }
                 Ok(resp) => return Ok(resp),
@@ -308,10 +310,13 @@ impl RotatorClient {
             .await
             .map_err(|e| RotatorError::Http(e.to_string()))?;
 
-        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes)
-            && let Some((prompt, completion)) = extract_usage_tokens(&json)
-        {
-            usage_manager.record_usage(provider, key, prompt, completion);
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            let (prompt, completion) = extract_usage(&json);
+            if let (Ok(prompt), Ok(completion)) = (u32::try_from(prompt), u32::try_from(completion))
+                && (prompt > 0 || completion > 0)
+            {
+                usage_manager.record_usage(provider, key, prompt, completion);
+            }
         }
 
         let mut builder = http::Response::builder().status(status).version(version);
@@ -328,12 +333,20 @@ impl RotatorClient {
         mut request: reqwest::RequestBuilder,
         key: &str,
     ) -> reqwest::RequestBuilder {
+        if provider == "gemini" {
+            request = request.query(&[("key", key)]);
+        }
         if let Some(definition) = self.provider_registry.get(provider) {
             for (header_key, value) in definition.default_headers {
                 request = request.header(header_key, value);
             }
             match definition.auth_type {
-                AuthType::ApiKey | AuthType::Bearer | AuthType::OAuth => {
+                AuthType::ApiKey => {
+                    if provider != "gemini" {
+                        request = request.header("x-api-key", key);
+                    }
+                }
+                AuthType::Bearer | AuthType::OAuth => {
                     request = request.header("Authorization", format!("Bearer {key}"));
                 }
             }

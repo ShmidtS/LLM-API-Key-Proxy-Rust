@@ -4,9 +4,8 @@ use crate::state::AppState;
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::{
-    Router,
+    Json, Router,
     extract::State,
-    response::Json,
     routing::{get, post},
 };
 use serde_json::Value;
@@ -29,8 +28,11 @@ async fn generations(
     proxy_image_request(state, "images/generations", req).await
 }
 
-async fn async_generations() -> (StatusCode, Json<Value>) {
-    (StatusCode::NOT_IMPLEMENTED, not_implemented())
+async fn async_generations(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> Result<Response, AppError> {
+    proxy_image_request(state, "images/generations/async", req).await
 }
 
 async fn edits(

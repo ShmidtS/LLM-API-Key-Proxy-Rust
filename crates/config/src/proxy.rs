@@ -40,6 +40,8 @@ pub struct ProxyConfig {
     pub gzip_compression_level: u32,
     #[serde(default, deserialize_with = "deserialize_optional_string")]
     pub admin_token: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    pub proxy_api_key: Option<String>,
     #[serde(default, deserialize_with = "deserialize_comma_separated")]
     pub api_keys: Vec<String>,
     #[serde(default = "default_auth_enabled")]
@@ -78,6 +80,7 @@ impl Default for ProxyConfig {
             gzip_min_size: default_gzip_min_size(),
             gzip_compression_level: default_gzip_level(),
             admin_token: default_admin_token(),
+            proxy_api_key: default_proxy_api_key(),
             api_keys: default_api_keys(),
             auth_enabled: default_auth_enabled(),
             cors_allowed_origins: default_cors_allowed_origins(),
@@ -119,6 +122,9 @@ fn default_gzip_level() -> u32 {
     3
 }
 fn default_admin_token() -> Option<String> {
+    None
+}
+fn default_proxy_api_key() -> Option<String> {
     None
 }
 fn default_api_keys() -> Vec<String> {

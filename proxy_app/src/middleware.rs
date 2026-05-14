@@ -39,17 +39,32 @@ pub async fn require_proxy_auth(
         return next.run(request).await;
     }
 
+    let mut valid_tokens: Vec<&str> = Vec::new();
+    if let Some(key) = app_state.config.proxy_api_key.as_deref() {
+        valid_tokens.push(key);
+    }
+    for key in &app_state.config.api_keys {
+        valid_tokens.push(key);
+    }
+
+    // If no auth tokens are configured, behave like the Python reference:
+    // authentication is effectively disabled for proxy routes.
+    if valid_tokens.is_empty() {
+        return next.run(request).await;
+    }
+
     let auth_token = bearer_token(request.headers());
     let api_key = request
         .headers()
         .get("x-api-key")
         .and_then(|h| h.to_str().ok());
 
-    if auth_token
+    let is_valid = auth_token
         .into_iter()
-        .chain(api_key)
-        .any(|token| app_state.config.api_keys.iter().any(|key| key == token))
-    {
+        .chain(api_key.into_iter())
+        .any(|token| valid_tokens.iter().any(|&valid| valid == token));
+
+    if is_valid {
         next.run(request).await
     } else {
         errors::authentication_error().into_response()

@@ -285,7 +285,7 @@ fn default_provider_definitions() -> Vec<ProviderDefinition> {
         provider(
             "openai",
             "https://api.openai.com/v1",
-            AuthType::ApiKey,
+            AuthType::Bearer,
             &[
                 r"^(gpt|o1|o3|o4)([-/].*)?$",
                 r"^text-embedding-.*",
@@ -321,7 +321,7 @@ fn default_provider_definitions() -> Vec<ProviderDefinition> {
         provider(
             "fireworks",
             "https://api.fireworks.ai/inference/v1",
-            AuthType::ApiKey,
+            AuthType::Bearer,
             &[r"^accounts/fireworks/models/.*", r"^fireworks/.*"],
             120,
             &[],
@@ -329,7 +329,7 @@ fn default_provider_definitions() -> Vec<ProviderDefinition> {
         provider(
             "nvidia",
             "https://integrate.api.nvidia.com/v1",
-            AuthType::ApiKey,
+            AuthType::Bearer,
             &[
                 r"^nvidia/.*",
                 r"^meta/llama.*",
@@ -343,7 +343,7 @@ fn default_provider_definitions() -> Vec<ProviderDefinition> {
         provider(
             "qwen",
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            AuthType::ApiKey,
+            AuthType::Bearer,
             &[r"^qwen[-/].*", r"^qwq[-/].*", r"^deepseek[-/].*"],
             60,
             &[],
@@ -375,7 +375,7 @@ fn default_provider_definitions() -> Vec<ProviderDefinition> {
         provider(
             "colin",
             "https://claude.colin1112.tech/v1",
-            AuthType::ApiKey,
+            AuthType::Bearer,
             &[r"^colin/.*", r"^colin[-/].*"],
             60,
             &[],
@@ -383,7 +383,7 @@ fn default_provider_definitions() -> Vec<ProviderDefinition> {
         provider(
             "elysiver",
             "https://elysiver.h-e.top/v1",
-            AuthType::ApiKey,
+            AuthType::Bearer,
             &[r"^elysiver/.*", r"^elysiver[-/].*"],
             60,
             &[],
@@ -399,7 +399,7 @@ fn default_provider_definitions() -> Vec<ProviderDefinition> {
         provider(
             "nanogpt",
             "https://nano-gpt.com/api/v1",
-            AuthType::ApiKey,
+            AuthType::Bearer,
             &[r"^nanogpt/.*", r"^nano-gpt/.*"],
             60,
             &[],
@@ -407,7 +407,7 @@ fn default_provider_definitions() -> Vec<ProviderDefinition> {
         provider(
             "opencode",
             "https://opencode.ai/zen/v1",
-            AuthType::ApiKey,
+            AuthType::Bearer,
             &[r"^opencode/.*", r"^zen/.*"],
             60,
             &[("HTTP-Referer", "https://opencode.ai")],
@@ -415,7 +415,7 @@ fn default_provider_definitions() -> Vec<ProviderDefinition> {
         provider(
             "firmware",
             "https://app.firmware.ai/api/v1",
-            AuthType::ApiKey,
+            AuthType::Bearer,
             &[r"^firmware/.*", r"^fw/.*"],
             60,
             &[],
@@ -431,7 +431,7 @@ fn default_provider_definitions() -> Vec<ProviderDefinition> {
         provider(
             "openrouter",
             "https://openrouter.ai/api/v1",
-            AuthType::ApiKey,
+            AuthType::Bearer,
             &[r"^openrouter/.*"],
             60,
             &[],
@@ -439,7 +439,7 @@ fn default_provider_definitions() -> Vec<ProviderDefinition> {
         provider(
             "xai",
             "https://api.x.ai/v1",
-            AuthType::ApiKey,
+            AuthType::Bearer,
             &[r"^xai/.*", r"^grok[-/].*"],
             60,
             &[],
@@ -447,7 +447,7 @@ fn default_provider_definitions() -> Vec<ProviderDefinition> {
         provider(
             "kilocode",
             "https://kilo.ai/api/openrouter",
-            AuthType::ApiKey,
+            AuthType::Bearer,
             &[r"^kilocode/.*"],
             60,
             &[],

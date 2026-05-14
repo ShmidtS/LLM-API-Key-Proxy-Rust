@@ -1,32 +1,67 @@
-use axum::{Json, Router, http::StatusCode, routing::post};
+use crate::errors::AppError;
+use crate::routes::utils::{not_implemented, upstream_response};
+use crate::state::AppState;
+use axum::extract::{OriginalUri, Query, State};
+use axum::http::StatusCode;
+use axum::response::Response;
+use axum::{
+    Json, Router,
+    routing::{post},
+};
 use serde_json::Value;
-
-use crate::{routes::utils::not_implemented, state::AppState};
+use std::collections::HashMap;
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/tools/web_search", post(web_search))
-        .route("/tools/tokenizer", post(tokenizer))
-        .route("/tools/layout", post(layout))
-        .route("/tools/web_reader", post(web_reader))
-        .route("/v1/tools/web-search", post(web_search))
-        .route("/v1/tools/tokenizer", post(tokenizer))
-        .route("/v1/tools/layout-parsing", post(layout))
-        .route("/v1/tools/web-reader", post(web_reader))
+        .route("/tools/web_search", post(legacy_tool))
+        .route("/tools/tokenizer", post(legacy_tool))
+        .route("/tools/layout", post(legacy_tool))
+        .route("/tools/web_reader", post(legacy_tool))
+        .route("/v1/tools/web-search", post(legacy_tool))
+        .route("/v1/tools/tokenizer", post(legacy_tool))
+        .route("/v1/tools/layout-parsing", post(legacy_tool))
+        .route("/v1/tools/web-reader", post(legacy_tool))
+        .route(
+            "/v1/threads",
+            post(tools_post_passthrough).get(tools_get_passthrough),
+        )
+        .route(
+            "/v1/threads/{*path}",
+            post(tools_post_passthrough).get(tools_get_passthrough),
+        )
 }
 
-async fn web_search() -> (StatusCode, Json<Value>) {
+async fn legacy_tool() -> (StatusCode, Json<Value>) {
     (StatusCode::NOT_IMPLEMENTED, not_implemented())
 }
 
-async fn tokenizer() -> (StatusCode, Json<Value>) {
-    (StatusCode::NOT_IMPLEMENTED, not_implemented())
+async fn tools_post_passthrough(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Json(req): Json<Value>,
+) -> Result<Response, AppError> {
+    let upstream = state
+        .rotator
+        .request("openai", upstream_path(uri.path()), req)
+        .await?;
+    upstream_response(upstream).await
 }
 
-async fn layout() -> (StatusCode, Json<Value>) {
-    (StatusCode::NOT_IMPLEMENTED, not_implemented())
+async fn tools_get_passthrough(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    let query_vec = params.into_iter().collect::<Vec<_>>();
+    let upstream = state
+        .rotator
+        .get_with_query("openai", upstream_path(uri.path()), &query_vec)
+        .await?;
+    upstream_response(upstream).await
 }
 
-async fn web_reader() -> (StatusCode, Json<Value>) {
-    (StatusCode::NOT_IMPLEMENTED, not_implemented())
+fn upstream_path(path: &str) -> &str {
+    path.strip_prefix("/v1/")
+        .or_else(|| path.strip_prefix('/'))
+        .unwrap_or(path)
 }
