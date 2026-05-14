@@ -29,7 +29,7 @@ struct UsageState {
     shutting_down: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct UsageManager {
     state: Arc<Mutex<UsageState>>,
     notify_flush: Arc<Notify>,
@@ -130,8 +130,7 @@ impl UsageManager {
 
         let task = self.task.lock().expect("usage task mutex poisoned").take();
         if let Some(task) = task {
-            task.await
-                .map_err(|err| io::Error::new(io::ErrorKind::Other, err))??;
+            task.await.map_err(io::Error::other)??;
         }
 
         Ok(())

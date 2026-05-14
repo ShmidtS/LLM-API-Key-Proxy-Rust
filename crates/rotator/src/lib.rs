@@ -5,6 +5,7 @@ pub mod credentials;
 pub mod error;
 pub mod http_pool;
 pub mod model_info;
+pub mod model_parser;
 pub mod provider_registry;
 pub mod providers;
 pub mod rate_limiter;
@@ -17,6 +18,7 @@ pub use credentials::CredentialManager;
 pub use error::{Result, RotatorError};
 pub use http_pool::HttpClientPool;
 pub use model_info::{ModelInfoService, ModelMetadata};
+pub use model_parser::{parse_model_ids, parse_model_ids_body, parse_model_ids_response};
 pub use provider_registry::{AuthType, ProviderDefinition, ProviderRegistry};
 pub use providers::oauth::{
     GoogleOAuthFlow, IflowOAuthFlow, OAuthFlow, OAuthManager, OAuthToken, QwenOAuthFlow,

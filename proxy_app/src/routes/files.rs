@@ -65,4 +65,3 @@ async fn file_content(
         .await?;
     upstream_response(upstream).await
 }
-

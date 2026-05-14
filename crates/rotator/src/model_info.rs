@@ -471,6 +471,7 @@ fn default_models() -> Vec<ModelMetadata> {
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn model(
     model_id: &str,
     provider: &str,

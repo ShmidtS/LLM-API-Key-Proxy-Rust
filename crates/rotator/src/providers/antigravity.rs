@@ -3,7 +3,7 @@ use crate::error::Result;
 use async_trait::async_trait;
 use dashmap::DashMap;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct AntigravityProvider {
     base_url: String,
     thinking_cache: DashMap<String, String>,

@@ -5,8 +5,16 @@ use axum::{
     response::Json,
     routing::get,
 };
+use futures::future::join_all;
 use models::common::{ModelInfo, ModelList};
+use rotator::{RotatorClient, parse_model_ids_response};
 use serde_json::{Value, json};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+const MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -18,7 +26,8 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
-    let mut data = Vec::new();
+    let mut tasks = Vec::new();
+    let now = Instant::now();
 
     for provider in state.registry.all_providers() {
         if state
@@ -30,24 +39,36 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
             continue;
         }
 
-        match state
-            .rotator
-            .request(&provider.id, "models", serde_json::json!({}))
+        let provider_id = provider.id;
+        let cached = state
+            .model_cache
+            .read()
             .await
-        {
-            Ok(response) => match response.json::<Value>().await {
-                Ok(value) => data.extend(models_from_value(value, &provider.id)),
-                Err(error) => tracing::warn!(
-                    provider = %provider.id,
-                    error = %error,
-                    "failed to decode provider models"
-                ),
-            },
-            Err(error) => tracing::warn!(
-                provider = %provider.id,
-                error = %error,
-                "failed to fetch provider models"
-            ),
+            .get(&provider_id)
+            .cloned()
+            .and_then(|(models, cached_at)| {
+                (now.duration_since(cached_at) < MODEL_CACHE_TTL).then_some(models)
+            });
+        let rotator = state.rotator.clone();
+        tasks.push(tokio::spawn(fetch_provider_models(
+            provider_id,
+            cached,
+            rotator,
+        )));
+    }
+
+    let mut data = Vec::new();
+    for result in join_all(tasks).await {
+        let Ok((provider_id, models)) = result else {
+            continue;
+        };
+        if let Some(models) = models {
+            state
+                .model_cache
+                .write()
+                .await
+                .insert(provider_id.clone(), (models.clone(), Instant::now()));
+            data.extend(models.into_iter().map(|id| model_info(id, &provider_id)));
         }
     }
 
@@ -55,6 +76,29 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
         object: "list".into(),
         data,
     })
+}
+
+async fn fetch_provider_models(
+    provider_id: String,
+    cached: Option<Vec<String>>,
+    rotator: Arc<RotatorClient>,
+) -> (String, Option<Vec<String>>) {
+    if let Some(models) = cached {
+        return (provider_id, Some(models));
+    }
+
+    let models = match rotator.list_models(&provider_id).await {
+        Ok(response) => parse_model_ids_response(&provider_id, response).await,
+        Err(error) => {
+            tracing::warn!(
+                provider = %provider_id,
+                error = %error,
+                "failed to fetch provider models"
+            );
+            None
+        }
+    };
+    (provider_id, models)
 }
 
 async fn get_model(State(state): State<AppState>, Path(model_id): Path<String>) -> Json<ModelInfo> {
@@ -94,32 +138,11 @@ async fn ollama_tags(State(state): State<AppState>) -> Json<Value> {
     Json(json!({"models": models}))
 }
 
-fn models_from_value(value: Value, provider_id: &str) -> Vec<ModelInfo> {
-    value
-        .get("data")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|model| {
-            let id = model.get("id")?.as_str()?.to_owned();
-            let object = model
-                .get("object")
-                .and_then(Value::as_str)
-                .unwrap_or("model")
-                .to_owned();
-            let created = model.get("created").and_then(Value::as_i64).unwrap_or(0);
-            let owned_by = model
-                .get("owned_by")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .or_else(|| Some(provider_id.to_owned()));
-
-            Some(ModelInfo {
-                id,
-                object,
-                created,
-                owned_by,
-            })
-        })
-        .collect()
+fn model_info(id: String, provider_id: &str) -> ModelInfo {
+    ModelInfo {
+        id,
+        object: "model".into(),
+        created: 0,
+        owned_by: Some(provider_id.to_owned()),
+    }
 }

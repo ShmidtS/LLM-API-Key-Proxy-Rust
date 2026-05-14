@@ -51,4 +51,3 @@ async fn cancel_batch(
         .await?;
     upstream_response(upstream).await
 }
-

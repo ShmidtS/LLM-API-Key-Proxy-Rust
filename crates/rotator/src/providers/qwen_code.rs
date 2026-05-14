@@ -2,7 +2,7 @@ use super::{Provider, bearer_auth_headers, list_data_models, send_json_request};
 use crate::error::Result;
 use async_trait::async_trait;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct QwenCodeProvider {
     base_url: String,
 }

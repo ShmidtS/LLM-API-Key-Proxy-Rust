@@ -1,7 +1,7 @@
+use crate::errors::AppError;
 use axum::body::Body;
 use axum::http::{StatusCode, header};
 use axum::response::Response;
-use crate::errors::AppError;
 
 pub async fn upstream_response(upstream: reqwest::Response) -> Result<Response, AppError> {
     let status = StatusCode::from_u16(upstream.status().as_u16())

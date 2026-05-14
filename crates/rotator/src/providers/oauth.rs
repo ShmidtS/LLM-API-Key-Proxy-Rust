@@ -108,10 +108,10 @@ impl OAuthManager {
         F: Fn(&str) -> Fut,
         Fut: Future<Output = Result<OAuthToken>>,
     {
-        if !self.is_expired(provider_id) {
-            if let Some(token) = self.get_token(provider_id) {
-                return Ok(token);
-            }
+        if !self.is_expired(provider_id)
+            && let Some(token) = self.get_token(provider_id)
+        {
+            return Ok(token);
         }
 
         let token = refresh_fn(provider_id).await?;
@@ -221,7 +221,7 @@ mod tests {
 
     #[tokio::test]
     async fn google_oauth_flow_reports_provider_and_stub_errors() {
-        let flow = GoogleOAuthFlow::default();
+        let flow = GoogleOAuthFlow;
         let client = reqwest::Client::new();
         let token = token("access", None);
 
@@ -238,7 +238,7 @@ mod tests {
 
     #[tokio::test]
     async fn qwen_oauth_flow_reports_provider_and_stub_errors() {
-        let flow = QwenOAuthFlow::default();
+        let flow = QwenOAuthFlow;
         let client = reqwest::Client::new();
         let token = token("access", None);
 
@@ -255,7 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn iflow_oauth_flow_reports_provider_and_stub_errors() {
-        let flow = IflowOAuthFlow::default();
+        let flow = IflowOAuthFlow;
         let client = reqwest::Client::new();
         let token = token("access", None);
 

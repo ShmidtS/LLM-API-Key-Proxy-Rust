@@ -2,7 +2,7 @@ use super::Provider;
 use crate::error::Result;
 use async_trait::async_trait;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChutesProvider {
     base_url: String,
 }

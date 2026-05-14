@@ -37,10 +37,8 @@ impl RotatorClient {
         for attempt in 0..=self.max_retries {
             let cred = self
                 .credentials
-                .get_least_loaded(provider)
+                .acquire_least_loaded(provider)
                 .ok_or_else(|| RotatorError::NoCredentials(provider.to_string()))?;
-
-            self.credentials.increment(provider, &cred.key);
 
             let client = self.http_pool.get_or_create(provider);
             let url = format!(
@@ -104,13 +102,15 @@ impl RotatorClient {
         Err(RotatorError::Exhausted(self.max_retries))
     }
 
+    pub async fn list_models(&self, provider: &str) -> Result<reqwest::Response> {
+        self.get(provider, "models").await
+    }
+
     pub async fn get(&self, provider: &str, path: &str) -> Result<reqwest::Response> {
         let cred = self
             .credentials
-            .get_least_loaded(provider)
+            .acquire_least_loaded(provider)
             .ok_or_else(|| RotatorError::NoCredentials(provider.to_string()))?;
-
-        self.credentials.increment(provider, &cred.key);
 
         let client = self.http_pool.get_or_create(provider);
         let url = format!(
@@ -129,10 +129,8 @@ impl RotatorClient {
     pub async fn delete(&self, provider: &str, path: &str) -> Result<reqwest::Response> {
         let cred = self
             .credentials
-            .get_least_loaded(provider)
+            .acquire_least_loaded(provider)
             .ok_or_else(|| RotatorError::NoCredentials(provider.to_string()))?;
-
-        self.credentials.increment(provider, &cred.key);
 
         let client = self.http_pool.get_or_create(provider);
         let url = format!(

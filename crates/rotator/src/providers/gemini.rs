@@ -3,7 +3,7 @@ use crate::error::Result;
 use crate::providers::openai::OpenAiProvider;
 use async_trait::async_trait;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GeminiProvider {
     inner: OpenAiProvider,
 }

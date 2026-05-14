@@ -26,7 +26,7 @@ async fn create_message(
         let headers = upstream.headers().clone();
         let stream = upstream
             .bytes_stream()
-            .map(|result| result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+            .map(|result| result.map_err(std::io::Error::other));
         let mut builder = Response::builder().status(status);
         if let Some(ct) = headers.get(header::CONTENT_TYPE) {
             builder = builder.header(header::CONTENT_TYPE, ct);
