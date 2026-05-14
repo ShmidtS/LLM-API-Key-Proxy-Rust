@@ -1,0 +1,15 @@
+[package]
+name = "proxy-tui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+rotator = { path = "../rotator" }
+proxy_config = { path = "../config" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+serde_json = { workspace = true }
