@@ -2,8 +2,6 @@
 
 Rust-миграция `LLM-API-Key-Proxy`: HTTP proxy для LLM API с rotation credentials, provider registry, OpenAI-compatible endpoints, Anthropic Messages API, admin endpoints и TUI мониторингом.
 
-Исходный Python проект находился в `E:/456/LLM-API-Key-Proxy`. Текущий Rust workspace находится в `E:/456/LLM-API-Key-Proxy-Rust`.
-
 ## Архитектура
 
 Workspace состоит из следующих crates:
