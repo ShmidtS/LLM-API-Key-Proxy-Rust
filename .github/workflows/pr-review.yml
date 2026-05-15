@@ -1,0 +1,207 @@
+name: PR Review
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.prNumber }}
+  cancel-in-progress: false
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, ready_for_review]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      prNumber:
+        description: 'The number of the PR to review manually'
+        required: true
+        type: string
+
+jobs:
+  review-pr:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.action == 'opened' && github.event.pull_request.draft == false) ||
+      github.event.action == 'ready_for_review' ||
+      (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'Agent Monitored')) ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        github.event.comment.user.login != 'mirrobot' &&
+        github.event.comment.user.login != 'mirrobot-agent' &&
+        github.event.comment.user.login != 'mirrobot-agent[bot]' &&
+        (contains(github.event.comment.body, '/mirrobot-review') || contains(github.event.comment.body, '/mirrobot_review'))
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.prNumber }}
+      BOT_NAMES_JSON: '["mirrobot", "mirrobot-agent", "mirrobot-agent[bot]"]'
+      IGNORE_BOT_NAMES_JSON: '["ellipsis-dev"]'
+      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      OPENCODE_MODEL: ${{ secrets.OPENCODE_MODEL }}
+      OPENCODE_FAST_MODEL: ${{ secrets.OPENCODE_FAST_MODEL }}
+      CUSTOM_PROVIDERS_JSON: ${{ secrets.CUSTOM_PROVIDERS_JSON }}
+
+    steps:
+      - name: Validate comment trigger
+        id: validate
+        if: github.event_name == 'issue_comment'
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          temp_file=$(mktemp)
+          printf '%s\n' "$COMMENT_BODY" > "$temp_file"
+          clean_body=$(perl -0777 -pe 's/```.*?```//gs; s/`[^`]*`//g' "$temp_file" | grep -v '^[[:space:]]*>' || true)
+          rm -f "$temp_file"
+
+          if echo "$clean_body" | grep -qE '/mirrobot[-_]review'; then
+            echo "should_proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Trigger only found in quotes/code blocks. Skipping."
+            echo "should_proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add reaction to PR comment
+        if: github.event_name == 'issue_comment' && steps.validate.outputs.should_proceed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            /repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -f content='eyes'
+
+      - name: Fetch PR context
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        id: pr_context
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pr_json=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" --json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,commits,files,comments,reviews)
+          {
+            echo 'PR_CONTEXT<<EOF'
+            echo "$pr_json" | jq -r '
+              "PR #" + env.PR_NUMBER + ": " + .title + "\n" +
+              "Author: " + .author.login + "\n" +
+              "State: " + .state + "\n" +
+              "Base: " + .baseRefName + "\n" +
+              "Head: " + .headRefName + "\n" +
+              "Additions/Deletions: +" + (.additions|tostring) + "/-" + (.deletions|tostring) + "\n\n" +
+              "Body:\n" + (.body // "(No description provided)") + "\n\n" +
+              "Changed files:\n" + ([.files[] | "- " + .path + " (+" + (.additions|tostring) + "/-" + (.deletions|tostring) + ")"] | join("\n")) + "\n\n" +
+              "Recent comments:\n" + ([.comments[] | select(.author.login != "ellipsis-dev") | "---\n" + .author.login + ":\n" + (.body // "")] | .[-10:] | join("\n"))
+            '
+            echo EOF
+          } >> "$GITHUB_ENV"
+          echo "head_ref=$(echo "$pr_json" | jq -r .headRefName)" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$(echo "$pr_json" | jq -r .baseRefName)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR head
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr_context.outputs.head_ref }}
+          fetch-depth: 0
+
+      - name: Generate PR diff
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        run: |
+          set -euo pipefail
+          git fetch origin "${{ steps.pr_context.outputs.base_ref }}" --depth=1
+          git diff --patch --find-renames "origin/${{ steps.pr_context.outputs.base_ref }}...HEAD" -- \
+            Cargo.toml Cargo.lock rust-toolchain.toml proxy_app crates \
+            > pr-diff.patch || true
+          if [ ! -s pr-diff.patch ]; then
+            echo '(No Rust workspace diff available.)' > pr-diff.patch
+          fi
+
+      - name: Set up Rust
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Rust checks
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        id: rust_checks
+        continue-on-error: true
+        run: |
+          set +e
+          cargo test --workspace --all-targets > cargo-test.txt 2>&1
+          test_status=$?
+          cargo clippy --workspace --all-targets -- -D warnings > cargo-clippy.txt 2>&1
+          clippy_status=$?
+          {
+            echo 'RUST_CHECKS<<EOF'
+            echo 'cargo test status:' "$test_status"
+            tail -n 160 cargo-test.txt
+            echo
+            echo 'cargo clippy status:' "$clippy_status"
+            tail -n 160 cargo-clippy.txt
+            echo EOF
+          } >> "$GITHUB_ENV"
+          exit 0
+
+      - name: Install opencode
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        run: curl -fsSL https://opencode.ai/install | bash
+
+      - name: Configure opencode
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/opencode
+          model="${OPENCODE_MODEL:-openai/gpt-4o-mini}"
+          api_key="${OPENCODE_API_KEY:-}"
+          jq -n \
+            --arg model "$model" \
+            --arg apiKey "$api_key" \
+            '{"$schema":"https://opencode.ai/config.json",username:"mirrobot-agent",autoupdate:true,model:$model,provider:{openai:{npm:"@ai-sdk/openai-compatible",name:"OpenAI Compatible",options:{baseURL:"https://api.openai.com/v1",apiKey:$apiKey},models:{($model):{}}}}}' \
+            > ~/.config/opencode/opencode.json
+
+      - name: Review PR with OpenCode
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          prompt_file=$(mktemp)
+          response_file=$(mktemp)
+          cat > "$prompt_file" <<'PROMPT'
+          You are mirrobot-agent reviewing a PR in a Rust repository.
+
+          Repository layout:
+          - proxy_app/src/: HTTP proxy application and routes
+          - proxy_app/tests/: integration tests
+          - crates/rotator/src/: provider rotation, credentials, rate limiting
+          - crates/config/src/: configuration loading
+          - crates/models/src/: API model types
+          - crates/cli/src/: CLI
+
+          PR context:
+          ${PR_CONTEXT}
+
+          Rust verification output:
+          ${RUST_CHECKS}
+
+          Diff path: pr-diff.patch
+
+          Review for Rust correctness, async/error-handling issues, API compatibility, tests, and security-sensitive behavior. Keep findings actionable and cite files from the diff.
+          PROMPT
+          envsubst < "$prompt_file" | opencode run --share - > "$response_file"
+          gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body-file "$response_file"

@@ -1,0 +1,526 @@
+# ============================================================================
+# COMPLIANCE CHECK WORKFLOW
+# ============================================================================
+# Purpose: AI-powered compliance agent that verifies PRs are ready for merge
+#          by checking file group consistency, documentation updates, and
+#          enforcing project-specific merge requirements.
+# ============================================================================
+
+name: Compliance Check
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr_number || github.event.workflow_run.pull_requests[0].number }}
+  cancel-in-progress: false
+
+on:
+  workflow_run:
+    workflows: ["PR Review"]
+    types: [completed]
+
+  pull_request_target:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to check'
+        required: true
+        type: string
+
+jobs:
+  compliance-check:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_target' &&
+       (github.event.action == 'ready_for_review' ||
+        (github.event.action == 'labeled' && contains(github.event.label.name, 'ready-for-merge')))) ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        github.event.comment.user.login != 'mirrobot' &&
+        github.event.comment.user.login != 'mirrobot-agent' &&
+        github.event.comment.user.login != 'mirrobot-agent[bot]' &&
+        (contains(github.event.comment.body, '/mirrobot-check') ||
+         contains(github.event.comment.body, '/mirrobot_check'))
+      )
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+      issues: write
+
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number || github.event.workflow_run.pull_requests[0].number }}
+      BOT_NAMES_JSON: '["mirrobot", "mirrobot-agent", "mirrobot-agent[bot]"]'
+      ENABLE_REVIEWER_MENTIONS: 'false'
+      FILE_GROUPS_JSON: |
+        [
+          {
+            "name": "GitHub Workflows",
+            "description": "When code changes affect the build or CI process, verify rust.yml and related workflows are updated with new steps, jobs, or release configurations. Check that code changes are reflected in build matrix, deploy steps, and CI/CD pipeline.",
+            "files": [
+              ".github/workflows/rust.yml",
+              ".github/workflows/compliance-check.yml",
+              ".github/workflows/status-check-init.yml"
+            ]
+          },
+          {
+            "name": "Documentation",
+            "description": "Ensure README.md reflects code changes. For new features such as providers, configuration options, CLI changes, or API endpoint changes, verify feature documentation exists.",
+            "files": [
+              "README.md"
+            ]
+          },
+          {
+            "name": "Rust Dependencies",
+            "description": "When Cargo.toml changes, ensure Cargo.lock is updated when dependency resolution changes. Workspace dependency changes should be compatible with all crate members.",
+            "files": [
+              "Cargo.toml",
+              "Cargo.lock",
+              "proxy_app/Cargo.toml",
+              "crates/*/Cargo.toml"
+            ]
+          },
+          {
+            "name": "Provider Configuration",
+            "description": "When adding or modifying LLM providers in crates/rotator/src/providers/, ensure provider registry, model information, credentials, and README.md are updated where needed.",
+            "files": [
+              "crates/rotator/src/providers/**/*.rs",
+              "crates/rotator/src/provider_registry.rs",
+              "crates/rotator/src/model_info.rs",
+              "crates/rotator/src/credentials.rs",
+              "crates/rotator/src/credential_store.rs"
+            ]
+          },
+          {
+            "name": "Proxy Application",
+            "description": "Changes to proxy_app routes, middleware, state, or compatibility layers should be reflected in tests and documentation. New endpoints should have corresponding route tests when practical.",
+            "files": [
+              "proxy_app/src/**/*.rs",
+              "proxy_app/tests/**/*.rs"
+            ]
+          },
+          {
+            "name": "Rust Crates",
+            "description": "Changes to shared crates should keep dependent crates compiling and should be covered by workspace formatting, clippy, and tests.",
+            "files": [
+              "crates/models/src/**/*.rs",
+              "crates/config/src/**/*.rs",
+              "crates/rotator/src/**/*.rs",
+              "crates/cli/src/**/*.rs",
+              "crates/tui/src/**/*.rs"
+            ]
+          }
+        ]
+
+    steps:
+      - name: Validate comment trigger
+        id: validate
+        if: github.event_name == 'issue_comment'
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -e
+          TEMP_FILE=$(mktemp)
+          echo "$COMMENT_BODY" > "$TEMP_FILE"
+          CLEAN_BODY=$(awk '
+            /^```/ { in_code = !in_code; next }
+            !in_code { print }
+          ' "$TEMP_FILE")
+          CLEAN_BODY=$(echo "$CLEAN_BODY" | sed 's/`[^`]*`//g')
+          CLEAN_BODY=$(echo "$CLEAN_BODY" | grep -v '^[[:space:]]*>' || true)
+          rm -f "$TEMP_FILE"
+
+          if echo "$CLEAN_BODY" | grep -qE '/mirrobot[-_]check'; then
+            echo "::notice::Valid trigger found in non-quoted, non-code text."
+            echo "should_proceed=true" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::Trigger only found in quotes/code blocks. Skipping."
+            echo "should_proceed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout base branch (for trusted prompt)
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        uses: actions/checkout@v4
+
+      - name: Bot Setup
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        id: setup
+        uses: ./.github/actions/bot-setup
+        with:
+          bot-app-id: ${{ secrets.BOT_APP_ID }}
+          bot-private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+          opencode-api-key: ${{ secrets.OPENCODE_API_KEY }}
+          opencode-model: ${{ secrets.OPENCODE_MODEL }}
+          opencode-fast-model: ${{ secrets.OPENCODE_FAST_MODEL }}
+          custom-providers-json: ${{ secrets.CUSTOM_PROVIDERS_JSON }}
+
+      - name: Wait for PR Review Workflow (if triggered by ready_for_review)
+        if: (github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true') && github.event.action == 'ready_for_review'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+        run: |
+          echo "Triggered by ready_for_review - waiting for PR Review to complete..."
+          MAX_ATTEMPTS=180
+          ATTEMPT=0
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            REVIEW_STATUS=$(gh run list \
+              --repo ${{ github.repository }} \
+              --workflow "PR Review" \
+              --json status,conclusion,headSha \
+              --jq "[.[] | select(.headSha == \"${{ github.event.pull_request.head.sha }}\")][0] | {status, conclusion}")
+
+            STATUS=$(echo "$REVIEW_STATUS" | jq -r '.status // "not_found"')
+            CONCLUSION=$(echo "$REVIEW_STATUS" | jq -r '.conclusion // ""')
+            echo "Attempt $((ATTEMPT + 1))/$MAX_ATTEMPTS: PR Review status=$STATUS, conclusion=$CONCLUSION"
+
+            if [ "$STATUS" == "completed" ]; then
+              echo "PR Review completed with conclusion: $CONCLUSION"
+              break
+            fi
+
+            sleep 10
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+
+          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+            echo "::warning::Timed out waiting for PR Review workflow (waited 30 minutes)"
+            echo "Proceeding with compliance check anyway..."
+          fi
+
+      - name: Get PR Metadata
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        id: pr_info
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+        run: |
+          pr_json=$(gh pr view ${{ env.PR_NUMBER }} --repo ${{ github.repository }} --json author,title,body,headRefOid,files,labels,reviewRequests)
+
+          echo "head_sha=$(echo "$pr_json" | jq -r .headRefOid)" >> $GITHUB_OUTPUT
+          echo "pr_title=$(echo "$pr_json" | jq -r .title)" >> $GITHUB_OUTPUT
+
+          pr_author=$(echo "$pr_json" | jq -r .author.login)
+          echo "pr_author=$pr_author" >> $GITHUB_OUTPUT
+
+          pr_body=$(echo "$pr_json" | jq -r '.body // ""')
+          echo "pr_body<<EOF" >> $GITHUB_OUTPUT
+          echo "$pr_body" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          changed_files=$(echo "$pr_json" | jq -r '.files[] | .path' | tr '\n' ' ')
+          echo "changed_files=$changed_files" >> $GITHUB_OUTPUT
+
+          files_json=$(echo "$pr_json" | jq -c '[.files[] | .path]')
+          echo "files_json=$files_json" >> $GITHUB_OUTPUT
+
+          labels_json=$(echo "$pr_json" | jq -c '[.labels[] | .name]')
+          echo "labels_json=$labels_json" >> $GITHUB_OUTPUT
+
+          reviewers=$(echo "$pr_json" | jq -r '.reviewRequests[]? | .login' | tr '\n' ' ')
+          mentions="@$pr_author"
+          if [ -n "$reviewers" ]; then
+            for reviewer in $reviewers; do
+              mentions="$mentions @$reviewer"
+            done
+          fi
+          echo "reviewer_mentions=$reviewers" >> $GITHUB_OUTPUT
+          echo "all_mentions=$mentions" >> $GITHUB_OUTPUT
+
+      - name: Fetch Previous Compliance Reviews
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        id: prev_reviews
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+          BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
+        run: |
+          reviews=$(gh api "/repos/${{ github.repository }}/issues/${{ env.PR_NUMBER }}/comments" \
+            --paginate | jq -r --argjson bots "$BOT_NAMES_JSON" '
+              map(select(
+                (.user.login as $u | $bots | index($u)) and
+                (.body | contains("<!-- compliance-check-id:"))
+              ))
+              | map(
+                  (.body | capture("<!-- compliance-check-id: [0-9]+-(?<sha>[a-f0-9]+) -->") | .sha) as $commit_sha |
+                  "## Previous Compliance Review\n" +
+                  "**Date**: " + .created_at + "\n" +
+                  "**Commit**: " + $commit_sha + "\n\n" +
+                  .body
+                )
+              | join("\n\n---\n\n")
+            ')
+
+          if [ -n "$reviews" ]; then
+            echo "PREVIOUS_REVIEWS<<EOF" >> $GITHUB_OUTPUT
+            echo "$reviews" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "PREVIOUS_REVIEWS=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Save secure prompt from base branch
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        run: cp .github/prompts/compliance-check.md /tmp/compliance-check.md
+
+      - name: Checkout PR Head for Diff Generation
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr_info.outputs.head_sha }}
+          fetch-depth: 0
+
+      - name: Install Rust
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.86
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        run: cargo fmt --check
+
+      - name: Run clippy
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Run tests
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        run: cargo test --workspace
+
+      - name: Generate PR Diff
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        id: diff
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.mirrobot_files"
+
+          pr_json=$(gh pr view ${{ env.PR_NUMBER }} --repo ${{ github.repository }} --json baseRefName)
+          BASE_BRANCH=$(echo "$pr_json" | jq -r .baseRefName)
+          CURRENT_SHA="${{ steps.pr_info.outputs.head_sha }}"
+
+          echo "Generating PR diff against base branch: $BASE_BRANCH"
+
+          if git fetch origin "$BASE_BRANCH":refs/remotes/origin/"$BASE_BRANCH" 2>/dev/null; then
+            if MERGE_BASE=$(git merge-base origin/"$BASE_BRANCH" "$CURRENT_SHA" 2>/dev/null); then
+              if DIFF_CONTENT=$(git diff --patch "$MERGE_BASE".."$CURRENT_SHA" 2>/dev/null); then
+                DIFF_SIZE=${#DIFF_CONTENT}
+                DIFF_LINES=$(echo "$DIFF_CONTENT" | wc -l)
+                echo "Generated PR diff: $DIFF_LINES lines, $DIFF_SIZE characters"
+
+                if [ $DIFF_SIZE -gt 500000 ]; then
+                  echo "::warning::PR diff is very large ($DIFF_SIZE chars). Truncating to 500KB."
+                  TRUNCATION_MSG=$'\n\n[DIFF TRUNCATED - PR is very large. Showing first 500KB only.]'
+                  DIFF_CONTENT="${DIFF_CONTENT:0:500000}${TRUNCATION_MSG}"
+                fi
+
+                echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt"
+                echo "diff_path=$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt" >> $GITHUB_OUTPUT
+              else
+                echo "::warning::Could not generate diff. Using changed files list only."
+                echo "(Diff generation failed. Please refer to the changed files list.)" > "$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt"
+                echo "diff_path=$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "::warning::Could not find merge base."
+              echo "(No common ancestor found.)" > "$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt"
+              echo "diff_path=$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "::warning::Could not fetch base branch."
+            echo "(Base branch not available for diff.)" > "$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt"
+            echo "diff_path=$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Format File Groups for Prompt
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        id: file_groups
+        run: |
+          echo "FILE GROUPS FOR COMPLIANCE CHECKING:" > /tmp/file_groups.txt
+          echo "" >> /tmp/file_groups.txt
+          echo "$FILE_GROUPS_JSON" | jq -r '.[] |
+            "Group: \(.name)\n" +
+            "Description: \(.description)\n" +
+            "Files:\n" +
+            (.files | map("  - \(.)") | join("\n")) +
+            "\n"
+          ' >> /tmp/file_groups.txt
+
+          echo "FILE_GROUPS_PATH=/tmp/file_groups.txt" >> $GITHUB_OUTPUT
+
+      - name: Generate Report Template
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        id: template
+        run: |
+          cat > /tmp/report_template.md <<'TEMPLATE'
+          ## Compliance Check Results
+
+          ### Status: [TO_BE_DETERMINED]
+
+          **PR**: #${{ env.PR_NUMBER }} - ${{ steps.pr_info.outputs.pr_title }}
+          **Author**: @${{ steps.pr_info.outputs.pr_author }}
+          **Commit**: ${{ steps.pr_info.outputs.head_sha }}
+          **Checked**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+          ---
+
+          ### Summary
+          [AI to complete: Brief overview of analysis]
+
+          ---
+
+          ### File Groups Analyzed
+          [AI to complete: Fill in analysis for each affected group]
+
+          ---
+
+          ### Rust Checks
+          [AI to complete: Consider cargo fmt, cargo clippy, and cargo test outcomes]
+
+          ---
+
+          ### Overall Assessment
+          [AI to complete: Holistic compliance state]
+
+          ### Next Steps
+          [AI to complete: Actionable guidance]
+
+          ---
+          _Compliance verification by AI agent • Re-run with `/mirrobot-check`_
+          <!-- compliance-check-id: ${{ env.PR_NUMBER }}-${{ steps.pr_info.outputs.head_sha }} -->
+          TEMPLATE
+
+          echo "TEMPLATE_PATH=/tmp/report_template.md" >> $GITHUB_OUTPUT
+
+      - name: Assemble Compliance Prompt
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        env:
+          PR_NUMBER: ${{ env.PR_NUMBER }}
+          PR_TITLE: ${{ steps.pr_info.outputs.pr_title }}
+          PR_BODY: ${{ steps.pr_info.outputs.pr_body }}
+          PR_AUTHOR: ${{ steps.pr_info.outputs.pr_author }}
+          PR_HEAD_SHA: ${{ steps.pr_info.outputs.head_sha }}
+          CHANGED_FILES: ${{ steps.pr_info.outputs.changed_files }}
+          CHANGED_FILES_JSON: ${{ steps.pr_info.outputs.files_json }}
+          PR_LABELS: ${{ steps.pr_info.outputs.labels_json }}
+          PREVIOUS_REVIEWS: ${{ steps.prev_reviews.outputs.PREVIOUS_REVIEWS }}
+          FILE_GROUPS: ${{ steps.file_groups.outputs.FILE_GROUPS_PATH }}
+          REPORT_TEMPLATE: ${{ steps.template.outputs.TEMPLATE_PATH }}
+          DIFF_PATH: ${{ steps.diff.outputs.diff_path }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          TMP_DIR="${RUNNER_TEMP:-/tmp}"
+          VARS='${PR_NUMBER} ${PR_TITLE} ${PR_BODY} ${PR_AUTHOR} ${PR_HEAD_SHA} ${CHANGED_FILES} ${CHANGED_FILES_JSON} ${PR_LABELS} ${PREVIOUS_REVIEWS} ${FILE_GROUPS} ${REPORT_TEMPLATE} ${DIFF_PATH} ${GITHUB_REPOSITORY}'
+          envsubst "$VARS" < /tmp/compliance-check.md > "$TMP_DIR/assembled_prompt.txt"
+
+      - name: Run Compliance Check with OpenCode
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ steps.setup.outputs.token }}
+          OPENCODE_PERMISSION: |
+            {
+              "bash": {
+                "gh*": "allow",
+                "git*": "allow",
+                "jq*": "allow",
+                "cat*": "allow",
+                "cargo*": "allow"
+              },
+              "external_directory": "allow",
+              "webfetch": "deny"
+            }
+          PR_NUMBER: ${{ env.PR_NUMBER }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_HEAD_SHA: ${{ steps.pr_info.outputs.head_sha }}
+        run: |
+          TMP_DIR="${RUNNER_TEMP:-/tmp}"
+          opencode run --share - < "$TMP_DIR/assembled_prompt.txt"
+
+      - name: Prepend Reviewer Mentions to Posted Comment
+        if: always() && (github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true') && env.ENABLE_REVIEWER_MENTIONS == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+          BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
+          REVIEWER_MENTIONS: ${{ steps.pr_info.outputs.reviewer_mentions }}
+          PR_AUTHOR: ${{ steps.pr_info.outputs.pr_author }}
+        run: |
+          sleep 3
+
+          latest_comment=$(gh api "/repos/${{ github.repository }}/issues/${{ env.PR_NUMBER }}/comments" \
+            --paginate | jq -r --argjson bots "$BOT_NAMES_JSON" '
+              map(select(.user.login as $u | $bots | index($u)))
+              | sort_by(.created_at)
+              | last
+              | {id: .id, body: .body}
+            ')
+
+          comment_id=$(echo "$latest_comment" | jq -r .id)
+          current_body=$(echo "$latest_comment" | jq -r .body)
+
+          reviewer_mentions=""
+          if [ -n "$REVIEWER_MENTIONS" ]; then
+            for reviewer in $REVIEWER_MENTIONS; do
+              if [ "$reviewer" != "$PR_AUTHOR" ]; then
+                reviewer_mentions="$reviewer_mentions @$reviewer"
+              fi
+            done
+          fi
+
+          if [ -n "$reviewer_mentions" ]; then
+            new_body="$reviewer_mentions
+
+          $current_body"
+            gh api --method PATCH "/repos/${{ github.repository }}/issues/comments/$comment_id" \
+              -f body="$new_body"
+            echo "Prepended reviewer mentions: $reviewer_mentions"
+          else
+            echo "No additional reviewers to mention"
+          fi
+
+      - name: Verify Compliance Review Footers
+        if: always() && (github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true')
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+          BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
+          PR_NUMBER: ${{ env.PR_NUMBER }}
+          PR_HEAD_SHA: ${{ steps.pr_info.outputs.head_sha }}
+        run: |
+          set -e
+          sleep 5
+
+          echo "Verifying latest compliance review for required footers..."
+
+          latest_comment=$(gh api "/repos/${{ github.repository }}/issues/${{ env.PR_NUMBER }}/comments" \
+            --paginate | jq -r --argjson bots "$BOT_NAMES_JSON" '
+              map(select(.user.login as $u | $bots | index($u)))
+              | sort_by(.created_at)
+              | last
+              | {id: .id, body: .body}
+            ')
+
+          current_body=$(echo "$latest_comment" | jq -r .body)
+          EXPECTED_SIGNATURE="_Compliance verification by AI agent"
+          needs_fix=false
+
+          if [[ "$current_body" != *"$EXPECTED_SIGNATURE"* ]]; then
+            echo "::warning::Missing compliance signature footer."
+            needs_fix=true
+          fi
+
+          if [[ "$current_body" != *"compliance-check-id:"* ]]; then
+            echo "::warning::Missing compliance-check-id marker."
+            needs_fix=true
+          fi
+
+          if [ "$needs_fix" = true ]; then
+            echo "::error::Compliance review missing required footers."
+            exit 1
+          else
+            echo "Verification passed."
+          fi

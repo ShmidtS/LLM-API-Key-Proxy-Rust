@@ -1,0 +1,137 @@
+name: Issue Analysis
+
+on:
+  issues:
+    types: [opened]
+  workflow_dispatch:
+    inputs:
+      issueNumber:
+        description: 'The number of the issue to analyze manually'
+        required: true
+        type: string
+
+jobs:
+  check-issue:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+
+    env:
+      ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issueNumber }}
+      IGNORE_BOT_NAMES_JSON: '["ellipsis-dev"]'
+      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      OPENCODE_MODEL: ${{ secrets.OPENCODE_MODEL }}
+      OPENCODE_FAST_MODEL: ${{ secrets.OPENCODE_FAST_MODEL }}
+      CUSTOM_PROVIDERS_JSON: ${{ secrets.CUSTOM_PROVIDERS_JSON }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add reaction to issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            /repos/${{ github.repository }}/issues/${{ env.ISSUE_NUMBER }}/reactions \
+            -f content='eyes'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fetch and format issue context
+        id: issue_details
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          issue_data=$(gh issue view "$ISSUE_NUMBER" --repo "${{ github.repository }}" --json author,title,body,createdAt,state,comments)
+          timeline_data=$(gh api "/repos/${{ github.repository }}/issues/$ISSUE_NUMBER/timeline")
+
+          {
+            echo 'ISSUE_CONTEXT<<EOF'
+            echo "$issue_data" | jq -r '
+              "Issue #" + env.ISSUE_NUMBER + ": " + .title + "\n" +
+              "Author: " + .author.login + "\n" +
+              "Created: " + .createdAt + "\n" +
+              "State: " + .state + "\n\n" +
+              "Body:\n" + (.body // "(No description provided)") + "\n\n" +
+              "Comments:\n" + ([.comments[] | select(.author.login != "ellipsis-dev") | "---\n" + .author.login + ":\n" + (.body // "")] | join("\n"))
+            '
+            echo
+            echo 'Timeline events:'
+            echo "$timeline_data" | jq -r '.[] | select(.event != null) | "- " + .event + " by " + (.actor.login // "unknown") + " at " + (.created_at // "")' | tail -n 50
+            echo EOF
+          } >> "$GITHUB_ENV"
+
+      - name: Run Rust checks
+        id: rust_checks
+        continue-on-error: true
+        run: |
+          set +e
+          cargo test --workspace --all-targets > cargo-test.txt 2>&1
+          test_status=$?
+          cargo clippy --workspace --all-targets -- -D warnings > cargo-clippy.txt 2>&1
+          clippy_status=$?
+          {
+            echo 'RUST_CHECKS<<EOF'
+            echo 'cargo test status:' "$test_status"
+            tail -n 120 cargo-test.txt
+            echo
+            echo 'cargo clippy status:' "$clippy_status"
+            tail -n 120 cargo-clippy.txt
+            echo EOF
+          } >> "$GITHUB_ENV"
+          exit 0
+
+      - name: Install opencode
+        run: curl -fsSL https://opencode.ai/install | bash
+
+      - name: Configure opencode
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/opencode
+          model="${OPENCODE_MODEL:-openai/gpt-4o-mini}"
+          api_key="${OPENCODE_API_KEY:-}"
+          jq -n \
+            --arg model "$model" \
+            --arg apiKey "$api_key" \
+            '{"$schema":"https://opencode.ai/config.json",username:"mirrobot-agent",autoupdate:true,model:$model,provider:{openai:{npm:"@ai-sdk/openai-compatible",name:"OpenAI Compatible",options:{baseURL:"https://api.openai.com/v1",apiKey:$apiKey},models:{($model):{}}}}}' \
+            > ~/.config/opencode/opencode.json
+
+      - name: Analyze issue and suggest resolution
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          prompt_file=$(mktemp)
+          response_file=$(mktemp)
+          cat > "$prompt_file" <<'PROMPT'
+          You are mirrobot-agent analyzing an issue in a Rust repository.
+
+          Repository layout:
+          - proxy_app/src/: HTTP proxy application and routes
+          - proxy_app/tests/: integration tests
+          - crates/rotator/src/: provider rotation, credentials, rate limiting
+          - crates/config/src/: configuration loading
+          - crates/models/src/: API model types
+          - crates/cli/src/: CLI
+
+          Issue context:
+          ${ISSUE_CONTEXT}
+
+          Rust verification output:
+          ${RUST_CHECKS}
+
+          Reply with likely cause, relevant Rust files/crates, and concrete next steps. Keep concise.
+          PROMPT
+          envsubst < "$prompt_file" | opencode run --share - > "$response_file"
+          gh issue comment "$ISSUE_NUMBER" --repo "${{ github.repository }}" --body-file "$response_file"

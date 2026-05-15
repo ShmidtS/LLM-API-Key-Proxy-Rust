@@ -1,0 +1,160 @@
+name: Bot Reply on Mention
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  continuous-reply:
+    if: |
+      github.event.comment.user.login != 'mirrobot' &&
+      github.event.comment.user.login != 'mirrobot-agent' &&
+      github.event.comment.user.login != 'mirrobot-agent[bot]' &&
+      (contains(github.event.comment.body, '@mirrobot') ||
+       contains(github.event.comment.body, '@mirrobot-agent'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+
+    env:
+      THREAD_NUMBER: ${{ github.event.issue.number }}
+      BOT_NAMES_JSON: '["mirrobot", "mirrobot-agent", "mirrobot-agent[bot]"]'
+      IGNORE_BOT_NAMES_JSON: '["ellipsis-dev"]'
+      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      OPENCODE_MODEL: ${{ secrets.OPENCODE_MODEL }}
+      OPENCODE_FAST_MODEL: ${{ secrets.OPENCODE_FAST_MODEL }}
+      CUSTOM_PROVIDERS_JSON: ${{ secrets.CUSTOM_PROVIDERS_JSON }}
+
+    steps:
+      - name: Validate comment trigger
+        id: validate
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          temp_file=$(mktemp)
+          printf '%s\n' "$COMMENT_BODY" > "$temp_file"
+          clean_body=$(perl -0777 -pe 's/```.*?```//gs; s/`[^`]*`//g' "$temp_file" | grep -v '^[[:space:]]*>' || true)
+          rm -f "$temp_file"
+
+          if echo "$clean_body" | grep -qE '@mirrobot(-agent)?'; then
+            echo "should_proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Trigger only found in quotes/code blocks. Skipping."
+            echo "should_proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        if: steps.validate.outputs.should_proceed == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add reaction to comment
+        if: steps.validate.outputs.should_proceed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            /repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -f content='eyes'
+
+      - name: Set up Rust
+        if: steps.validate.outputs.should_proceed == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        if: steps.validate.outputs.should_proceed == 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Gather thread context
+        if: steps.validate.outputs.should_proceed == 'true'
+        id: context
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          issue_json=$(gh issue view "$THREAD_NUMBER" --repo "${{ github.repository }}" --json author,title,body,state,comments)
+          {
+            echo 'THREAD_CONTEXT<<EOF'
+            echo "$issue_json" | jq -r '
+              "Title: \(.title)\nState: \(.state)\nAuthor: \(.author.login)\n\nBody:\n\(.body // "(No description provided)")\n\nRecent comments:\n" +
+              ([.comments[] | select(.author.login as $login | ($login != "mirrobot" and $login != "mirrobot-agent" and $login != "mirrobot-agent[bot]" and $login != "ellipsis-dev")) | "---\n" + .author.login + ":\n" + (.body // "")] | .[-10:] | join("\n"))
+            '
+            echo EOF
+          } >> "$GITHUB_ENV"
+
+      - name: Run Rust checks
+        if: steps.validate.outputs.should_proceed == 'true'
+        id: rust_checks
+        continue-on-error: true
+        run: |
+          set +e
+          cargo test --workspace --all-targets > cargo-test.txt 2>&1
+          test_status=$?
+          cargo clippy --workspace --all-targets -- -D warnings > cargo-clippy.txt 2>&1
+          clippy_status=$?
+          {
+            echo 'RUST_CHECKS<<EOF'
+            echo 'cargo test status:' "$test_status"
+            tail -n 120 cargo-test.txt
+            echo
+            echo 'cargo clippy status:' "$clippy_status"
+            tail -n 120 cargo-clippy.txt
+            echo EOF
+          } >> "$GITHUB_ENV"
+          exit 0
+
+      - name: Install opencode
+        if: steps.validate.outputs.should_proceed == 'true'
+        run: curl -fsSL https://opencode.ai/install | bash
+
+      - name: Configure opencode
+        if: steps.validate.outputs.should_proceed == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/opencode
+          model="${OPENCODE_MODEL:-openai/gpt-4o-mini}"
+          api_key="${OPENCODE_API_KEY:-}"
+          jq -n \
+            --arg model "$model" \
+            --arg apiKey "$api_key" \
+            '{"$schema":"https://opencode.ai/config.json",username:"mirrobot-agent",autoupdate:true,model:$model,provider:{openai:{npm:"@ai-sdk/openai-compatible",name:"OpenAI Compatible",options:{baseURL:"https://api.openai.com/v1",apiKey:$apiKey},models:{($model):{}}}}}' \
+            > ~/.config/opencode/opencode.json
+
+      - name: Analyze comment and respond
+        if: steps.validate.outputs.should_proceed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          prompt_file=$(mktemp)
+          response_file=$(mktemp)
+          cat > "$prompt_file" <<'PROMPT'
+          You are mirrobot-agent responding in a Rust repository.
+
+          Repository layout:
+          - proxy_app/src/: HTTP proxy application
+          - crates/rotator/src/: provider rotation, credentials, rate limiting
+          - crates/config/src/: configuration loading
+          - crates/models/src/: API model types
+          - crates/cli/src/: CLI
+
+          User comment:
+          ${COMMENT_BODY}
+
+          Thread context:
+          ${THREAD_CONTEXT}
+
+          Rust verification output:
+          ${RUST_CHECKS}
+
+          Reply with a concise, actionable GitHub comment. Mention relevant Rust crates/files when useful.
+          PROMPT
+          envsubst < "$prompt_file" | opencode run --share - > "$response_file"
+          gh issue comment "$THREAD_NUMBER" --repo "${{ github.repository }}" --body-file "$response_file"

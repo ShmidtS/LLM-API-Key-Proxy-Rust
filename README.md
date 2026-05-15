@@ -89,7 +89,7 @@ cargo test --workspace
 cargo clippy --workspace -- -D warnings
 ```
 
-Текущее состояние миграции: 129 tests проходят, `cargo clippy --workspace -- -D warnings` чист.
+Текущее состояние миграции: 164 tests проходят, `cargo clippy --workspace -- -D warnings` чист.
 
 ## Миграция из Python
 
@@ -106,3 +106,21 @@ cargo clippy --workspace -- -D warnings
 | Usage tracking | JSON usage accounting с background flush. |
 | Admin utilities | `/admin/stats`, `/admin/token_count`, `/admin/cost_estimate`. |
 | Runtime monitoring | `proxy-tui` на ratatui. |
+| Responses API | Нативный translation в `/v1/responses` — нормализация `input` -> `messages`, non-stream и SSE stream conversion. |
+| Z.ai dispatch | Tools, agents, video endpoints маршрутизируются на `zai` provider методы через `provider_method_call`. |
+| OAuth flows | Интерактивный PKCE + callback server для Google, Qwen, iFlow. Refresh-token flow. |
+| Model info service | Динамические каталоги OpenRouter / Models.dev с background refresh. |
+| CLI tooling | `proxy-cli` — credentials list/show, OAuth setup/list/delete, env export. |
+| GitHub Actions CI | `cargo fmt`, `clippy`, `test`, Docker build, release binary, compliance check, PR/issue automation. |
+
+## Что не мигрировано (deferred / non-goals)
+
+Следующие Python desktop/GUI компоненты не перенесены в Rust — операционная модель Rust-версии ориентирована на env/config/Docker-first подход:
+
+| Python компонент | Причина deferral |
+| --- | --- |
+| `settings_tool.py`, `settings_dialogs/*` | Desktop GUI на customtkinter; заменено env-конфигурацией и `proxy-cli`. |
+| `launcher_tui.py`, `onboarding.py` | Python launcher/onboarding GUI; запуск через `cargo run --bin proxy_app`. |
+| `quota_viewer.py`, `quota_api_client.py` | Quota viewer GUI; admin stats доступны через `/admin/stats` и `proxy-tui`. |
+| `model_filter_gui.py`, `model_filter_engine.py` | Model filter GUI; фильтрация через `MODEL_ALLOWLIST` / `MODEL_DENYLIST` env. |
+| `customtkinter` widgets и dialogs | Не переносятся; вся конфигурация в env/TOML/JSON. |

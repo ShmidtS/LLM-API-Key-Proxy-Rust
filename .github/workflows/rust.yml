@@ -17,7 +17,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.85
+          toolchain: 1.86
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2

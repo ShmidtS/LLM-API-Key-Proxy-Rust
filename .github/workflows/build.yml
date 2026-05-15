@@ -1,0 +1,214 @@
+name: Build and Release Executable
+
+# ╔═══════════════════════════════════════════════════════════════════════════════════════╗
+# ║                              CONFIGURATION SECTION                                  ║
+# ╚═══════════════════════════════════════════════════════════════════════════════════════╝
+
+env:
+  BUILD_BRANCHES: "dev,main"
+  STABLE_BRANCHES: "main"
+  FALLBACK_BRANCHES: "main master develop dev"
+  RELEASE_FILES_ALL: ".env.example README.md DOCUMENTATION.md LICENSE"
+  RELEASE_FILES_WINDOWS: ""
+  RELEASE_FILES_LINUX: ""
+  RELEASE_FILES_MACOS: ""
+  FILE_DESCRIPTIONS: |
+    proxy_app.exe|Main Rust application executable for **Windows**.
+    proxy_app|Main Rust application executable for **Linux** and **macOS**.
+  EXPERIMENTAL_WARNING: |
+    > [!WARNING]
+    > This release is from the [`{BRANCH}`](https://github.com/{REPO}/tree/{BRANCH}) branch and is **highly unstable**. It contains features that are under active development, may be feature-incomplete, contain bugs, or have features that will be removed in the future.
+  PRUNE_ENABLED: "false"
+  PRUNE_PROTECTED_BRANCHES: "main,master,production,prod,staging,develop"
+  PRUNE_RETENTION_DAYS: "1"
+  PRUNE_KEEP_DAILY_SNAPSHOT: "true"
+  PRUNE_MAX_COUNT: "10"
+
+on:
+  workflow_dispatch:
+    inputs:
+      manual_previous_tag:
+        description: 'Optional: Manually set the previous tag to generate the changelog from.'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Dry run mode for pruning (preview without deleting)'
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches:
+      - dev
+      - main
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'proxy_app/**'
+      - 'crates/**'
+      - '.github/workflows/build.yml'
+      - 'cliff.toml'
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.86
+          components: rustfmt, clippy
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Build executable
+        run: cargo build --release -p proxy_app
+
+      - name: Get short SHA
+        id: version
+        shell: bash
+        run: |
+          sha=$(git rev-parse --short HEAD)
+          echo "sha=$sha" >> $GITHUB_OUTPUT
+
+      - name: Prepare files for artifact
+        shell: bash
+        run: |
+          stagingDir="staging"
+          mkdir -p "$stagingDir"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/release/proxy_app.exe "$stagingDir/"
+          else
+            cp target/release/proxy_app "$stagingDir/"
+          fi
+          for file in ${{ env.RELEASE_FILES_ALL }}; do
+            if [ -f "$file" ]; then
+              cp "$file" "$stagingDir/"
+            fi
+          done
+
+      - name: Archive build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxy-app-build-${{ runner.os }}-${{ steps.version.outputs.sha }}
+          path: staging/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Fetch all tags and history
+        shell: bash
+        run: git fetch --prune --tags
+
+      - name: Get short SHA
+        id: get_sha
+        shell: bash
+        run: echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Generate Build Version
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH_NAME="${GITHUB_REF_NAME//\//-}"
+          DATE_STAMP=$(date -u +"%Y.%m.%d")
+          BUILD_COUNT=$(gh release list --repo "${{ github.repository }}" --limit 100 | { grep -E "$BRANCH_NAME/build-$DATE_STAMP" || true; } | wc -l)
+          BUILD_NUMBER=$((BUILD_COUNT + 1))
+          VERSION="$DATE_STAMP-$BUILD_NUMBER-${{ steps.get_sha.outputs.sha }}"
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          echo "archive_version_part=$VERSION" >> $GITHUB_OUTPUT
+          echo "release_title=Build ($BRANCH_NAME): $VERSION" >> $GITHUB_OUTPUT
+          echo "release_tag=$BRANCH_NAME/build-$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: proxy-app-build-*-${{ steps.get_sha.outputs.sha }}
+
+      - name: Archive release files
+        id: archive
+        shell: bash
+        run: |
+          mkdir -p archives
+          for dir in release-assets/proxy-app-build-*; do
+            [ -d "$dir" ] || continue
+            case "$dir" in
+              *Windows*) os_name="Windows" ;;
+              *Linux*) os_name="Linux" ;;
+              *macOS*) os_name="macOS" ;;
+              *) os_name="Unknown" ;;
+            esac
+            archive_name="LLM-API-Key-Proxy-Rust-${os_name}-${{ steps.version.outputs.archive_version_part }}.zip"
+            (cd "$dir" && zip -r "../../archives/$archive_name" .)
+          done
+          echo "archives=$(find archives -name '*.zip' -type f | tr '\n' ' ')" >> $GITHUB_OUTPUT
+
+      - name: Generate Build Metadata
+        id: metadata
+        shell: bash
+        run: |
+          WINDOWS_EXE=$(find release-assets -name "proxy_app.exe" -type f | head -1)
+          LINUX_EXE=$(find release-assets -path "*/proxy-app-build-Linux-*/proxy_app" -type f | head -1)
+          MACOS_EXE=$(find release-assets -path "*/proxy-app-build-macOS-*/proxy_app" -type f | head -1)
+          echo "win_build_size=$([ -n "$WINDOWS_EXE" ] && du -sh "$WINDOWS_EXE" | cut -f1 || echo Unknown)" >> $GITHUB_OUTPUT
+          echo "linux_build_size=$([ -n "$LINUX_EXE" ] && du -sh "$LINUX_EXE" | cut -f1 || echo Unknown)" >> $GITHUB_OUTPUT
+          echo "macos_build_size=$([ -n "$MACOS_EXE" ] && du -sh "$MACOS_EXE" | cut -f1 || echo Unknown)" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH_NAME="${{ steps.version.outputs.branch_name }}"
+          PRERELEASE_FLAG="--prerelease"
+          if [[ ",${{ env.STABLE_BRANCHES }}," == *",$BRANCH_NAME,"* ]]; then
+            PRERELEASE_FLAG="--latest"
+          fi
+
+          RELEASE_NOTES=$(mktemp)
+          if [ "$PRERELEASE_FLAG" = "--prerelease" ]; then
+            echo "${{ env.EXPERIMENTAL_WARNING }}" | sed "s/{BRANCH}/$BRANCH_NAME/g; s|{REPO}|${{ github.repository }}|g" >> "$RELEASE_NOTES"
+            echo "" >> "$RELEASE_NOTES"
+          fi
+          cat >> "$RELEASE_NOTES" <<EOF
+          ## Rust Executable Builds
+
+          | Platform | Size |
+          | --- | --- |
+          | Windows | ${{ steps.metadata.outputs.win_build_size }} |
+          | Linux | ${{ steps.metadata.outputs.linux_build_size }} |
+          | macOS | ${{ steps.metadata.outputs.macos_build_size }} |
+
+          Built from commit ${{ github.sha }}.
+          EOF
+
+          gh release create "${{ steps.version.outputs.release_tag }}" ${{ steps.archive.outputs.archives }} \
+            --repo "${{ github.repository }}" \
+            --title "${{ steps.version.outputs.release_title }}" \
+            --notes-file "$RELEASE_NOTES" \
+            $PRERELEASE_FLAG
