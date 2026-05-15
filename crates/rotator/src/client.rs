@@ -179,6 +179,15 @@ impl RotatorClient {
         Err(RotatorError::Exhausted(self.max_retries))
     }
 
+    pub async fn provider_method_call(
+        &self,
+        provider: &str,
+        method: &str,
+        body: serde_json::Value,
+    ) -> Result<reqwest::Response> {
+        self.request(provider, method, body).await
+    }
+
     pub fn circuit_state(&self, provider: &str) -> CircuitState {
         self.circuit_breakers.get_state(provider)
     }
@@ -384,28 +393,17 @@ impl RotatorClient {
         let cached = self.oauth_manager.get_token(&cache_key);
 
         if raw_expired || cached.is_some() {
-            let token_endpoint = definition
-                .token_endpoint
-                .as_ref()
-                .ok_or_else(|| {
-                    RotatorError::Other(format!(
-                        "Missing token_endpoint for provider {provider}"
-                    ))
-                })?;
-            let client_id = definition
-                .client_id
-                .as_ref()
-                .ok_or_else(|| {
-                    RotatorError::Other(format!(
-                        "Missing client_id for provider {provider}"
-                    ))
-                })?;
+            let token_endpoint = definition.token_endpoint.as_ref().ok_or_else(|| {
+                RotatorError::Other(format!("Missing token_endpoint for provider {provider}"))
+            })?;
+            let client_id = definition.client_id.as_ref().ok_or_else(|| {
+                RotatorError::Other(format!("Missing client_id for provider {provider}"))
+            })?;
             let client_secret = definition.client_secret.as_deref();
 
             let lock = {
                 let entry = self.oauth_refresh_locks.entry(cache_key.clone());
-                let guard = entry
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
+                let guard = entry.or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
                 guard.clone()
             };
             let _guard = lock.lock().await;
@@ -430,7 +428,8 @@ impl RotatorClient {
             return Ok(access_token);
         }
 
-        self.oauth_manager.set_token(&cache_key, oauth_token.clone());
+        self.oauth_manager
+            .set_token(&cache_key, oauth_token.clone());
         Ok(oauth_token.access_token)
     }
 
@@ -859,9 +858,9 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_refresh_is_single_flight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
-        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let refresh_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let refresh_addr = refresh_listener.local_addr().unwrap();
@@ -924,7 +923,11 @@ mod tests {
         );
         assert!(resp1.is_ok());
         assert!(resp2.is_ok());
-        assert_eq!(refresh_count.load(Ordering::SeqCst), 1, "refresh should happen exactly once");
+        assert_eq!(
+            refresh_count.load(Ordering::SeqCst),
+            1,
+            "refresh should happen exactly once"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

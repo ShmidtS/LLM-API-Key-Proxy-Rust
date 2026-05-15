@@ -85,7 +85,10 @@ async fn chat_completions(
         return Ok(builder.body(Body::from_stream(stream)).unwrap());
     }
 
-    let resp = state.rotator.request(&provider, upstream_path, upstream_body).await?;
+    let resp = state
+        .rotator
+        .request(&provider, upstream_path, upstream_body)
+        .await?;
     let mut response = if provider == "anthropic" {
         let status = resp.status();
         let headers = resp.headers().clone();

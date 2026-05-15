@@ -26,7 +26,10 @@ pub fn openai_to_anthropic_messages(body: &Value) -> Value {
         .into_iter()
         .flatten()
     {
-        let role = message.get("role").and_then(Value::as_str).unwrap_or("user");
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
         let content = message.get("content").unwrap_or(&Value::Null);
 
         if role == "system" {
@@ -113,7 +116,9 @@ pub fn anthropic_stream_to_openai_sse(chunk: &str, model: &str) -> Option<String
             Some("content_block_delta") => value
                 .pointer("/delta/text")
                 .and_then(Value::as_str)
-                .map(|text| openai_stream_chunk(None, model, json!({ "content": text }), Value::Null)),
+                .map(|text| {
+                    openai_stream_chunk(None, model, json!({ "content": text }), Value::Null)
+                }),
             Some("message_delta") => Some(openai_stream_chunk(
                 None,
                 model,

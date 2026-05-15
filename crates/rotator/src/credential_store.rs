@@ -101,7 +101,10 @@ mod tests {
             manager.credentials.get("openai").unwrap()[0].concurrent_limit,
             2
         );
-        assert_eq!(manager.credentials.get("anthropic").unwrap()[0].key, "key-2");
+        assert_eq!(
+            manager.credentials.get("anthropic").unwrap()[0].key,
+            "key-2"
+        );
     }
 
     #[test]

@@ -149,11 +149,7 @@ impl OAuthProvider {
             form.push(("client_secret", client_secret));
         }
 
-        let response = client
-            .post(&self.token_endpoint)
-            .form(&form)
-            .send()
-            .await?;
+        let response = client.post(&self.token_endpoint).form(&form).send().await?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -295,11 +291,7 @@ pub async fn refresh_oauth_token(
         form.push(("client_secret", client_secret));
     }
 
-    let response = client
-        .post(token_endpoint)
-        .form(&form)
-        .send()
-        .await?;
+    let response = client.post(token_endpoint).form(&form).send().await?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
@@ -313,7 +305,9 @@ pub async fn refresh_oauth_token(
         .map(|expires_in| chrono::Utc::now().timestamp() as u64 + expires_in);
     Ok(OAuthToken {
         access_token: refreshed.access_token,
-        refresh_token: refreshed.refresh_token.or_else(|| token.refresh_token.clone()),
+        refresh_token: refreshed
+            .refresh_token
+            .or_else(|| token.refresh_token.clone()),
         expires_at,
         token_type: refreshed.token_type.unwrap_or_else(|| "Bearer".to_owned()),
     })

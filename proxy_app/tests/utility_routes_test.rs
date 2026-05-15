@@ -306,8 +306,22 @@ async fn tools_routes_attempt_forwarding() {
         std::env::set_var("ADMIN_TOKEN", "test-admin-token");
     }
 
+    let (status, json) = request_json_with_auth(
+        Method::POST,
+        "/v1/tools/web-search",
+        Some("Bearer test-admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "/v1/tools/web-search");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("query or input"),
+        "/v1/tools/web-search"
+    );
+
     let routes = [
-        (Method::POST, "/v1/tools/web-search"),
         (Method::POST, "/v1/tools/tokenizer"),
         (Method::POST, "/v1/tools/layout-parsing"),
         (Method::POST, "/v1/tools/web-reader"),
@@ -321,7 +335,7 @@ async fn tools_routes_attempt_forwarding() {
             json["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("no credentials available for provider: openai"),
+                .contains("no credentials available for provider: zai"),
             "{uri}"
         );
     }

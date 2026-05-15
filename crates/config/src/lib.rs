@@ -89,7 +89,11 @@ where
 fn apply_optional_string_env(key: &str, target: &mut Option<String>) {
     if let Ok(value) = env::var(key) {
         let trimmed = trim_quotes(&value);
-        *target = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+        *target = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
     }
 }
 

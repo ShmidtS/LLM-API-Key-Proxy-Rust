@@ -27,43 +27,41 @@ fn cors_layer(config: &ProxyConfig) -> Option<CorsLayer> {
         return None;
     }
 
-    let origins = config
-        .cors_allowed_origins
-        .iter()
-        .filter_map(|origin| match HeaderValue::from_str(origin) {
-            Ok(origin) => Some(origin),
-            Err(_) => {
-                tracing::warn!("ignoring invalid cors_allowed_origins entry: {}", origin);
-                None
+    let origins =
+        config.cors_allowed_origins.iter().filter_map(|origin| {
+            match HeaderValue::from_str(origin) {
+                Ok(origin) => Some(origin),
+                Err(_) => {
+                    tracing::warn!("ignoring invalid cors_allowed_origins entry: {}", origin);
+                    None
+                }
             }
         });
     let mut cors = CorsLayer::new().allow_origin(AllowOrigin::list(origins));
 
     if !config.cors_allowed_methods.is_empty() {
-        let methods = config
-            .cors_allowed_methods
-            .iter()
-            .filter_map(|method| match method.parse::<Method>() {
+        let methods = config.cors_allowed_methods.iter().filter_map(|method| {
+            match method.parse::<Method>() {
                 Ok(method) => Some(method),
                 Err(_) => {
                     tracing::warn!("ignoring invalid cors_allowed_methods entry: {}", method);
                     None
                 }
-            });
+            }
+        });
         cors = cors.allow_methods(AllowMethods::list(methods));
     }
 
     if !config.cors_allowed_headers.is_empty() {
-        let headers = config
-            .cors_allowed_headers
-            .iter()
-            .filter_map(|header| match header.parse::<HeaderName>() {
+        let headers = config.cors_allowed_headers.iter().filter_map(|header| {
+            match header.parse::<HeaderName>() {
                 Ok(header) => Some(header),
                 Err(_) => {
                     tracing::warn!("ignoring invalid cors_allowed_headers entry: {}", header);
                     None
                 }
-            });
+            }
+        });
         cors = cors.allow_headers(AllowHeaders::list(headers));
     }
 
