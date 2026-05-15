@@ -1,11 +1,10 @@
 use crate::errors::AppError;
-use crate::routes::utils::{not_implemented, upstream_response};
+use crate::routes::utils::upstream_response;
 use crate::state::AppState;
-use axum::http::StatusCode;
 use axum::response::Response;
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     routing::{get, post},
 };
 use serde_json::Value;
@@ -49,8 +48,15 @@ async fn variations(
     proxy_image_request(state, "images/variations", req).await
 }
 
-async fn get_image() -> (StatusCode, Json<Value>) {
-    (StatusCode::NOT_IMPLEMENTED, not_implemented())
+async fn get_image(
+    State(state): State<AppState>,
+    Path(image_id): Path<String>,
+) -> Result<Response, AppError> {
+    let upstream = state
+        .rotator
+        .get("openai", &format!("images/{image_id}"))
+        .await?;
+    upstream_response(upstream).await
 }
 
 async fn proxy_image_request(

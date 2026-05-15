@@ -300,7 +300,7 @@ async fn admin_cost_estimate_uses_model_prices() {
 }
 
 #[tokio::test]
-async fn tools_routes_return_not_implemented() {
+async fn tools_routes_attempt_forwarding() {
     let _guard = ADMIN_TOKEN_LOCK.lock().await;
     unsafe {
         std::env::set_var("ADMIN_TOKEN", "test-admin-token");
@@ -316,8 +316,14 @@ async fn tools_routes_return_not_implemented() {
     for (method, uri) in routes {
         let (status, json) =
             request_json_with_auth(method, uri, Some("Bearer test-admin-token")).await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{uri}");
-        assert_eq!(json["error"], "Not Implemented", "{uri}");
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{uri}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no credentials available for provider: openai"),
+            "{uri}"
+        );
     }
 
     unsafe {
@@ -326,7 +332,7 @@ async fn tools_routes_return_not_implemented() {
 }
 
 #[tokio::test]
-async fn agents_routes_return_not_implemented() {
+async fn agents_routes_attempt_forwarding() {
     let _guard = ADMIN_TOKEN_LOCK.lock().await;
     unsafe {
         std::env::set_var("ADMIN_TOKEN", "test-admin-token");
@@ -342,8 +348,14 @@ async fn agents_routes_return_not_implemented() {
     for (method, uri) in routes {
         let (status, json) =
             request_json_with_auth(method, uri, Some("Bearer test-admin-token")).await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{uri}");
-        assert_eq!(json["error"], "Not Implemented", "{uri}");
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{uri}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no credentials available for provider: openai"),
+            "{uri}"
+        );
     }
 
     unsafe {

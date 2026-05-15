@@ -58,6 +58,9 @@ fn test_state(provider: &str, base_url: String, model_pattern: &str) -> AppState
         model_count: 1,
         timeout_secs: 30,
         default_headers: HashMap::new(),
+        token_endpoint: None,
+        client_id: None,
+        client_secret: None,
     });
 
     let credentials = CredentialManager::new();

@@ -21,15 +21,11 @@ pub fn router() -> Router<AppState> {
 async fn get_response(
     State(state): State<AppState>,
     Path(response_id): Path<String>,
-    OriginalUri(uri): OriginalUri,
+    OriginalUri(_uri): OriginalUri,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, AppError> {
     let query_vec = params.into_iter().collect::<Vec<_>>();
-    let path = if uri.path().starts_with("/v1/") {
-        format!("responses/{response_id}")
-    } else {
-        format!("responses/{response_id}")
-    };
+    let path = format!("responses/{response_id}");
     let upstream = state
         .rotator
         .get_with_query("openai", &path, &query_vec)

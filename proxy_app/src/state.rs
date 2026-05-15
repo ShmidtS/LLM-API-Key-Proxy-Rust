@@ -80,14 +80,16 @@ mod tests {
 
     #[tokio::test]
     async fn from_config_stores_proxy_config() {
-        let mut config = ProxyConfig::default();
-        config.host = "0.0.0.0".to_owned();
-        config.port = 9000;
-        config.request_timeout_secs = 45;
-        config.max_retries = 7;
-        config.usage_path = "target/test-usage-a002.json".to_owned();
-        config.usage_flush_interval_secs = 5;
-        config.usage_batch_size = 2;
+        let config = ProxyConfig {
+            host: "0.0.0.0".to_owned(),
+            port: 9000,
+            request_timeout_secs: 45,
+            max_retries: 7,
+            usage_path: "target/test-usage-a002.json".to_owned(),
+            usage_flush_interval_secs: 5,
+            usage_batch_size: 2,
+            ..Default::default()
+        };
 
         let state = AppState::from_config(config);
 

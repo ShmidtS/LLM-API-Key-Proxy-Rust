@@ -172,10 +172,12 @@ mod tests {
 
     #[tokio::test]
     async fn allows_configured_cors_origin_methods_and_headers() {
-        let mut config = ProxyConfig::default();
-        config.cors_allowed_origins = vec!["https://example.com".to_owned()];
-        config.cors_allowed_methods = vec!["GET".to_owned()];
-        config.cors_allowed_headers = vec!["authorization".to_owned()];
+        let config = ProxyConfig {
+            cors_allowed_origins: vec!["https://example.com".to_owned()],
+            cors_allowed_methods: vec!["GET".to_owned()],
+            cors_allowed_headers: vec!["authorization".to_owned()],
+            ..Default::default()
+        };
         let app = build_app_with_state(state::AppState::from_config(config));
 
         let response = app
@@ -217,11 +219,12 @@ mod tests {
 
     #[tokio::test]
     async fn skips_invalid_cors_entries() {
-        let mut config = ProxyConfig::default();
-        config.cors_allowed_origins =
-            vec!["not a header".to_owned(), "https://example.com".to_owned()];
-        config.cors_allowed_methods = vec!["NOT A METHOD".to_owned(), "GET".to_owned()];
-        config.cors_allowed_headers = vec!["not a header".to_owned(), "authorization".to_owned()];
+        let config = ProxyConfig {
+            cors_allowed_origins: vec!["not a header".to_owned(), "https://example.com".to_owned()],
+            cors_allowed_methods: vec!["NOT A METHOD".to_owned(), "GET".to_owned()],
+            cors_allowed_headers: vec!["not a header".to_owned(), "authorization".to_owned()],
+            ..Default::default()
+        };
         let app = build_app_with_state(state::AppState::from_config(config));
 
         let response = app

@@ -30,7 +30,7 @@ pub use provider_registry::{AuthType, ProviderDefinition, ProviderRegistry};
 pub use provider_utils::{extract_usage, transform_tool_schema};
 pub use providers::oauth::{
     GoogleOAuthFlow, IflowOAuthFlow, OAuthFlow, OAuthManager, OAuthProvider, OAuthToken,
-    QwenOAuthFlow,
+    QwenOAuthFlow, RefreshTokenResponse, refresh_oauth_token,
 };
 pub use providers::{Provider, ProviderManager};
 pub use rate_limiter::{RateLimiterRegistry, TokenBucket};

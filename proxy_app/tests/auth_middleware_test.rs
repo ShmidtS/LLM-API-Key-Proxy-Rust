@@ -8,9 +8,11 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 fn state_with_auth() -> AppState {
-    let mut config = ProxyConfig::default();
-    config.admin_token = Some("admin-secret".to_owned());
-    config.api_keys = vec!["proxy-secret".to_owned()];
+    let config = ProxyConfig {
+        admin_token: Some("admin-secret".to_owned()),
+        api_keys: vec!["proxy-secret".to_owned()],
+        ..Default::default()
+    };
     AppState::from_config(config)
 }
 

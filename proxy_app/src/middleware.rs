@@ -61,8 +61,8 @@ pub async fn require_proxy_auth(
 
     let is_valid = auth_token
         .into_iter()
-        .chain(api_key.into_iter())
-        .any(|token| valid_tokens.iter().any(|&valid| valid == token));
+        .chain(api_key)
+        .any(|token| valid_tokens.contains(&token));
 
     if is_valid {
         next.run(request).await

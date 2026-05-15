@@ -1,14 +1,14 @@
 use crate::errors::AppError;
-use crate::routes::utils::{not_implemented, upstream_response};
+use crate::routes::utils::upstream_response;
 use crate::state::AppState;
-use axum::extract::{OriginalUri, State};
-use axum::http::StatusCode;
+use axum::extract::{OriginalUri, Query, State};
 use axum::response::Response;
 use axum::{
     Json, Router,
     routing::{get, post},
 };
 use serde_json::Value;
+use std::collections::HashMap;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -20,8 +20,17 @@ pub fn router() -> Router<AppState> {
         .route("/v1/video/{video_id}/status", get(video_status))
 }
 
-async fn video_status() -> (StatusCode, Json<Value>) {
-    (StatusCode::NOT_IMPLEMENTED, not_implemented())
+async fn video_status(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    let query_vec = params.into_iter().collect::<Vec<_>>();
+    let upstream = state
+        .rotator
+        .get_with_query("openai", upstream_path(uri.path()), &query_vec)
+        .await?;
+    upstream_response(upstream).await
 }
 
 async fn video_post_passthrough(

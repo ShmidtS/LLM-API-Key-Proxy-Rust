@@ -66,6 +66,9 @@ fn test_state(providers: Vec<(&str, String)>) -> proxy_app::state::AppState {
             model_count: 1,
             timeout_secs: 30,
             default_headers: HashMap::new(),
+            token_endpoint: None,
+            client_id: None,
+            client_secret: None,
         });
         credentials.register_keys(id.to_owned(), vec![format!("{id}-key")], 10);
     }

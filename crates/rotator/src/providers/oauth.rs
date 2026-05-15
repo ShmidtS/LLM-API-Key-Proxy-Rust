@@ -95,11 +95,11 @@ pub struct OAuthProvider {
 }
 
 #[derive(Debug, Deserialize)]
-struct RefreshTokenResponse {
-    access_token: String,
-    refresh_token: Option<String>,
-    expires_in: Option<u64>,
-    token_type: Option<String>,
+pub struct RefreshTokenResponse {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_in: Option<u64>,
+    pub token_type: Option<String>,
 }
 
 impl OAuthProvider {
@@ -149,15 +149,19 @@ impl OAuthProvider {
             form.push(("client_secret", client_secret));
         }
 
-        let refreshed: RefreshTokenResponse = client
+        let response = client
             .post(&self.token_endpoint)
             .form(&form)
             .send()
-            .await?
-            .error_for_status()
-            .map_err(|error| RotatorError::Http(error.to_string()))?
-            .json()
             .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RotatorError::Other(format!(
+                "OAuth refresh failed ({status}): {body}"
+            )));
+        }
+        let refreshed: RefreshTokenResponse = response.json().await?;
         let token_expiry = refreshed
             .expires_in
             .map(|expires_in| Instant::now() + Duration::from_secs(expires_in));
@@ -235,40 +239,84 @@ impl OAuthManager {
         Self::default()
     }
 
-    pub fn get_token(&self, provider_id: &str) -> Option<OAuthToken> {
-        self.tokens.get(provider_id).map(|token| token.clone())
+    pub fn get_token(&self, cache_key: &str) -> Option<OAuthToken> {
+        self.tokens.get(cache_key).map(|token| token.clone())
     }
 
-    pub fn set_token(&self, provider_id: &str, token: OAuthToken) {
-        self.tokens.insert(provider_id.to_owned(), token);
+    pub fn set_token(&self, cache_key: &str, token: OAuthToken) {
+        self.tokens.insert(cache_key.to_owned(), token);
     }
 
-    pub fn is_expired(&self, provider_id: &str) -> bool {
+    pub fn is_expired(&self, cache_key: &str) -> bool {
         self.tokens
-            .get(provider_id)
+            .get(cache_key)
             .and_then(|token| token.expires_at)
             .is_some_and(|expires_at| expires_at <= chrono::Utc::now().timestamp() as u64)
     }
 
     pub async fn refresh_if_needed<F, Fut>(
         &self,
-        provider_id: &str,
+        cache_key: &str,
         refresh_fn: F,
     ) -> Result<OAuthToken>
     where
         F: Fn(&str) -> Fut,
         Fut: Future<Output = Result<OAuthToken>>,
     {
-        if !self.is_expired(provider_id)
-            && let Some(token) = self.get_token(provider_id)
+        if !self.is_expired(cache_key)
+            && let Some(token) = self.get_token(cache_key)
         {
             return Ok(token);
         }
 
-        let token = refresh_fn(provider_id).await?;
-        self.set_token(provider_id, token.clone());
+        let token = refresh_fn(cache_key).await?;
+        self.set_token(cache_key, token.clone());
         Ok(token)
     }
+}
+
+pub async fn refresh_oauth_token(
+    client: &reqwest::Client,
+    token_endpoint: &str,
+    client_id: &str,
+    client_secret: Option<&str>,
+    token: &OAuthToken,
+) -> Result<OAuthToken> {
+    let refresh_token = token
+        .refresh_token
+        .as_ref()
+        .ok_or_else(|| RotatorError::Other("missing OAuth refresh token".to_owned()))?;
+    let mut form = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token.as_str()),
+        ("client_id", client_id),
+    ];
+    if let Some(client_secret) = client_secret {
+        form.push(("client_secret", client_secret));
+    }
+
+    let response = client
+        .post(token_endpoint)
+        .form(&form)
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(RotatorError::Other(format!(
+            "OAuth refresh failed ({status}): {body}"
+        )));
+    }
+    let refreshed: RefreshTokenResponse = response.json().await?;
+    let expires_at = refreshed
+        .expires_in
+        .map(|expires_in| chrono::Utc::now().timestamp() as u64 + expires_in);
+    Ok(OAuthToken {
+        access_token: refreshed.access_token,
+        refresh_token: refreshed.refresh_token.or_else(|| token.refresh_token.clone()),
+        expires_at,
+        token_type: refreshed.token_type.unwrap_or_else(|| "Bearer".to_owned()),
+    })
 }
 
 pub fn auth_headers_oauth(token: &OAuthToken) -> Vec<(String, String)> {
@@ -340,9 +388,9 @@ mod tests {
         let refreshed = manager
             .refresh_if_needed("provider", {
                 let calls = Arc::clone(&calls);
-                move |provider_id| {
+                move |cache_key| {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    let access_token = format!("new-{provider_id}");
+                    let access_token = format!("new-{cache_key}");
                     async move { Ok(token(&access_token, Some(now() + 60))) }
                 }
             })

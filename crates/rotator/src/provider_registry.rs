@@ -21,6 +21,9 @@ pub struct ProviderDefinition {
     pub model_count: usize,
     pub timeout_secs: u64,
     pub default_headers: HashMap<String, String>,
+    pub token_endpoint: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -122,6 +125,15 @@ impl ProviderRegistry {
                 .get(&id)
                 .map(|def| def.default_headers)
                 .unwrap_or_default();
+            let token_endpoint = std::env::var(format!("PROXY_{provider_key}_TOKEN_ENDPOINT"))
+                .ok()
+                .or_else(|| self.get(&id).and_then(|def| def.token_endpoint));
+            let client_id = std::env::var(format!("PROXY_{provider_key}_CLIENT_ID"))
+                .ok()
+                .or_else(|| self.get(&id).and_then(|def| def.client_id));
+            let client_secret = std::env::var(format!("PROXY_{provider_key}_CLIENT_SECRET"))
+                .ok()
+                .or_else(|| self.get(&id).and_then(|def| def.client_secret));
 
             self.register(ProviderDefinition {
                 id,
@@ -134,6 +146,9 @@ impl ProviderRegistry {
                 model_count,
                 timeout_secs,
                 default_headers,
+                token_endpoint,
+                client_id,
+                client_secret,
             });
         }
     }
@@ -302,14 +317,18 @@ fn default_provider_definitions() -> Vec<ProviderDefinition> {
             60,
             &[],
         ),
-        provider(
-            "gemini_cli",
-            "https://cloudcode-pa.googleapis.com/v1internal",
-            AuthType::OAuth,
-            &[r"^gemini_cli/.*"],
-            120,
-            &[],
-        ),
+        {
+            let mut def = provider(
+                "gemini_cli",
+                "https://cloudcode-pa.googleapis.com/v1internal",
+                AuthType::OAuth,
+                &[r"^gemini_cli/.*"],
+                120,
+                &[],
+            );
+            def.token_endpoint = Some("https://oauth2.googleapis.com/token".to_owned());
+            def
+        },
         provider(
             "anthropic",
             "https://api.anthropic.com/v1",
@@ -420,14 +439,18 @@ fn default_provider_definitions() -> Vec<ProviderDefinition> {
             60,
             &[],
         ),
-        provider(
-            "antigravity",
-            "https://cloudcode-pa.googleapis.com/v1internal",
-            AuthType::OAuth,
-            &[r"^antigravity/.*", r"^ag/.*"],
-            120,
-            &[],
-        ),
+        {
+            let mut def = provider(
+                "antigravity",
+                "https://cloudcode-pa.googleapis.com/v1internal",
+                AuthType::OAuth,
+                &[r"^antigravity/.*", r"^ag/.*"],
+                120,
+                &[],
+            );
+            def.token_endpoint = Some("https://oauth2.googleapis.com/token".to_owned());
+            def
+        },
         provider(
             "openrouter",
             "https://openrouter.ai/api/v1",
@@ -480,6 +503,9 @@ fn provider(
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect(),
+        token_endpoint: None,
+        client_id: None,
+        client_secret: None,
     }
 }
 

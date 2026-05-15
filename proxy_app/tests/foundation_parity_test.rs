@@ -10,10 +10,11 @@ fn app_with_config(config: ProxyConfig) -> axum::Router {
 }
 
 fn auth_config() -> ProxyConfig {
-    let mut config = ProxyConfig::default();
-    config.admin_token = Some("test-admin".to_owned());
-    config.api_keys = vec!["test-key".to_owned()];
-    config
+    ProxyConfig {
+        admin_token: Some("test-admin".to_owned()),
+        api_keys: vec!["test-key".to_owned()],
+        ..Default::default()
+    }
 }
 
 async fn response_json(response: axum::response::Response) -> (StatusCode, Value) {

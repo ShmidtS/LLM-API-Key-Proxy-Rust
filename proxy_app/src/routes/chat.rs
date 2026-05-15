@@ -70,7 +70,7 @@ async fn chat_completions(
                             &model,
                         )
                         .map(Bytes::from)
-                        .unwrap_or_else(Bytes::new)
+                        .unwrap_or_default()
                     } else {
                         bytes
                     }

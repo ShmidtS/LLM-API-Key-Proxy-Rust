@@ -1,8 +1,7 @@
 use crate::errors::AppError;
-use crate::routes::utils::{not_implemented, upstream_response};
+use crate::routes::utils::upstream_response;
 use crate::state::AppState;
 use axum::extract::{OriginalUri, Query, State};
-use axum::http::StatusCode;
 use axum::response::Response;
 use axum::{
     Json, Router,
@@ -13,14 +12,14 @@ use std::collections::HashMap;
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/tools/web_search", post(legacy_tool))
-        .route("/tools/tokenizer", post(legacy_tool))
-        .route("/tools/layout", post(legacy_tool))
-        .route("/tools/web_reader", post(legacy_tool))
-        .route("/v1/tools/web-search", post(legacy_tool))
-        .route("/v1/tools/tokenizer", post(legacy_tool))
-        .route("/v1/tools/layout-parsing", post(legacy_tool))
-        .route("/v1/tools/web-reader", post(legacy_tool))
+        .route("/tools/web_search", post(tools_post_passthrough))
+        .route("/tools/tokenizer", post(tools_post_passthrough))
+        .route("/tools/layout", post(tools_post_passthrough))
+        .route("/tools/web_reader", post(tools_post_passthrough))
+        .route("/v1/tools/web-search", post(tools_post_passthrough))
+        .route("/v1/tools/tokenizer", post(tools_post_passthrough))
+        .route("/v1/tools/layout-parsing", post(tools_post_passthrough))
+        .route("/v1/tools/web-reader", post(tools_post_passthrough))
         .route(
             "/v1/threads",
             post(tools_post_passthrough).get(tools_get_passthrough),
@@ -29,10 +28,6 @@ pub fn router() -> Router<AppState> {
             "/v1/threads/{*path}",
             post(tools_post_passthrough).get(tools_get_passthrough),
         )
-}
-
-async fn legacy_tool() -> (StatusCode, Json<Value>) {
-    (StatusCode::NOT_IMPLEMENTED, not_implemented())
 }
 
 async fn tools_post_passthrough(

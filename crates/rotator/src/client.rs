@@ -5,6 +5,7 @@ use crate::error::{Result, RotatorError};
 use crate::http_pool::HttpClientPool;
 use crate::provider_registry::{AuthType, ProviderRegistry};
 use crate::provider_utils::extract_usage;
+use crate::providers::oauth::{OAuthManager, OAuthToken, refresh_oauth_token};
 use crate::rate_limiter::RateLimiterRegistry;
 use crate::throttle::{ThrottleReason, classify_throttle_with_headers};
 use crate::usage::UsageManager;
@@ -12,6 +13,14 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, warn};
+
+fn oauth_cache_key(provider: &str, key: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    format!("{}:{}", provider, hasher.finish())
+}
 
 #[derive(Debug, Clone)]
 pub struct RotatorClient {
@@ -24,6 +33,8 @@ pub struct RotatorClient {
     usage_manager: Option<Arc<UsageManager>>,
     last_latency_ms: Arc<DashMap<String, u64>>,
     max_retries: usize,
+    oauth_manager: Arc<OAuthManager>,
+    oauth_refresh_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl RotatorClient {
@@ -48,6 +59,8 @@ impl RotatorClient {
             usage_manager,
             last_latency_ms: Arc::new(DashMap::new()),
             max_retries,
+            oauth_manager: Arc::new(OAuthManager::new()),
+            oauth_refresh_locks: Arc::new(DashMap::new()),
         }
     }
 
@@ -84,7 +97,8 @@ impl RotatorClient {
                 self.resolve_base_url(provider),
                 path.trim_start_matches('/')
             );
-            let request = self.apply_auth_headers(provider, client.post(&url), permit.key());
+            let token = self.resolve_auth_token(provider, permit.key()).await?;
+            let request = self.apply_auth_headers(provider, client.post(&url), &token);
             let started_at = Instant::now();
             let result = request.json(&body).send().await;
             self.last_latency_ms
@@ -197,7 +211,8 @@ impl RotatorClient {
             self.resolve_base_url(provider),
             path.trim_start_matches('/')
         );
-        let request = self.apply_auth_headers(provider, client.get(&url), permit.key());
+        let token = self.resolve_auth_token(provider, permit.key()).await?;
+        let request = self.apply_auth_headers(provider, client.get(&url), &token);
         let result = request.send().await;
 
         result.map_err(|e| RotatorError::Http(e.to_string()))
@@ -216,7 +231,8 @@ impl RotatorClient {
             self.resolve_base_url(provider),
             path.trim_start_matches('/')
         );
-        let request = self.apply_auth_headers(provider, client.delete(&url), permit.key());
+        let token = self.resolve_auth_token(provider, permit.key()).await?;
+        let request = self.apply_auth_headers(provider, client.delete(&url), &token);
         let result = request.send().await;
 
         result.map_err(|e| RotatorError::Http(e.to_string()))
@@ -240,7 +256,8 @@ impl RotatorClient {
             self.resolve_base_url(provider),
             path.trim_start_matches('/')
         );
-        let request = self.apply_auth_headers(provider, client.get(&url), permit.key());
+        let token = self.resolve_auth_token(provider, permit.key()).await?;
+        let request = self.apply_auth_headers(provider, client.get(&url), &token);
         let result = request.query(query).send().await;
 
         result.map_err(|e| RotatorError::Http(e.to_string()))
@@ -264,7 +281,8 @@ impl RotatorClient {
             self.resolve_base_url(provider),
             path.trim_start_matches('/')
         );
-        let request = self.apply_auth_headers(provider, client.delete(&url), permit.key());
+        let token = self.resolve_auth_token(provider, permit.key()).await?;
+        let request = self.apply_auth_headers(provider, client.delete(&url), &token);
         let result = request.query(query).send().await;
 
         result.map_err(|e| RotatorError::Http(e.to_string()))
@@ -327,14 +345,103 @@ impl RotatorClient {
             .into())
     }
 
+    async fn resolve_auth_token(&self, provider: &str, key: &str) -> Result<String> {
+        let definition = match self.provider_registry.get(provider) {
+            Some(def) => def,
+            None => return Ok(key.to_owned()),
+        };
+
+        if definition.auth_type != AuthType::OAuth {
+            return Ok(key.to_owned());
+        }
+
+        let oauth_token: OAuthToken = match serde_json::from_str(key) {
+            Ok(token) => token,
+            Err(_) => {
+                return Err(RotatorError::Other(format!(
+                    "invalid OAuth credential JSON for provider {provider}"
+                )));
+            }
+        };
+
+        let cache_key = oauth_cache_key(provider, key);
+
+        let is_expired_with_skew = |token: &OAuthToken| {
+            token.expires_at.is_some_and(|expires_at| {
+                let now = chrono::Utc::now().timestamp() as u64;
+                let skew = 60; // refresh 60 s before hard expiry
+                expires_at.saturating_sub(skew) <= now
+            })
+        };
+
+        if let Some(cached) = self.oauth_manager.get_token(&cache_key)
+            && !is_expired_with_skew(&cached)
+        {
+            return Ok(cached.access_token);
+        }
+
+        let raw_expired = is_expired_with_skew(&oauth_token);
+        let cached = self.oauth_manager.get_token(&cache_key);
+
+        if raw_expired || cached.is_some() {
+            let token_endpoint = definition
+                .token_endpoint
+                .as_ref()
+                .ok_or_else(|| {
+                    RotatorError::Other(format!(
+                        "Missing token_endpoint for provider {provider}"
+                    ))
+                })?;
+            let client_id = definition
+                .client_id
+                .as_ref()
+                .ok_or_else(|| {
+                    RotatorError::Other(format!(
+                        "Missing client_id for provider {provider}"
+                    ))
+                })?;
+            let client_secret = definition.client_secret.as_deref();
+
+            let lock = {
+                let entry = self.oauth_refresh_locks.entry(cache_key.clone());
+                let guard = entry
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
+                guard.clone()
+            };
+            let _guard = lock.lock().await;
+
+            if let Some(cached) = self.oauth_manager.get_token(&cache_key)
+                && !is_expired_with_skew(&cached)
+            {
+                return Ok(cached.access_token);
+            }
+
+            let client = self.http_pool.get_or_create(provider);
+            let refreshed = refresh_oauth_token(
+                &client,
+                token_endpoint,
+                client_id,
+                client_secret,
+                &oauth_token,
+            )
+            .await?;
+            let access_token = refreshed.access_token.clone();
+            self.oauth_manager.set_token(&cache_key, refreshed);
+            return Ok(access_token);
+        }
+
+        self.oauth_manager.set_token(&cache_key, oauth_token.clone());
+        Ok(oauth_token.access_token)
+    }
+
     fn apply_auth_headers(
         &self,
         provider: &str,
         mut request: reqwest::RequestBuilder,
-        key: &str,
+        token: &str,
     ) -> reqwest::RequestBuilder {
         if provider == "gemini" {
-            request = request.query(&[("key", key)]);
+            request = request.query(&[("key", token)]);
         }
         if let Some(definition) = self.provider_registry.get(provider) {
             for (header_key, value) in definition.default_headers {
@@ -343,15 +450,15 @@ impl RotatorClient {
             match definition.auth_type {
                 AuthType::ApiKey => {
                     if provider != "gemini" {
-                        request = request.header("x-api-key", key);
+                        request = request.header("x-api-key", token);
                     }
                 }
                 AuthType::Bearer | AuthType::OAuth => {
-                    request = request.header("Authorization", format!("Bearer {key}"));
+                    request = request.header("Authorization", format!("Bearer {token}"));
                 }
             }
         } else {
-            request = request.header("Authorization", format!("Bearer {key}"));
+            request = request.header("Authorization", format!("Bearer {token}"));
         }
         request
     }
@@ -421,6 +528,9 @@ mod tests {
             model_count: 1,
             timeout_secs: 60,
             default_headers: HashMap::new(),
+            token_endpoint: None,
+            client_id: None,
+            client_secret: None,
         });
 
         (registry, calls)
@@ -606,5 +716,215 @@ mod tests {
 
         RotatorClient::transform_request("gemini", &mut body);
         assert_eq!(body["model"], "models/gemini-2.5-flash");
+    }
+
+    #[tokio::test]
+    async fn oauth_token_is_parsed_and_used_as_bearer() {
+        let (registry, calls) = test_provider(vec![200]).await;
+        let mut registry_def = registry.get("test").unwrap();
+        registry_def.auth_type = AuthType::OAuth;
+        registry.register(registry_def);
+
+        let credentials = CredentialManager::new();
+        let oauth_json = serde_json::to_string(&crate::providers::oauth::OAuthToken {
+            access_token: "oauth-access-123".to_owned(),
+            refresh_token: None,
+            expires_at: Some(u64::MAX),
+            token_type: "Bearer".to_owned(),
+        })
+        .unwrap();
+        credentials.register_keys("test".to_string(), vec![oauth_json], 1);
+
+        let client = RotatorClient::new(
+            credentials,
+            HttpClientPool::new(30),
+            registry,
+            Arc::new(RateLimiterRegistry::new()),
+            Arc::new(CooldownManager::new()),
+            Arc::new(CircuitBreakerRegistry::new()),
+            None,
+            0,
+        );
+
+        let response = client
+            .request("test", "chat/completions", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn oauth_refresh_triggered_when_token_expired() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let refresh_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refresh_addr = refresh_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = refresh_listener.accept().await.unwrap();
+            let mut buffer = [0; 2048];
+            let size = socket.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..size]);
+            assert!(request.starts_with("POST /token HTTP/1.1"));
+            assert!(request.contains("grant_type=refresh_token"));
+            let body = r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600,"token_type":"Bearer"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let (registry, calls) = test_provider(vec![200]).await;
+        let mut registry_def = registry.get("test").unwrap();
+        registry_def.auth_type = AuthType::OAuth;
+        registry_def.token_endpoint = Some(format!("http://{refresh_addr}/token"));
+        registry_def.client_id = Some("client-id".to_owned());
+        registry_def.client_secret = Some("client-secret".to_owned());
+        registry.register(registry_def);
+
+        let credentials = CredentialManager::new();
+        let oauth_json = serde_json::to_string(&crate::providers::oauth::OAuthToken {
+            access_token: "old-access".to_owned(),
+            refresh_token: Some("old-refresh".to_owned()),
+            expires_at: Some(1),
+            token_type: "Bearer".to_owned(),
+        })
+        .unwrap();
+        credentials.register_keys("test".to_string(), vec![oauth_json], 1);
+
+        let client = RotatorClient::new(
+            credentials,
+            HttpClientPool::new(30),
+            registry,
+            Arc::new(RateLimiterRegistry::new()),
+            Arc::new(CooldownManager::new()),
+            Arc::new(CircuitBreakerRegistry::new()),
+            None,
+            0,
+        );
+
+        let response = client
+            .request("test", "chat/completions", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn oauth_missing_refresh_token_returns_error() {
+        let (registry, _) = test_provider(vec![200]).await;
+        let mut registry_def = registry.get("test").unwrap();
+        registry_def.auth_type = AuthType::OAuth;
+        registry_def.token_endpoint = Some("http://localhost:1/token".to_owned());
+        registry_def.client_id = Some("client-id".to_owned());
+        registry.register(registry_def);
+
+        let credentials = CredentialManager::new();
+        let oauth_json = serde_json::to_string(&crate::providers::oauth::OAuthToken {
+            access_token: "old-access".to_owned(),
+            refresh_token: None,
+            expires_at: Some(1),
+            token_type: "Bearer".to_owned(),
+        })
+        .unwrap();
+        credentials.register_keys("test".to_string(), vec![oauth_json], 1);
+
+        let client = RotatorClient::new(
+            credentials,
+            HttpClientPool::new(30),
+            registry,
+            Arc::new(RateLimiterRegistry::new()),
+            Arc::new(CooldownManager::new()),
+            Arc::new(CircuitBreakerRegistry::new()),
+            None,
+            0,
+        );
+
+        let result = client
+            .request("test", "chat/completions", serde_json::json!({}))
+            .await;
+        assert!(
+            matches!(result, Err(RotatorError::Other(ref msg)) if msg.contains("missing OAuth refresh token")),
+            "expected missing refresh token error, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_refresh_is_single_flight() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let refresh_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refresh_addr = refresh_listener.local_addr().unwrap();
+        let refresh_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&refresh_count);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = refresh_listener.accept().await else {
+                    break;
+                };
+                count_clone.fetch_add(1, Ordering::SeqCst);
+                let mut buffer = [0; 2048];
+                let size = socket.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                assert!(request.starts_with("POST /token HTTP/1.1"));
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let body = r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600,"token_type":"Bearer"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let (registry, calls) = test_provider(vec![200, 200]).await;
+        let mut registry_def = registry.get("test").unwrap();
+        registry_def.auth_type = AuthType::OAuth;
+        registry_def.token_endpoint = Some(format!("http://{refresh_addr}/token"));
+        registry_def.client_id = Some("client-id".to_owned());
+        registry_def.client_secret = Some("client-secret".to_owned());
+        registry.register(registry_def);
+
+        let credentials = CredentialManager::new();
+        let oauth_json = serde_json::to_string(&crate::providers::oauth::OAuthToken {
+            access_token: "old-access".to_owned(),
+            refresh_token: Some("old-refresh".to_owned()),
+            expires_at: Some(1),
+            token_type: "Bearer".to_owned(),
+        })
+        .unwrap();
+        credentials.register_keys("test".to_string(), vec![oauth_json], 2);
+
+        let client = RotatorClient::new(
+            credentials,
+            HttpClientPool::new(30),
+            registry,
+            Arc::new(RateLimiterRegistry::new()),
+            Arc::new(CooldownManager::new()),
+            Arc::new(CircuitBreakerRegistry::new()),
+            None,
+            0,
+        );
+
+        let (resp1, resp2) = tokio::join!(
+            client.request("test", "chat/completions", serde_json::json!({})),
+            client.request("test", "chat/completions", serde_json::json!({}))
+        );
+        assert!(resp1.is_ok());
+        assert!(resp2.is_ok());
+        assert_eq!(refresh_count.load(Ordering::SeqCst), 1, "refresh should happen exactly once");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
