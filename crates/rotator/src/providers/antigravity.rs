@@ -1,3 +1,6 @@
+use super::oauth::{
+    OAuthFlow, OAuthFlowConfig, OAuthToken, authenticate_with_config, refresh_oauth_token,
+};
 use super::{Provider, bearer_auth_headers, list_data_models, send_json_request};
 use crate::error::Result;
 use async_trait::async_trait;
@@ -65,6 +68,56 @@ impl Provider for AntigravityProvider {
         api_key: &str,
     ) -> Result<Vec<serde_json::Value>> {
         list_data_models(client, &self.base_url, self.auth_headers(api_key)).await
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct AntigravityOAuthFlow;
+
+impl AntigravityOAuthFlow {
+    pub fn oauth_config() -> OAuthFlowConfig {
+        OAuthFlowConfig {
+            provider_id: "antigravity",
+            client_id: "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
+            client_secret: std::env::var("ANTIGRAVITY_CLIENT_SECRET")
+                .ok()
+                .map(|value| Box::leak(value.into_boxed_str()) as &'static str),
+            auth_endpoint: "https://accounts.google.com/o/oauth2/v2/auth",
+            token_endpoint: "https://oauth2.googleapis.com/token",
+            scopes: &[
+                "https://www.googleapis.com/auth/cloud-platform",
+                "https://www.googleapis.com/auth/userinfo.email",
+                "https://www.googleapis.com/auth/userinfo.profile",
+                "https://www.googleapis.com/auth/cclog",
+                "https://www.googleapis.com/auth/experimentsandconfigs",
+            ],
+            callback_path: "/oauthcallback",
+            callback_port: 51121,
+            credential_prefix: "antigravity",
+        }
+    }
+}
+
+#[async_trait]
+impl OAuthFlow for AntigravityOAuthFlow {
+    fn provider_id(&self) -> &str {
+        "antigravity"
+    }
+
+    async fn authenticate(&self, client: &reqwest::Client) -> Result<OAuthToken> {
+        authenticate_with_config(client, Self::oauth_config()).await
+    }
+
+    async fn refresh(&self, client: &reqwest::Client, token: &OAuthToken) -> Result<OAuthToken> {
+        let config = Self::oauth_config();
+        refresh_oauth_token(
+            client,
+            config.token_endpoint,
+            config.client_id,
+            config.client_secret,
+            token,
+        )
+        .await
     }
 }
 

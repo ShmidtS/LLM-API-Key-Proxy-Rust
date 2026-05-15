@@ -1,7 +1,7 @@
 use proxy_config::ProxyConfig;
 use rotator::{
-    CircuitBreakerRegistry, CooldownManager, CredentialManager, HttpClientPool, ProviderRegistry,
-    RateLimiterRegistry, RotatorClient, UsageManager,
+    CircuitBreakerRegistry, CooldownManager, CredentialManager, HttpClientPool, ModelInfoService,
+    ProviderRegistry, RateLimiterRegistry, RotatorClient, UsageManager,
 };
 use std::{
     collections::HashMap,
@@ -17,6 +17,8 @@ pub struct AppState {
     pub rotator: Arc<RotatorClient>,
     pub registry: Arc<ProviderRegistry>,
     pub model_cache: ModelCache,
+    pub model_info: Arc<RwLock<ModelInfoService>>,
+    pub catalog_client: reqwest::Client,
     pub config: ProxyConfig,
 }
 
@@ -55,10 +57,17 @@ impl AppState {
             Some(usage_manager),
             cfg.max_retries,
         );
+        let catalog_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(cfg.request_timeout_secs.min(2)))
+            .connect_timeout(Duration::from_secs(1))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             rotator: Arc::new(client),
             registry,
             model_cache: Arc::new(RwLock::new(HashMap::new())),
+            model_info: Arc::new(RwLock::new(ModelInfoService::new())),
+            catalog_client,
             config: cfg,
         }
     }
@@ -68,6 +77,8 @@ impl AppState {
             rotator: Arc::new(rotator),
             registry,
             model_cache: Arc::new(RwLock::new(HashMap::new())),
+            model_info: Arc::new(RwLock::new(ModelInfoService::new())),
+            catalog_client: reqwest::Client::new(),
             config: ProxyConfig::default(),
         }
     }

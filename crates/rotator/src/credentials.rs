@@ -1,6 +1,8 @@
+use crate::error::{Result, RotatorError};
 use dashmap::DashMap;
 use regex::Regex;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -80,7 +82,53 @@ impl CredentialManager {
             manager.register_keys(provider, keys.into_iter().map(|(_, key)| key).collect(), 10);
         }
 
+        let _ = manager.discover_oauth_credentials();
         manager
+    }
+
+    pub fn discover_oauth_credentials(&self) -> Result<()> {
+        self.discover_oauth_credentials_in("oauth_creds")
+    }
+
+    pub fn discover_oauth_credentials_in(&self, dir: impl AsRef<Path>) -> Result<()> {
+        let dir = dir.as_ref();
+        if !dir.exists() {
+            return Ok(());
+        }
+        let regex = Regex::new(r"^([a-z0-9_]+)_oauth_(\d+)\.json$").unwrap();
+        let mut keys_by_provider: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+
+        for entry in std::fs::read_dir(dir)
+            .map_err(|error| RotatorError::Other(format!("failed to read oauth_creds: {error}")))?
+        {
+            let entry = entry.map_err(|error| {
+                RotatorError::Other(format!("failed to read oauth_creds entry: {error}"))
+            })?;
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            let Some(captures) = regex.captures(&file_name) else {
+                continue;
+            };
+            let provider = match &captures[1] {
+                "google" => "gemini".to_owned(),
+                provider => provider.to_owned(),
+            };
+            let index = captures[2].parse().unwrap_or(0);
+            let body = std::fs::read_to_string(entry.path()).map_err(|error| {
+                RotatorError::Other(format!("failed to read OAuth credential file: {error}"))
+            })?;
+            serde_json::from_str::<crate::providers::oauth::OAuthCredentialFile>(&body)?;
+            keys_by_provider
+                .entry(provider)
+                .or_default()
+                .push((index, body));
+        }
+
+        for (provider, mut keys) in keys_by_provider {
+            keys.sort_by_key(|(index, _)| *index);
+            self.register_keys(provider, keys.into_iter().map(|(_, key)| key).collect(), 10);
+        }
+        Ok(())
     }
 
     pub fn register_keys(&self, provider: String, keys: Vec<String>, limit: usize) {
@@ -208,6 +256,32 @@ mod tests {
         let selected = manager.get_least_loaded("openai").unwrap();
 
         assert_eq!(selected.key, "key-1");
+    }
+
+    #[test]
+    fn discovers_oauth_credential_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "rotator-oauth-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("google_oauth_1.json");
+        std::fs::write(
+            &file,
+            r#"{"access_token":"access","refresh_token":"refresh","expires_at":123,"token_type":"Bearer","client_id":"client","token_endpoint":"https://oauth2.googleapis.com/token"}"#,
+        )
+        .unwrap();
+
+        let manager = CredentialManager::new();
+        manager.discover_oauth_credentials_in(&dir).unwrap();
+
+        let entries = manager.credentials.get("gemini").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].key.contains("\"access_token\":\"access\""));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

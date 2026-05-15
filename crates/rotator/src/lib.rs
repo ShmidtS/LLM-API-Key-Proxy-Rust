@@ -28,6 +28,7 @@ pub use model_info::{ModelInfoService, ModelMetadata};
 pub use model_parser::{parse_model_ids, parse_model_ids_body, parse_model_ids_response};
 pub use provider_registry::{AuthType, ProviderDefinition, ProviderRegistry};
 pub use provider_utils::{extract_usage, transform_tool_schema};
+pub use providers::antigravity::AntigravityOAuthFlow;
 pub use providers::oauth::{
     GoogleOAuthFlow, IflowOAuthFlow, OAuthFlow, OAuthManager, OAuthProvider, OAuthToken,
     QwenOAuthFlow, RefreshTokenResponse, refresh_oauth_token,

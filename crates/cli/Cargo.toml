@@ -1,0 +1,15 @@
+[package]
+name = "proxy-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rotator = { path = "../rotator" }
+proxy_config = { package = "config", path = "../config" }
+models = { path = "../models" }
+clap = { version = "4", features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }

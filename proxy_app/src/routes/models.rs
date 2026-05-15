@@ -26,6 +26,16 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
+    if let Err(error) = state
+        .model_info
+        .write()
+        .await
+        .refresh_if_needed(&state.catalog_client)
+        .await
+    {
+        tracing::warn!(error = %error, "failed to refresh model catalog");
+    }
+
     let mut tasks = Vec::new();
     let now = Instant::now();
 

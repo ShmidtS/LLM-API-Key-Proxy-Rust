@@ -1,12 +1,16 @@
 use dashmap::DashMap;
 use regex::Regex;
-use std::sync::OnceLock;
+use serde_json::Value;
+use std::{sync::OnceLock, time::Duration};
+use thiserror::Error;
+use tokio::time::Instant;
 
 static REGEX_CACHE: OnceLock<DashMap<String, Regex>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelMetadata {
     pub model_id: String,
+    pub display_name: String,
     pub provider: String,
     pub context_length: u32,
     pub pricing_input_per_1k: f64,
@@ -17,15 +21,40 @@ pub struct ModelMetadata {
     pub capabilities: Vec<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ModelInfoService {
     models: DashMap<String, ModelMetadata>,
+    static_model_ids: DashMap<String, ()>,
+    refresh_interval: Duration,
+    last_refresh: Option<Instant>,
+}
+
+impl Default for ModelInfoService {
+    fn default() -> Self {
+        Self {
+            models: DashMap::new(),
+            static_model_ids: DashMap::new(),
+            refresh_interval: Duration::from_secs(60 * 60),
+            last_refresh: None,
+        }
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum ModelInfoError {
+    #[error("http error: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("catalog parse error: {0}")]
+    Parse(#[from] serde_json::Error),
 }
 
 impl ModelInfoService {
     pub fn new() -> Self {
         let service = Self::default();
         for metadata in default_models() {
+            service
+                .static_model_ids
+                .insert(metadata.model_id.clone(), ());
             service.register_model(metadata);
         }
         service
@@ -37,6 +66,42 @@ impl ModelInfoService {
 
     pub fn get_model(&self, model_id: &str) -> Option<ModelMetadata> {
         self.models.get(model_id).map(|entry| entry.value().clone())
+    }
+
+    pub fn resolve_alias(&self, alias: &str) -> Option<&str> {
+        match alias {
+            "claude-3.5-sonnet" | "claude-3-5-sonnet" => Some("claude-3-5-sonnet-20241022"),
+            "claude-3.5-haiku" | "claude-3-5-haiku" => Some("claude-3-5-haiku-20241022"),
+            "claude-3-opus" => Some("claude-3-opus-20240229"),
+            "gpt-4" => Some("gpt-4-0613"),
+            "gpt-3.5-turbo" => Some("gpt-3.5-turbo-0125"),
+            _ => None,
+        }
+    }
+
+    pub fn merge_external_models(&self, models: Vec<ModelMetadata>) {
+        for metadata in models {
+            if !self.static_model_ids.contains_key(&metadata.model_id) {
+                self.register_model(metadata);
+            }
+        }
+    }
+
+    pub async fn refresh_if_needed(
+        &mut self,
+        client: &reqwest::Client,
+    ) -> Result<(), ModelInfoError> {
+        let should_refresh = self
+            .last_refresh
+            .is_none_or(|last_refresh| last_refresh.elapsed() >= self.refresh_interval);
+        if !should_refresh {
+            return Ok(());
+        }
+
+        self.last_refresh = Some(Instant::now());
+        let models = fetch_openrouter_catalog(client).await?;
+        self.merge_external_models(models);
+        Ok(())
     }
 
     pub fn find_models(&self, pattern: &str) -> Vec<ModelMetadata> {
@@ -75,6 +140,144 @@ impl ModelInfoService {
         sort_models(&mut models);
         models
     }
+}
+
+/// Fetches and normalizes OpenRouter model catalog.
+pub async fn fetch_openrouter_catalog(
+    client: &reqwest::Client,
+) -> Result<Vec<ModelMetadata>, ModelInfoError> {
+    let payload = client
+        .get("https://openrouter.ai/api/v1/models")
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    normalize_openrouter_catalog(payload)
+}
+
+/// Fetches and normalizes Models.dev catalog.
+pub async fn fetch_modelsdev_catalog(
+    client: &reqwest::Client,
+) -> Result<Vec<ModelMetadata>, ModelInfoError> {
+    let payload = client
+        .get("https://models.dev/api.json")
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+    normalize_modelsdev_catalog(payload)
+}
+
+fn normalize_openrouter_catalog(payload: Value) -> Result<Vec<ModelMetadata>, ModelInfoError> {
+    let mut models = Vec::new();
+    if let Some(entries) = payload.get("data").and_then(Value::as_array) {
+        for entry in entries {
+            if let Some(model) = normalize_catalog_model(entry) {
+                models.push(model);
+            }
+        }
+    }
+    sort_models(&mut models);
+    Ok(models)
+}
+
+fn normalize_modelsdev_catalog(payload: Value) -> Result<Vec<ModelMetadata>, ModelInfoError> {
+    let mut models = Vec::new();
+    collect_modelsdev_models(&payload, &mut models);
+    sort_models(&mut models);
+    Ok(models)
+}
+
+fn collect_modelsdev_models(value: &Value, models: &mut Vec<ModelMetadata>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_modelsdev_models(item, models);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(model) = normalize_catalog_model(value) {
+                models.push(model);
+            } else {
+                for item in map.values() {
+                    collect_modelsdev_models(item, models);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_catalog_model(entry: &Value) -> Option<ModelMetadata> {
+    let model_id = entry
+        .get("id")
+        .or_else(|| entry.get("model_id"))
+        .and_then(Value::as_str)?;
+    let display_name = entry
+        .get("name")
+        .or_else(|| entry.get("display_name"))
+        .and_then(Value::as_str)
+        .unwrap_or(model_id);
+    let context_length = entry
+        .get("context_length")
+        .or_else(|| entry.get("max_tokens"))
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or_default();
+    let pricing = entry.get("pricing");
+    let pricing_input_per_1k = catalog_price(pricing, "prompt");
+    let pricing_output_per_1k = catalog_price(pricing, "completion");
+    let supports_tools = entry
+        .get("supported_parameters")
+        .and_then(Value::as_array)
+        .is_some_and(|parameters| {
+            parameters
+                .iter()
+                .any(|value| value.as_str() == Some("tools"))
+        });
+    let supports_vision = entry
+        .get("architecture")
+        .and_then(|architecture| architecture.get("modality"))
+        .and_then(Value::as_str)
+        .is_some_and(|modality| modality.contains("image"));
+    let mut capabilities = vec!["chat".to_string()];
+    if supports_vision {
+        capabilities.push("vision".to_string());
+    }
+    if supports_tools {
+        capabilities.push("tools".to_string());
+    }
+
+    Some(ModelMetadata {
+        model_id: model_id.to_string(),
+        display_name: display_name.to_string(),
+        provider: provider_from_model_id(model_id),
+        context_length,
+        pricing_input_per_1k,
+        pricing_output_per_1k,
+        supports_streaming: true,
+        supports_vision,
+        supports_tools,
+        capabilities,
+    })
+}
+
+fn catalog_price(pricing: Option<&Value>, key: &str) -> f64 {
+    pricing
+        .and_then(|pricing| pricing.get(key))
+        .and_then(|value| value.as_f64().or_else(|| value.as_str()?.parse().ok()))
+        .map(|price| (price * 1000.0 * 1_000_000.0).round() / 1_000_000.0)
+        .unwrap_or_default()
+}
+
+fn provider_from_model_id(model_id: &str) -> String {
+    model_id
+        .split_once('/')
+        .map(|(provider, _)| provider)
+        .unwrap_or_else(|| model_id.split('-').next().unwrap_or("unknown"))
+        .to_string()
 }
 
 fn cached_regex(pattern: &str) -> Option<Regex> {
@@ -485,6 +688,7 @@ fn model(
 ) -> ModelMetadata {
     ModelMetadata {
         model_id: model_id.to_string(),
+        display_name: model_id.to_string(),
         provider: provider.to_string(),
         context_length,
         pricing_input_per_1k,
@@ -549,6 +753,7 @@ mod tests {
         let service = ModelInfoService::new();
         let metadata = ModelMetadata {
             model_id: "custom-model".to_string(),
+            display_name: "custom-model".to_string(),
             provider: "custom".to_string(),
             context_length: 65_536,
             pricing_input_per_1k: 0.001,
@@ -602,5 +807,63 @@ mod tests {
         assert!(all.iter().any(|model| model.provider == "openai"));
         assert!(all.iter().any(|model| model.provider == "anthropic"));
         assert!(all.iter().any(|model| model.provider == "gemini"));
+    }
+
+    #[test]
+    fn normalizes_openrouter_catalog_response() {
+        let payload = serde_json::json!({
+            "data": [{
+                "id": "anthropic/claude-3.5-sonnet",
+                "name": "Claude 3.5 Sonnet",
+                "context_length": 200000,
+                "pricing": {"prompt": 0.000003, "completion": 0.000015}
+            }]
+        });
+
+        let models = normalize_openrouter_catalog(payload).expect("catalog should parse");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model_id, "anthropic/claude-3.5-sonnet");
+        assert_eq!(models[0].display_name, "Claude 3.5 Sonnet");
+        assert_eq!(models[0].provider, "anthropic");
+        assert_eq!(models[0].context_length, 200_000);
+        assert_eq!(models[0].pricing_input_per_1k, 0.003);
+        assert_eq!(models[0].pricing_output_per_1k, 0.015);
+    }
+
+    #[test]
+    fn resolves_common_model_aliases() {
+        let service = ModelInfoService::new();
+
+        assert_eq!(
+            service.resolve_alias("claude-3.5-sonnet"),
+            Some("claude-3-5-sonnet-20241022")
+        );
+        assert_eq!(service.resolve_alias("gpt-4"), Some("gpt-4-0613"));
+        assert_eq!(service.resolve_alias("unknown"), None);
+    }
+
+    #[test]
+    fn merge_external_models_keeps_static_model_on_conflict() {
+        let service = ModelInfoService::new();
+        let original = service
+            .get_model("gpt-4o")
+            .expect("static gpt-4o metadata should exist");
+        let external = ModelMetadata {
+            model_id: "gpt-4o".to_string(),
+            display_name: "External GPT-4o".to_string(),
+            provider: "openrouter".to_string(),
+            context_length: 1,
+            pricing_input_per_1k: 99.0,
+            pricing_output_per_1k: 99.0,
+            supports_streaming: false,
+            supports_vision: false,
+            supports_tools: false,
+            capabilities: vec!["chat".to_string()],
+        };
+
+        service.merge_external_models(vec![external]);
+
+        assert_eq!(service.get_model("gpt-4o"), Some(original));
     }
 }
