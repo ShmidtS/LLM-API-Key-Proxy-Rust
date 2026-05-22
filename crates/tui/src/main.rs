@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::io;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -13,12 +15,62 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Tabs};
+use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Tabs, Wrap};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::process::Command;
 
 const TAB_TITLES: [&str; 3] = ["Providers", "Model Cache", "Usage"];
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:3000";
+const DEFAULT_HOST: &str = "127.0.0.1";
+const DEFAULT_PORT: u16 = 3000;
+const LAUNCHER_CONFIG_PATH: &str = "launcher_config.json";
 const DEFAULT_MODEL_CACHE_TTL_SECS: u64 = 300;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppMode {
+    MainMenu,
+    Dashboard,
+    ConfigMenu,
+    About,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LauncherConfig {
+    host: String,
+    port: u16,
+    enable_raw_logging: bool,
+    base_url: String,
+}
+
+impl Default for LauncherConfig {
+    fn default() -> Self {
+        Self {
+            host: DEFAULT_HOST.to_owned(),
+            port: DEFAULT_PORT,
+            enable_raw_logging: false,
+            base_url: DEFAULT_BASE_URL.to_owned(),
+        }
+    }
+}
+
+impl LauncherConfig {
+    fn load() -> Self {
+        fs::read_to_string(LAUNCHER_CONFIG_PATH)
+            .ok()
+            .and_then(|contents| serde_json::from_str(&contents).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self) -> Result<()> {
+        let contents = serde_json::to_string_pretty(self)?;
+        fs::write(LAUNCHER_CONFIG_PATH, contents).context("write launcher_config.json")
+    }
+
+    fn refresh_base_url(&mut self) {
+        self.base_url = format!("http://{}:{}", self.host, self.port);
+    }
+}
 
 #[derive(Debug)]
 struct App {
@@ -28,20 +80,42 @@ struct App {
     admin_token: Option<String>,
     data: DashboardData,
     last_error: Option<String>,
+    mode: AppMode,
+    config: LauncherConfig,
+    config_draft: LauncherConfig,
+    edit_field: Option<ConfigField>,
+    edit_buffer: String,
+    message: Option<String>,
+    onboarding_warning: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigField {
+    Host,
+    Port,
 }
 
 impl App {
     fn new() -> Self {
+        let mut config = LauncherConfig::load();
+        config.refresh_base_url();
+        let base_url = config.base_url.clone();
         Self {
             current_tab: 0,
             client: reqwest::Client::new(),
-            base_url: std::env::var("PROXY_TUI_BASE_URL")
-                .unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned()),
+            base_url,
             admin_token: std::env::var("ADMIN_TOKEN")
                 .ok()
                 .filter(|token| !token.is_empty()),
             data: DashboardData::default(),
             last_error: None,
+            mode: AppMode::MainMenu,
+            config_draft: config.clone(),
+            config,
+            edit_field: None,
+            edit_buffer: String::new(),
+            message: None,
+            onboarding_warning: setup_required(),
         }
     }
 
@@ -100,16 +174,195 @@ impl App {
                 return false;
             }
 
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return true,
-                KeyCode::Char('r') => self.refresh().await,
-                KeyCode::Right | KeyCode::Tab => self.next_tab(),
-                KeyCode::Left | KeyCode::BackTab => self.previous_tab(),
-                _ => {}
+            if self.edit_field.is_some() {
+                self.handle_config_input(key.code);
+                return false;
             }
-        }
 
+            match self.mode {
+                AppMode::MainMenu => self.handle_main_menu_key(key.code).await,
+                AppMode::Dashboard => self.handle_dashboard_key(key.code).await,
+                AppMode::ConfigMenu => self.handle_config_menu_key(key.code),
+                AppMode::About => self.handle_about_key(key.code),
+            }
+        } else {
+            false
+        }
+    }
+
+    async fn handle_main_menu_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc => true,
+            KeyCode::Char('d') | KeyCode::Char('1') => {
+                self.switch_to_dashboard().await;
+                false
+            }
+            KeyCode::Char('c') | KeyCode::Char('2') => {
+                self.config_draft = self.config.clone();
+                self.mode = AppMode::ConfigMenu;
+                self.message = None;
+                false
+            }
+            KeyCode::Char('r') | KeyCode::Char('3') => {
+                self.run_proxy().await;
+                self.switch_to_dashboard().await;
+                false
+            }
+            KeyCode::Char('a') | KeyCode::Char('4') => {
+                self.mode = AppMode::About;
+                self.message = None;
+                false
+            }
+            KeyCode::Char('5') => true,
+            _ => false,
+        }
+    }
+
+    async fn handle_dashboard_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc => true,
+            KeyCode::Char('m') => {
+                self.mode = AppMode::MainMenu;
+                false
+            }
+            KeyCode::Char('r') => {
+                self.refresh().await;
+                false
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                self.next_tab();
+                false
+            }
+            KeyCode::Left | KeyCode::BackTab => {
+                self.previous_tab();
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_config_menu_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.config_draft = self.config.clone();
+                self.mode = AppMode::MainMenu;
+                self.message = None;
+            }
+            KeyCode::Char('h') => {
+                self.edit_field = Some(ConfigField::Host);
+                self.edit_buffer = self.config_draft.host.clone();
+            }
+            KeyCode::Char('p') => {
+                self.edit_field = Some(ConfigField::Port);
+                self.edit_buffer = self.config_draft.port.to_string();
+            }
+            KeyCode::Char('r') => {
+                self.config_draft.enable_raw_logging = !self.config_draft.enable_raw_logging;
+                self.save_config_draft();
+            }
+            KeyCode::Char('s') => {
+                self.save_config_draft();
+                self.mode = AppMode::MainMenu;
+            }
+            _ => {}
+        }
         false
+    }
+
+    fn handle_config_input(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter => self.commit_config_input(),
+            KeyCode::Esc => {
+                self.edit_field = None;
+                self.edit_buffer.clear();
+            }
+            KeyCode::Backspace => {
+                self.edit_buffer.pop();
+            }
+            KeyCode::Char(character) => {
+                if matches!(self.edit_field, Some(ConfigField::Port)) {
+                    if character.is_ascii_digit() {
+                        self.edit_buffer.push(character);
+                    }
+                } else {
+                    self.edit_buffer.push(character);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn commit_config_input(&mut self) {
+        match self.edit_field {
+            Some(ConfigField::Host) => {
+                let host = self.edit_buffer.trim();
+                if host.is_empty() {
+                    self.message = Some("Host cannot be empty".to_owned());
+                } else {
+                    self.config_draft.host = host.to_owned();
+                    self.save_config_draft();
+                }
+            }
+            Some(ConfigField::Port) => match self.edit_buffer.trim().parse::<u16>() {
+                Ok(port) => {
+                    self.config_draft.port = port;
+                    self.save_config_draft();
+                }
+                Err(_) => self.message = Some("Port must be 0-65535".to_owned()),
+            },
+            None => {}
+        }
+        self.edit_field = None;
+        self.edit_buffer.clear();
+    }
+
+    fn handle_about_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('m') => {
+                self.mode = AppMode::MainMenu;
+                false
+            }
+            _ => false,
+        }
+    }
+
+    async fn switch_to_dashboard(&mut self) {
+        self.config.refresh_base_url();
+        self.base_url = self.config.base_url.clone();
+        self.mode = AppMode::Dashboard;
+        self.refresh().await;
+    }
+
+    async fn run_proxy(&mut self) {
+        let port = self.config.port.to_string();
+        match Command::new("cargo")
+            .args([
+                "run",
+                "--bin",
+                "proxy_app",
+                "--",
+                "--host",
+                &self.config.host,
+                "--port",
+                &port,
+            ])
+            .spawn()
+        {
+            Ok(_) => self.message = Some("Proxy started".to_owned()),
+            Err(error) => self.message = Some(format!("Proxy start failed: {error}")),
+        }
+    }
+
+    fn save_config_draft(&mut self) {
+        self.config_draft.refresh_base_url();
+        match self.config_draft.save() {
+            Ok(()) => {
+                self.config = self.config_draft.clone();
+                self.base_url = self.config.base_url.clone();
+                self.message = Some("Configuration saved".to_owned());
+            }
+            Err(error) => self.message = Some(format!("Configuration save failed: {error}")),
+        }
     }
 }
 
@@ -206,7 +459,6 @@ struct UsageRow {
 async fn main() -> Result<()> {
     let mut terminal = setup_terminal()?;
     let mut app = App::new();
-    app.refresh().await;
     let result = run_app(&mut terminal, &mut app).await;
     restore_terminal(&mut terminal)?;
     result
@@ -243,6 +495,113 @@ async fn run_app(
 }
 
 fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
+    match app.mode {
+        AppMode::MainMenu => render_main_menu(frame, app),
+        AppMode::Dashboard => render_dashboard(frame, app),
+        AppMode::ConfigMenu => render_config_menu(frame, app),
+        AppMode::About => render_about(frame),
+    }
+}
+
+fn render_main_menu(frame: &mut ratatui::Frame<'_>, app: &App) {
+    let constraints = if app.onboarding_warning {
+        vec![
+            Constraint::Length(5),
+            Constraint::Min(8),
+            Constraint::Length(1),
+        ]
+    } else {
+        vec![Constraint::Min(8), Constraint::Length(1)]
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(frame.area());
+    let mut body_index = 0;
+
+    if app.onboarding_warning {
+        frame.render_widget(
+            Paragraph::new(
+                "Setup required: .env missing or PROXY_API_KEY not set. Run `cargo run --bin proxy_app -- --add-credential` first.",
+            )
+            .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            .block(Block::default().borders(Borders::ALL).title("Setup required"))
+            .wrap(Wrap { trim: true }),
+            chunks[0],
+        );
+        body_index = 1;
+    }
+
+    let menu = vec![
+        Line::from("1. Dashboard (d)"),
+        Line::from("2. Configuration (c)"),
+        Line::from("3. Run Proxy (r)"),
+        Line::from("4. About (a)"),
+        Line::from("5. Exit (q/Esc)"),
+        Line::from(""),
+        Line::from(format!("Current endpoint: {}", app.config.base_url)),
+    ];
+    frame.render_widget(
+        Paragraph::new(menu).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("LLM API Key Proxy Launcher"),
+        ),
+        chunks[body_index],
+    );
+    render_message(frame, chunks[body_index + 1], app);
+}
+
+fn render_config_menu(frame: &mut ratatui::Frame<'_>, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(10), Constraint::Length(1)])
+        .split(frame.area());
+    let edit = match app.edit_field {
+        Some(ConfigField::Host) => format!("Editing host: {}", app.edit_buffer),
+        Some(ConfigField::Port) => format!("Editing port: {}", app.edit_buffer),
+        None => "".to_owned(),
+    };
+    let body = vec![
+        Line::from(format!("Host: {}", app.config_draft.host)),
+        Line::from(format!("Port: {}", app.config_draft.port)),
+        Line::from(format!(
+            "Enable raw logging: {}",
+            app.config_draft.enable_raw_logging
+        )),
+        Line::from(format!("Base URL: {}", app.config_draft.base_url)),
+        Line::from(""),
+        Line::from("h edit host | p edit port | r toggle raw logging"),
+        Line::from("s save and return | q return without saving"),
+        Line::from("Enter accepts edit | Esc cancels edit"),
+        Line::from(edit),
+    ];
+    frame.render_widget(
+        Paragraph::new(body).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Configuration"),
+        ),
+        chunks[0],
+    );
+    render_message(frame, chunks[1], app);
+}
+
+fn render_about(frame: &mut ratatui::Frame<'_>) {
+    let body = vec![
+        Line::from("LLM API Key Proxy"),
+        Line::from(format!("Version: {}", env!("CARGO_PKG_VERSION"))),
+        Line::from("GitHub: https://github.com/ShmidtS/LLM-API-Key-Proxy-Rust"),
+        Line::from(""),
+        Line::from("m/q/Esc return to main menu"),
+    ];
+    frame.render_widget(
+        Paragraph::new(body).block(Block::default().borders(Borders::ALL).title("About")),
+        frame.area(),
+    );
+}
+
+fn render_dashboard(frame: &mut ratatui::Frame<'_>, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -277,13 +636,24 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
         _ => {}
     }
 
-    let status = app.last_error.as_deref().map_or(
-        "q quit | r refresh | ←/→ switch tabs".to_owned(),
-        |error| format!("q quit | r refresh | ←/→ switch tabs | error: {error}"),
-    );
+    let mut status = "m menu | q quit | r refresh | ←/→ switch tabs".to_owned();
+    if let Some(message) = app.message.as_deref() {
+        status.push_str(&format!(" | {message}"));
+    }
+    if let Some(error) = app.last_error.as_deref() {
+        status.push_str(&format!(" | error: {error}"));
+    }
     frame.render_widget(
         Paragraph::new(status).style(Style::default().fg(Color::Gray)),
         chunks[2],
+    );
+}
+
+fn render_message(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &App) {
+    let message = app.message.as_deref().unwrap_or_default();
+    frame.render_widget(
+        Paragraph::new(message).style(Style::default().fg(Color::Gray)),
+        area,
     );
 }
 
@@ -564,17 +934,25 @@ fn format_latency(latency_ms: Option<u64>) -> String {
     latency_ms.map_or_else(|| "n/a".to_owned(), |latency| format!("{latency}ms"))
 }
 
+fn setup_required() -> bool {
+    !Path::new(".env").exists()
+        || std::env::var("PROXY_API_KEY")
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn app_new_creates_default_state() {
-        let app = App::new();
+    #[test]
+    fn launcher_config_default_matches_expected_values() {
+        let config = LauncherConfig::default();
 
-        assert_eq!(app.current_tab, 0);
-        assert!(app.data.providers.is_empty());
-        assert!(app.last_error.is_none());
+        assert_eq!(config.host, DEFAULT_HOST);
+        assert_eq!(config.port, DEFAULT_PORT);
+        assert!(!config.enable_raw_logging);
+        assert_eq!(config.base_url, DEFAULT_BASE_URL);
     }
 
     #[test]

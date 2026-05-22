@@ -8,9 +8,10 @@ license.workspace = true
 [dependencies]
 rotator = { path = "../rotator" }
 proxy_config = { package = "config", path = "../config" }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["full", "process"] }
 anyhow = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
