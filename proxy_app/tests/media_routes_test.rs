@@ -49,7 +49,7 @@ fn media_test_state(base_url: String) -> AppState {
     registry.register(ProviderDefinition {
         id: "openai".to_owned(),
         display_name: "openai".to_owned(),
-        base_url,
+        base_url: base_url.clone(),
         auth_type: AuthType::ApiKey,
         model_patterns: vec![r"^gpt-.*".to_owned()],
         endpoints: vec!["/images".to_owned()],
@@ -61,9 +61,25 @@ fn media_test_state(base_url: String) -> AppState {
         client_id: None,
         client_secret: None,
     });
+    registry.register(ProviderDefinition {
+        id: "zai".to_owned(),
+        display_name: "zai".to_owned(),
+        base_url,
+        auth_type: AuthType::ApiKey,
+        model_patterns: vec![r"^glm-.*".to_owned()],
+        endpoints: vec!["/video".to_owned()],
+        features: vec!["video".to_owned()],
+        model_count: 1,
+        timeout_secs: 30,
+        default_headers: HashMap::new(),
+        token_endpoint: None,
+        client_id: None,
+        client_secret: None,
+    });
 
     let credentials = CredentialManager::new();
     credentials.register_keys("openai".to_owned(), vec!["test-key".to_owned()], 10);
+    credentials.register_keys("zai".to_owned(), vec!["test-key".to_owned()], 10);
     let rotator = RotatorClient::new(
         credentials,
         HttpClientPool::new(30),

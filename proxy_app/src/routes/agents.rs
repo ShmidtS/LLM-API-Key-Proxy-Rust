@@ -31,7 +31,7 @@ async fn agents_post_passthrough(
 ) -> Result<Response, AppError> {
     let upstream = state
         .rotator
-        .request("openai", &agents_upstream_path(uri.path()), req)
+        .request("zai", &agents_upstream_path(uri.path()), req)
         .await?;
     upstream_response(upstream).await
 }
@@ -44,7 +44,7 @@ async fn agents_get_passthrough(
     let query_vec = params.into_iter().collect::<Vec<_>>();
     let upstream = state
         .rotator
-        .get_with_query("openai", &agents_upstream_path(uri.path()), &query_vec)
+        .get_with_query("zai", &agents_upstream_path(uri.path()), &query_vec)
         .await?;
     upstream_response(upstream).await
 }
@@ -61,7 +61,7 @@ async fn create_agent(
     State(state): State<AppState>,
     Json(req): Json<Value>,
 ) -> Result<Response, AppError> {
-    let upstream = state.rotator.request("openai", "agents", req).await?;
+    let upstream = state.rotator.request("zai", "agents", req).await?;
     upstream_response(upstream).await
 }
 
@@ -73,7 +73,7 @@ async fn get_agent(
     let query_vec = params.into_iter().collect::<Vec<_>>();
     let upstream = state
         .rotator
-        .get_with_query("openai", &format!("agents/{id}"), &query_vec)
+        .get_with_query("zai", &format!("agents/{id}"), &query_vec)
         .await?;
     upstream_response(upstream).await
 }
@@ -85,7 +85,7 @@ async fn update_agent(
 ) -> Result<Response, AppError> {
     let upstream = state
         .rotator
-        .request("openai", &format!("agents/{id}"), req)
+        .request("zai", &format!("agents/{id}"), req)
         .await?;
     upstream_response(upstream).await
 }

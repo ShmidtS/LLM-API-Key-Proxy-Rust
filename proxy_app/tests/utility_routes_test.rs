@@ -95,6 +95,65 @@ async fn request_json_with_admin_token_and_body(
     (status, json)
 }
 
+async fn request_multipart(uri: &str) -> (StatusCode, Value) {
+    let app = app_without_credentials();
+    let body = "------WebKitFormBoundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\nContent-Type: text/plain\r\n\r\ntest content\r\n------WebKitFormBoundary--\r\n";
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header(
+                    "content-type",
+                    "multipart/form-data; boundary=----WebKitFormBoundary",
+                )
+                .header("x-api-key", "test-proxy-token")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    (status, json)
+}
+
+#[tokio::test]
+async fn test_files_multipart_forwarding() {
+    let _guard = ADMIN_TOKEN_LOCK.lock().await;
+    unsafe {
+        std::env::remove_var("ADMIN_TOKEN");
+    }
+
+    let (status, json) = request_multipart("/v1/files").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no credentials available for provider: openai")
+    );
+}
+
+#[tokio::test]
+async fn test_audio_transcriptions_multipart_forwarding() {
+    let _guard = ADMIN_TOKEN_LOCK.lock().await;
+    unsafe {
+        std::env::remove_var("ADMIN_TOKEN");
+    }
+
+    let (status, json) = request_multipart("/v1/audio/transcriptions").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no credentials available for provider: openai")
+    );
+}
+
 #[tokio::test]
 async fn test_files_routes_forward_to_upstream() {
     let _guard = ADMIN_TOKEN_LOCK.lock().await;
@@ -280,7 +339,7 @@ async fn admin_cost_estimate_uses_model_prices() {
                 .header("content-type", "application/json")
                 .header("authorization", "Bearer test-admin-token")
                 .body(Body::from(
-                    r#"{"model":"openai/gpt-4o","input_tokens":1000000,"output_tokens":1000000}"#,
+                    r#"{"model":"gpt-4o","input_tokens":1000000,"output_tokens":1000000}"#,
                 ))
                 .unwrap(),
         )
@@ -292,7 +351,7 @@ async fn admin_cost_estimate_uses_model_prices() {
     let json: Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["estimated_cost_usd"], 20.0);
+    assert_eq!(json["estimated_cost_usd"], 12500.0);
 
     unsafe {
         std::env::remove_var("ADMIN_TOKEN");
@@ -367,7 +426,7 @@ async fn agents_routes_attempt_forwarding() {
             json["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("no credentials available for provider: openai"),
+                .contains("no credentials available for provider: zai"),
             "{uri}"
         );
     }

@@ -11,7 +11,7 @@ models = { path = "../crates/models" }
 proxy_config = { package = "config", path = "../crates/config" }
 axum = { workspace = true }
 tokio = { workspace = true }
-tower = { workspace = true, features = ["util"] }
+tower = { workspace = true, features = ["util", "limit"] }
 tower-http = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true }

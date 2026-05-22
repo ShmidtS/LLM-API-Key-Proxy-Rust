@@ -28,7 +28,7 @@ async fn video_status(
     let query_vec = params.into_iter().collect::<Vec<_>>();
     let upstream = state
         .rotator
-        .get_with_query("openai", upstream_path(uri.path()), &query_vec)
+        .get_with_query("zai", upstream_path(uri.path()), &query_vec)
         .await?;
     upstream_response(upstream).await
 }
@@ -40,7 +40,7 @@ async fn video_post_passthrough(
 ) -> Result<Response, AppError> {
     let upstream = state
         .rotator
-        .request("openai", upstream_path(uri.path()), req)
+        .request("zai", upstream_path(uri.path()), req)
         .await?;
     upstream_response(upstream).await
 }

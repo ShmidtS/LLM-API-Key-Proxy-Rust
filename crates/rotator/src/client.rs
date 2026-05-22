@@ -179,6 +179,120 @@ impl RotatorClient {
         Err(RotatorError::Exhausted(self.max_retries))
     }
 
+    pub async fn request_raw(
+        &self,
+        provider: &str,
+        path: &str,
+        body: bytes::Bytes,
+        content_type: &str,
+    ) -> Result<reqwest::Response> {
+        for attempt in 0..=self.max_retries {
+            if !self.circuit_breakers.is_allowed(provider) {
+                return Err(RotatorError::CircuitOpen(provider.to_string()));
+            }
+
+            let cred = self
+                .credentials
+                .acquire_least_loaded_where(provider, |key| {
+                    self.cooldown.is_available(provider, key)
+                })
+                .ok_or_else(|| RotatorError::NoCredentials(provider.to_string()))?;
+            let permit =
+                CredentialPermit::new(self.credentials.clone(), provider, cred.key.clone());
+
+            if !self.rate_limiter.acquire(provider, permit.key()) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+
+            let client = self.http_pool.get_or_create(provider);
+            let url = format!(
+                "{}/{}",
+                self.resolve_base_url(provider),
+                path.trim_start_matches('/')
+            );
+            let token = self.resolve_auth_token(provider, permit.key()).await?;
+            let request = self.apply_auth_headers(provider, client.post(&url), &token);
+            let started_at = Instant::now();
+            let result = request
+                .header(reqwest::header::CONTENT_TYPE, content_type)
+                .body(reqwest::Body::from(body.clone()))
+                .send()
+                .await;
+            self.last_latency_ms
+                .insert(provider.to_owned(), started_at.elapsed().as_millis() as u64);
+
+            match result {
+                Ok(resp) if resp.status().is_success() => {
+                    self.circuit_breakers.record_success(provider);
+                    return self
+                        .record_usage_from_response(provider, permit.key(), resp, false)
+                        .await;
+                }
+                Ok(resp) if resp.status().as_u16() == 429 => {
+                    let headers = resp.headers().clone();
+                    let body = resp
+                        .json::<serde_json::Value>()
+                        .await
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    let (reason, retry_after) =
+                        classify_throttle_with_headers(429, Some(&headers), &body);
+                    warn!(provider, attempt, ?reason, "throttled, retrying...");
+                    if attempt < self.max_retries {
+                        let delay = retry_after
+                            .unwrap_or_else(|| Duration::from_millis(500 * (attempt as u64 + 1)));
+                        self.cooldown.add_cooldown(provider, permit.key(), delay);
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(RotatorError::RateLimited(
+                        provider.to_string(),
+                        retry_after.map(|duration| duration.as_secs()),
+                    ));
+                }
+                Ok(resp) if resp.status().is_server_error() => {
+                    let status = resp.status();
+                    self.circuit_breakers.record_failure(provider);
+                    error!(provider, attempt, status = %status, "server error, retrying...");
+                    if attempt < self.max_retries {
+                        let headers = resp.headers().clone();
+                        let body = resp
+                            .json::<serde_json::Value>()
+                            .await
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                        let (reason, retry_after) =
+                            classify_throttle_with_headers(status.as_u16(), Some(&headers), &body);
+                        let delay = retry_after.unwrap_or_else(|| match reason {
+                            ThrottleReason::ServerOverload => Duration::from_secs(5),
+                            _ => Duration::from_millis(300 * (attempt as u64 + 1)),
+                        });
+                        self.cooldown.add_cooldown(provider, permit.key(), delay);
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    self.cooldown
+                        .add_cooldown(provider, permit.key(), Duration::from_secs(5));
+                    return Ok(resp);
+                }
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    if e.is_timeout() {
+                        self.circuit_breakers.record_failure(provider);
+                        self.cooldown
+                            .add_cooldown(provider, permit.key(), Duration::from_secs(5));
+                    }
+                    error!(provider, attempt, error = %e, "request failed");
+                    if attempt < self.max_retries {
+                        tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 + 1))).await;
+                        continue;
+                    }
+                    return Err(RotatorError::Http(e.to_string()));
+                }
+            }
+        }
+        Err(RotatorError::Exhausted(self.max_retries))
+    }
+
     pub async fn provider_method_call(
         &self,
         provider: &str,
@@ -325,9 +439,6 @@ impl RotatorClient {
         let Some(usage_manager) = &self.usage_manager else {
             return Ok(resp);
         };
-        if stream {
-            return Ok(resp);
-        }
 
         let status = resp.status();
         let version = resp.version();
@@ -337,7 +448,25 @@ impl RotatorClient {
             .await
             .map_err(|e| RotatorError::Http(e.to_string()))?;
 
-        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        let usage_json = if stream {
+            let text = String::from_utf8_lossy(&bytes);
+            let mut usage_json = None;
+            for line in text.lines() {
+                let Some(data) = line.strip_prefix("data: ") else {
+                    continue;
+                };
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data)
+                    && json.get("usage").is_some()
+                {
+                    usage_json = Some(json);
+                }
+            }
+            usage_json
+        } else {
+            serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+        };
+
+        if let Some(json) = usage_json {
             let (prompt, completion) = extract_usage(&json);
             if let (Ok(prompt), Ok(completion)) = (u32::try_from(prompt), u32::try_from(completion))
                 && (prompt > 0 || completion > 0)
@@ -618,6 +747,48 @@ mod tests {
                 .completion_tokens,
             7
         );
+        usage_manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_records_streaming_usage_after_success() {
+        let usage_manager = Arc::new(crate::UsageManager::with_config(
+            std::env::temp_dir().join("rotator-openai-streaming-usage-test.json"),
+            Duration::from_secs(60),
+            100,
+        ));
+        let (registry, _) = test_provider_with_body(
+            vec![200],
+            "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"id\":\"chatcmpl-1\",\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n"
+                .to_string(),
+        )
+        .await;
+        let credentials = CredentialManager::new();
+        credentials.register_keys("test".to_string(), vec!["key-1".to_string()], 1);
+        let client = RotatorClient::new(
+            credentials,
+            HttpClientPool::new(30),
+            registry,
+            Arc::new(RateLimiterRegistry::new()),
+            Arc::new(CooldownManager::new()),
+            Arc::new(CircuitBreakerRegistry::new()),
+            Some(usage_manager.clone()),
+            0,
+        );
+
+        let response = client
+            .request(
+                "test",
+                "chat/completions",
+                serde_json::json!({"stream": true}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        let usage = usage_manager.get_usage("test", "key-1").unwrap();
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 5);
         usage_manager.shutdown().await.unwrap();
     }
 

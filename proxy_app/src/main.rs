@@ -1,4 +1,5 @@
-use std::{net::SocketAddr, process};
+use std::{net::SocketAddr, process, time::Duration};
+use tokio::time::timeout;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -21,9 +22,22 @@ async fn main() {
             tracing::error!("failed to parse socket address: {err}");
             process::exit(1);
         });
+    let graceful_shutdown_timeout_secs = config.graceful_shutdown_timeout_secs;
     let state = proxy_app::state::AppState::from_config(config);
     let app = proxy_app::build_app_with_state(state);
     tracing::info!("listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+
+    match timeout(Duration::from_secs(graceful_shutdown_timeout_secs), server).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => tracing::error!("server error: {err}"),
+        Err(_) => tracing::warn!("graceful shutdown timed out, forcing exit"),
+    }
+}
+
+async fn shutdown_signal() {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        tracing::error!("failed to listen for shutdown signal: {err}");
+    }
 }

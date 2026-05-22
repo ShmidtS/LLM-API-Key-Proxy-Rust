@@ -1,15 +1,14 @@
 use crate::errors::AppError;
-use crate::routes::utils::upstream_response;
+use crate::routes::utils::{content_type, is_json, is_multipart, json_body, upstream_response};
 use crate::state::AppState;
+use axum::body::Bytes;
 use axum::extract::Query;
 use axum::response::Response;
 use axum::{
     Router,
     extract::{Path, State},
-    response::Json,
     routing::{get, post},
 };
-use serde_json::Value;
 use std::collections::HashMap;
 
 pub fn router() -> Router<AppState> {
@@ -24,9 +23,29 @@ pub fn router() -> Router<AppState> {
 
 async fn upload_file(
     State(state): State<AppState>,
-    Json(req): Json<Value>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
 ) -> Result<Response, AppError> {
-    let upstream = state.rotator.request("openai", "files", req).await?;
+    let Some(content_type) = content_type(&headers) else {
+        return Err(AppError::BadRequest("missing content-type".into()));
+    };
+
+    let upstream = if is_multipart(content_type) {
+        state
+            .rotator
+            .request_raw("openai", "files", body, content_type)
+            .await?
+    } else if is_json(content_type) {
+        state
+            .rotator
+            .request("openai", "files", json_body(body)?)
+            .await?
+    } else {
+        return Err(AppError::BadRequest(format!(
+            "unsupported content-type: {content_type}"
+        )));
+    };
+
     upstream_response(upstream).await
 }
 

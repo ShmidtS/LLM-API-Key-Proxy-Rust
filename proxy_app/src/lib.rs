@@ -12,7 +12,7 @@ use axum::{
 use proxy_config::ProxyConfig;
 use std::time::Duration;
 use tower_http::{
-    compression::CompressionLayer,
+    compression::{CompressionLayer, CompressionLevel},
     cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer},
     limit::RequestBodyLimitLayer,
     timeout::TimeoutLayer,
@@ -116,22 +116,28 @@ pub fn build_app_with_state(app_state: state::AppState) -> Router {
         app
     };
 
-    app.layer(CompressionLayer::new())
-        .layer(from_fn(middleware::add_request_id))
-        .layer(RequestBodyLimitLayer::new(config.max_body_bytes))
-        .layer(from_fn_with_state(
-            app_state.clone(),
-            middleware::reject_oversized_body,
-        ))
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(config.request_timeout_secs),
-        ))
-        .layer(from_fn_with_state(
-            app_state.clone(),
-            middleware::log_requests,
-        ))
-        .with_state(app_state)
+    app.layer(tower::limit::ConcurrencyLimitLayer::new(
+        config.max_concurrent_requests,
+    ))
+    // NOTE: gzip_min_size is not supported by tower-http CompressionLayer in 0.6
+    .layer(CompressionLayer::new().quality(CompressionLevel::Precise(
+        config.gzip_compression_level as i32,
+    )))
+    .layer(from_fn(middleware::add_request_id))
+    .layer(RequestBodyLimitLayer::new(config.max_body_bytes))
+    .layer(from_fn_with_state(
+        app_state.clone(),
+        middleware::reject_oversized_body,
+    ))
+    .layer(TimeoutLayer::with_status_code(
+        StatusCode::REQUEST_TIMEOUT,
+        Duration::from_secs(config.request_timeout_secs),
+    ))
+    .layer(from_fn_with_state(
+        app_state.clone(),
+        middleware::log_requests,
+    ))
+    .with_state(app_state)
 }
 
 #[cfg(test)]

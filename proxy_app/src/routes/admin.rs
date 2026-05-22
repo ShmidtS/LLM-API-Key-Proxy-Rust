@@ -6,7 +6,7 @@ use axum::{
 use rotator::CircuitState;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{collections::HashMap, sync::atomic::Ordering, time::Duration};
+use std::{sync::atomic::Ordering, time::Duration};
 
 use crate::state::AppState;
 
@@ -129,17 +129,11 @@ async fn cost_estimate(
     State(_state): State<AppState>,
     Json(req): Json<CostEstimateRequest>,
 ) -> Json<Value> {
-    let prices = HashMap::from([
-        ("openai/gpt-4o", (5.0_f64, 15.0_f64)),
-        ("anthropic/claude-3-5-sonnet", (3.0_f64, 15.0_f64)),
-    ]);
-    let (input_price, output_price) = prices
-        .get(req.model.as_str())
-        .copied()
-        .unwrap_or((1.0, 2.0));
-    let estimated_cost = (req.input_tokens as f64 * input_price
-        + req.output_tokens as f64 * output_price)
-        / 1_000_000.0;
+    let estimated_cost = rotator::costs::estimate_cost(
+        &req.model,
+        req.input_tokens as usize,
+        req.output_tokens as usize,
+    );
 
     Json(json!({"estimated_cost_usd": estimated_cost}))
 }
