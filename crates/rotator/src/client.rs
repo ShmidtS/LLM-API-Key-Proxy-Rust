@@ -6,8 +6,11 @@ use crate::http_pool::HttpClientPool;
 use crate::provider_registry::{AuthType, ProviderRegistry};
 use crate::provider_utils::extract_usage;
 use crate::providers::oauth::{OAuthManager, OAuthToken, refresh_oauth_token};
+use crate::providers::transform_request_for_provider;
 use crate::rate_limiter::RateLimiterRegistry;
-use crate::throttle::{ThrottleReason, classify_throttle_with_headers};
+use crate::retry_policy::{
+    FailureClass, RetryDecision, classify_upstream_failure, decide_retry, get_retry_backoff,
+};
 use crate::usage::UsageManager;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -87,6 +90,7 @@ impl RotatorClient {
                 CredentialPermit::new(self.credentials.clone(), provider, cred.key.clone());
 
             if !self.rate_limiter.acquire(provider, permit.key()) {
+                drop(permit);
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
@@ -116,49 +120,127 @@ impl RotatorClient {
                         .await;
                 }
                 Ok(resp) if resp.status().as_u16() == 429 => {
+                    let status = resp.status();
                     let headers = resp.headers().clone();
-                    let body = resp
-                        .json::<serde_json::Value>()
-                        .await
-                        .unwrap_or_else(|_| serde_json::json!({}));
-                    let (reason, retry_after) =
-                        classify_throttle_with_headers(429, Some(&headers), &body);
-                    warn!(provider, attempt, ?reason, "throttled, retrying...");
-                    if attempt < self.max_retries {
-                        let delay = retry_after
-                            .unwrap_or_else(|| Duration::from_millis(500 * (attempt as u64 + 1)));
-                        self.cooldown.add_cooldown(provider, permit.key(), delay);
-                        tokio::time::sleep(delay).await;
-                        continue;
+                    let body_text = resp.text().await.unwrap_or_default();
+                    let failure = classify_upstream_failure(status, &headers, Some(&body_text));
+                    let decision =
+                        decide_retry(failure.clone(), attempt as u32, self.max_retries as u32);
+                    warn!(
+                        provider,
+                        attempt,
+                        ?failure,
+                        ?decision,
+                        "throttled, retrying..."
+                    );
+                    match decision {
+                        RetryDecision::CooldownKey { duration } => {
+                            self.cooldown.add_cooldown(provider, permit.key(), duration);
+                            drop(permit);
+                            tokio::time::sleep(duration).await;
+                            continue;
+                        }
+                        RetryDecision::CooldownProvider { duration } => {
+                            self.cooldown.add_provider_cooldown(provider, duration);
+                            drop(permit);
+                            tokio::time::sleep(duration).await;
+                            continue;
+                        }
+                        RetryDecision::RetrySameKey => {
+                            drop(permit);
+                            tokio::time::sleep(get_retry_backoff(attempt as u32, 500, 60_000))
+                                .await;
+                            continue;
+                        }
+                        RetryDecision::RotateKey => {
+                            self.cooldown.add_cooldown(
+                                provider,
+                                permit.key(),
+                                Duration::from_secs(5),
+                            );
+                            drop(permit);
+                            tokio::time::sleep(get_retry_backoff(attempt as u32, 500, 60_000))
+                                .await;
+                            continue;
+                        }
+                        RetryDecision::OpenCircuit => {
+                            self.circuit_breakers.record_failure(provider);
+                            return Err(RotatorError::CircuitOpen(provider.to_string()));
+                        }
+                        RetryDecision::Abort => {
+                            return Err(RotatorError::RateLimited(
+                                provider.to_string(),
+                                match failure {
+                                    FailureClass::RateLimit { retry_after } => {
+                                        retry_after.map(|duration| duration.as_secs())
+                                    }
+                                    _ => None,
+                                },
+                            ));
+                        }
                     }
-                    return Err(RotatorError::RateLimited(
-                        provider.to_string(),
-                        retry_after.map(|duration| duration.as_secs()),
-                    ));
                 }
                 Ok(resp) if resp.status().is_server_error() => {
                     let status = resp.status();
-                    self.circuit_breakers.record_failure(provider);
-                    error!(provider, attempt, status = %status, "server error, retrying...");
-                    if attempt < self.max_retries {
-                        let headers = resp.headers().clone();
-                        let body = resp
-                            .json::<serde_json::Value>()
-                            .await
-                            .unwrap_or_else(|_| serde_json::json!({}));
-                        let (reason, retry_after) =
-                            classify_throttle_with_headers(status.as_u16(), Some(&headers), &body);
-                        let delay = retry_after.unwrap_or_else(|| match reason {
-                            ThrottleReason::ServerOverload => Duration::from_secs(5),
-                            _ => Duration::from_millis(300 * (attempt as u64 + 1)),
-                        });
-                        self.cooldown.add_cooldown(provider, permit.key(), delay);
-                        tokio::time::sleep(delay).await;
-                        continue;
+                    let version = resp.version();
+                    let headers = resp.headers().clone();
+                    let body_text = resp.text().await.unwrap_or_default();
+                    let failure = classify_upstream_failure(status, &headers, Some(&body_text));
+                    let decision =
+                        decide_retry(failure.clone(), attempt as u32, self.max_retries as u32);
+                    error!(provider, attempt, status = %status, ?failure, ?decision, "server error, retrying...");
+                    match decision {
+                        RetryDecision::RetrySameKey => {
+                            drop(permit);
+                            tokio::time::sleep(get_retry_backoff(attempt as u32, 300, 60_000))
+                                .await;
+                            continue;
+                        }
+                        RetryDecision::RotateKey => {
+                            self.cooldown.add_cooldown(
+                                provider,
+                                permit.key(),
+                                Duration::from_secs(5),
+                            );
+                            drop(permit);
+                            tokio::time::sleep(get_retry_backoff(attempt as u32, 300, 60_000))
+                                .await;
+                            continue;
+                        }
+                        RetryDecision::CooldownKey { duration } => {
+                            self.circuit_breakers.record_failure(provider);
+                            self.cooldown.add_cooldown(provider, permit.key(), duration);
+                            drop(permit);
+                            tokio::time::sleep(duration).await;
+                            continue;
+                        }
+                        RetryDecision::CooldownProvider { duration } => {
+                            self.circuit_breakers.record_failure(provider);
+                            self.cooldown.add_provider_cooldown(provider, duration);
+                            drop(permit);
+                            tokio::time::sleep(duration).await;
+                            continue;
+                        }
+                        RetryDecision::OpenCircuit => {
+                            self.circuit_breakers.record_failure(provider);
+                            return Err(RotatorError::CircuitOpen(provider.to_string()));
+                        }
+                        RetryDecision::Abort => {
+                            self.circuit_breakers.record_failure(provider);
+                            self.cooldown.add_cooldown(
+                                provider,
+                                permit.key(),
+                                Duration::from_secs(5),
+                            );
+                            let mut builder =
+                                http::Response::builder().status(status).version(version);
+                            *builder.headers_mut().expect("response builder is valid") = headers;
+                            return Ok(builder
+                                .body(bytes::Bytes::from(body_text))
+                                .expect("response body rebuild should not fail")
+                                .into());
+                        }
                     }
-                    self.cooldown
-                        .add_cooldown(provider, permit.key(), Duration::from_secs(5));
-                    return Ok(resp);
                 }
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
@@ -167,12 +249,14 @@ impl RotatorClient {
                         self.cooldown
                             .add_cooldown(provider, permit.key(), Duration::from_secs(5));
                     }
-                    error!(provider, attempt, error = %e, "request failed");
+                    let sanitized = e.without_url();
+                    error!(provider, attempt, error = %sanitized, "request failed");
                     if attempt < self.max_retries {
+                        drop(permit);
                         tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 + 1))).await;
                         continue;
                     }
-                    return Err(RotatorError::Http(e.to_string()));
+                    return Err(RotatorError::Http(sanitized.to_string()));
                 }
             }
         }
@@ -201,6 +285,7 @@ impl RotatorClient {
                 CredentialPermit::new(self.credentials.clone(), provider, cred.key.clone());
 
             if !self.rate_limiter.acquire(provider, permit.key()) {
+                drop(permit);
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
@@ -230,49 +315,116 @@ impl RotatorClient {
                         .await;
                 }
                 Ok(resp) if resp.status().as_u16() == 429 => {
+                    let status = resp.status();
                     let headers = resp.headers().clone();
-                    let body = resp
-                        .json::<serde_json::Value>()
-                        .await
-                        .unwrap_or_else(|_| serde_json::json!({}));
-                    let (reason, retry_after) =
-                        classify_throttle_with_headers(429, Some(&headers), &body);
-                    warn!(provider, attempt, ?reason, "throttled, retrying...");
-                    if attempt < self.max_retries {
-                        let delay = retry_after
-                            .unwrap_or_else(|| Duration::from_millis(500 * (attempt as u64 + 1)));
-                        self.cooldown.add_cooldown(provider, permit.key(), delay);
-                        tokio::time::sleep(delay).await;
-                        continue;
+                    let body_text = resp.text().await.unwrap_or_default();
+                    let failure = classify_upstream_failure(status, &headers, Some(&body_text));
+                    let decision =
+                        decide_retry(failure.clone(), attempt as u32, self.max_retries as u32);
+                    warn!(
+                        provider,
+                        attempt,
+                        ?failure,
+                        ?decision,
+                        "throttled, retrying..."
+                    );
+                    match decision {
+                        RetryDecision::CooldownKey { duration } => {
+                            self.cooldown.add_cooldown(provider, permit.key(), duration);
+                            drop(permit);
+                            tokio::time::sleep(duration).await;
+                            continue;
+                        }
+                        RetryDecision::CooldownProvider { duration } => {
+                            self.cooldown.add_provider_cooldown(provider, duration);
+                            drop(permit);
+                            tokio::time::sleep(duration).await;
+                            continue;
+                        }
+                        RetryDecision::RetrySameKey | RetryDecision::RotateKey => {
+                            drop(permit);
+                            tokio::time::sleep(get_retry_backoff(attempt as u32, 500, 60_000))
+                                .await;
+                            continue;
+                        }
+                        RetryDecision::OpenCircuit => {
+                            self.circuit_breakers.record_failure(provider);
+                            return Err(RotatorError::CircuitOpen(provider.to_string()));
+                        }
+                        RetryDecision::Abort => {
+                            return Err(RotatorError::RateLimited(
+                                provider.to_string(),
+                                match failure {
+                                    FailureClass::RateLimit { retry_after } => {
+                                        retry_after.map(|duration| duration.as_secs())
+                                    }
+                                    _ => None,
+                                },
+                            ));
+                        }
                     }
-                    return Err(RotatorError::RateLimited(
-                        provider.to_string(),
-                        retry_after.map(|duration| duration.as_secs()),
-                    ));
                 }
                 Ok(resp) if resp.status().is_server_error() => {
                     let status = resp.status();
-                    self.circuit_breakers.record_failure(provider);
-                    error!(provider, attempt, status = %status, "server error, retrying...");
-                    if attempt < self.max_retries {
-                        let headers = resp.headers().clone();
-                        let body = resp
-                            .json::<serde_json::Value>()
-                            .await
-                            .unwrap_or_else(|_| serde_json::json!({}));
-                        let (reason, retry_after) =
-                            classify_throttle_with_headers(status.as_u16(), Some(&headers), &body);
-                        let delay = retry_after.unwrap_or_else(|| match reason {
-                            ThrottleReason::ServerOverload => Duration::from_secs(5),
-                            _ => Duration::from_millis(300 * (attempt as u64 + 1)),
-                        });
-                        self.cooldown.add_cooldown(provider, permit.key(), delay);
-                        tokio::time::sleep(delay).await;
-                        continue;
+                    let version = resp.version();
+                    let headers = resp.headers().clone();
+                    let body_text = resp.text().await.unwrap_or_default();
+                    let failure = classify_upstream_failure(status, &headers, Some(&body_text));
+                    let decision =
+                        decide_retry(failure.clone(), attempt as u32, self.max_retries as u32);
+                    error!(provider, attempt, status = %status, ?failure, ?decision, "server error, retrying...");
+                    match decision {
+                        RetryDecision::RetrySameKey => {
+                            drop(permit);
+                            tokio::time::sleep(get_retry_backoff(attempt as u32, 300, 60_000))
+                                .await;
+                            continue;
+                        }
+                        RetryDecision::RotateKey => {
+                            self.cooldown.add_cooldown(
+                                provider,
+                                permit.key(),
+                                Duration::from_secs(5),
+                            );
+                            drop(permit);
+                            tokio::time::sleep(get_retry_backoff(attempt as u32, 300, 60_000))
+                                .await;
+                            continue;
+                        }
+                        RetryDecision::CooldownKey { duration } => {
+                            self.circuit_breakers.record_failure(provider);
+                            self.cooldown.add_cooldown(provider, permit.key(), duration);
+                            drop(permit);
+                            tokio::time::sleep(duration).await;
+                            continue;
+                        }
+                        RetryDecision::CooldownProvider { duration } => {
+                            self.circuit_breakers.record_failure(provider);
+                            self.cooldown.add_provider_cooldown(provider, duration);
+                            drop(permit);
+                            tokio::time::sleep(duration).await;
+                            continue;
+                        }
+                        RetryDecision::OpenCircuit => {
+                            self.circuit_breakers.record_failure(provider);
+                            return Err(RotatorError::CircuitOpen(provider.to_string()));
+                        }
+                        RetryDecision::Abort => {
+                            self.circuit_breakers.record_failure(provider);
+                            self.cooldown.add_cooldown(
+                                provider,
+                                permit.key(),
+                                Duration::from_secs(5),
+                            );
+                            let mut builder =
+                                http::Response::builder().status(status).version(version);
+                            *builder.headers_mut().expect("response builder is valid") = headers;
+                            return Ok(builder
+                                .body(bytes::Bytes::from(body_text))
+                                .expect("response body rebuild should not fail")
+                                .into());
+                        }
                     }
-                    self.cooldown
-                        .add_cooldown(provider, permit.key(), Duration::from_secs(5));
-                    return Ok(resp);
                 }
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
@@ -281,12 +433,14 @@ impl RotatorClient {
                         self.cooldown
                             .add_cooldown(provider, permit.key(), Duration::from_secs(5));
                     }
-                    error!(provider, attempt, error = %e, "request failed");
+                    let sanitized = e.without_url();
+                    error!(provider, attempt, error = %sanitized, "request failed");
                     if attempt < self.max_retries {
+                        drop(permit);
                         tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 + 1))).await;
                         continue;
                     }
-                    return Err(RotatorError::Http(e.to_string()));
+                    return Err(RotatorError::Http(sanitized.to_string()));
                 }
             }
         }
@@ -412,21 +566,7 @@ impl RotatorClient {
     }
 
     pub fn transform_request(provider: &str, body: &mut serde_json::Value) {
-        match provider {
-            "anthropic" => {
-                if let Some(object) = body.as_object_mut() {
-                    object.remove("stream_options");
-                }
-            }
-            "gemini" => {
-                if let Some(model) = body.get("model").and_then(|value| value.as_str())
-                    && !model.starts_with("models/")
-                {
-                    body["model"] = serde_json::Value::String(format!("models/{model}"));
-                }
-            }
-            _ => {}
-        }
+        transform_request_for_provider(provider, body);
     }
 
     async fn record_usage_from_response(
@@ -886,6 +1026,54 @@ mod tests {
 
         RotatorClient::transform_request("gemini", &mut body);
         assert_eq!(body["model"], "models/gemini-2.5-flash");
+    }
+
+    #[test]
+    fn nvidia_transform_removes_unsupported_anthropic_fields() {
+        let mut body = serde_json::json!({
+            "model": "nvidia/llama-3.1",
+            "thinking": {"type": "enabled"},
+            "cache_control": {"type": "ephemeral"},
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "thinking",
+                    "thinking": "reasoning",
+                    "thinking_signature": "sig",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        });
+
+        RotatorClient::transform_request("nvidia", &mut body);
+
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("cache_control").is_none());
+        assert!(body["messages"][0]["content"][0].get("thinking").is_none());
+        assert!(
+            body["messages"][0]["content"][0]
+                .get("thinking_signature")
+                .is_none()
+        );
+        assert!(
+            body["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unknown_transform_leaves_body_unchanged() {
+        let mut body = serde_json::json!({
+            "model": "custom-model",
+            "stream_options": {"include_usage": true},
+            "thinking": {"type": "enabled"}
+        });
+        let original = body.clone();
+
+        RotatorClient::transform_request("unknown", &mut body);
+
+        assert_eq!(body, original);
     }
 
     #[tokio::test]

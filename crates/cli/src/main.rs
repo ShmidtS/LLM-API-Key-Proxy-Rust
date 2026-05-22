@@ -81,7 +81,11 @@ fn run_credentials(command: CredentialCommands) -> Result<()> {
 fn add_env_credential(provider: &str, key: &str) -> Result<()> {
     let provider = provider.trim().to_ascii_uppercase();
     let key = key.trim();
-    if provider.is_empty() || !provider.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if provider.is_empty()
+        || !provider
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
         bail!("invalid provider name: must be alphanumeric with underscores");
     }
     if key.is_empty() || key.contains('\n') || key.contains('\r') {

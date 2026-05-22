@@ -72,12 +72,23 @@ pub(crate) async fn list_data_models(
         .unwrap_or_default())
 }
 
+pub fn transform_request_for_provider(provider: &str, body: &mut serde_json::Value) {
+    match provider {
+        "anthropic" => anthropic::AnthropicProvider::new().transform_request(body),
+        "gemini" => gemini::GeminiProvider::new().transform_request(body),
+        "nvidia" => nvidia::NvidiaProvider::new().transform_request(body),
+        _ => {}
+    }
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync + Debug {
     fn id(&self) -> &str;
     fn base_url(&self) -> &str;
     fn auth_headers(&self, api_key: &str) -> Vec<(String, String)>;
     fn supports_streaming(&self) -> bool;
+
+    fn transform_request(&self, _body: &mut serde_json::Value) {}
 
     /// Forward a request to the provider. Path is relative (e.g., "chat/completions").
     async fn request(

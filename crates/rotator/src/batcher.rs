@@ -9,7 +9,13 @@ use tokio::time::{Duration, Instant, timeout};
 const EMBEDDING_BATCH_SIZE: usize = 64;
 const EMBEDDING_BATCH_TIMEOUT: Duration = Duration::from_millis(100);
 
-type BatchKey = (String, Option<String>, Option<u64>, Option<String>, Option<String>);
+type BatchKey = (
+    String,
+    Option<String>,
+    Option<u64>,
+    Option<String>,
+    Option<String>,
+);
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingBatcher {

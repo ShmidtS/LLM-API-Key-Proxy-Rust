@@ -13,6 +13,7 @@ pub mod provider_registry;
 pub mod provider_utils;
 pub mod providers;
 pub mod rate_limiter;
+pub mod retry_policy;
 pub mod throttle;
 pub mod tokenizer;
 pub mod usage;

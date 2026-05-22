@@ -12,6 +12,7 @@ pub struct CooldownEntry {
 #[derive(Debug, Default)]
 pub struct CooldownManager {
     cooldowns: DashMap<(String, String), CooldownEntry>,
+    provider_cooldowns: DashMap<String, Instant>,
 }
 
 impl CooldownManager {
@@ -30,7 +31,29 @@ impl CooldownManager {
             .insert((provider.to_owned(), key.to_owned()), entry);
     }
 
+    pub fn add_provider_cooldown(&self, provider: &str, duration: Duration) {
+        self.provider_cooldowns
+            .insert(provider.to_owned(), Instant::now() + duration);
+    }
+
+    pub fn is_provider_available(&self, provider: &str) -> bool {
+        if let Some(expires_at) = self.provider_cooldowns.get(provider) {
+            if Instant::now() < *expires_at {
+                return false;
+            }
+        } else {
+            return true;
+        }
+
+        self.provider_cooldowns.remove(provider);
+        true
+    }
+
     pub fn is_available(&self, provider: &str, key: &str) -> bool {
+        if !self.is_provider_available(provider) {
+            return false;
+        }
+
         let cooldown_key = (provider.to_owned(), key.to_owned());
 
         if let Some(entry) = self.cooldowns.get(&cooldown_key) {
@@ -114,6 +137,36 @@ mod tests {
         manager.remove_cooldown("openai", "key-1");
 
         assert!(manager.is_available("openai", "key-1"));
+    }
+
+    #[test]
+    fn provider_is_unavailable_during_cooldown() {
+        let manager = CooldownManager::new();
+
+        manager.add_provider_cooldown("openai", Duration::from_secs(60));
+
+        assert!(!manager.is_provider_available("openai"));
+        assert!(!manager.is_available("openai", "key-1"));
+    }
+
+    #[tokio::test]
+    async fn provider_becomes_available_after_cooldown_expires() {
+        let manager = CooldownManager::new();
+
+        manager.add_provider_cooldown("openai", Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(manager.is_provider_available("openai"));
+        assert!(manager.is_available("openai", "key-1"));
+    }
+
+    #[test]
+    fn provider_cooldown_does_not_block_other_providers() {
+        let manager = CooldownManager::new();
+
+        manager.add_provider_cooldown("openai", Duration::from_secs(60));
+
+        assert!(manager.is_available("anthropic", "key-1"));
     }
 
     #[test]

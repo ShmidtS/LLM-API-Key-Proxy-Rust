@@ -24,6 +24,8 @@ AGENTS.md
 tests/
 !proxy_app/tests/
 !proxy_app/tests/foundation_parity_test.rs
+!crates/rotator/tests/
+!crates/rotator/tests/retry_test.rs
 context-mode/
 CONTEXT.md
 superpowers/

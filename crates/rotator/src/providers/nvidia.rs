@@ -15,6 +15,25 @@ impl NvidiaProvider {
     }
 }
 
+fn strip_unsupported_anthropic_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.remove("thinking");
+            object.remove("cache_control");
+            object.remove("thinking_signature");
+            for value in object.values_mut() {
+                strip_unsupported_anthropic_fields(value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                strip_unsupported_anthropic_fields(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[async_trait]
 impl Provider for NvidiaProvider {
     fn id(&self) -> &str {
@@ -31,6 +50,10 @@ impl Provider for NvidiaProvider {
 
     fn supports_streaming(&self) -> bool {
         true
+    }
+
+    fn transform_request(&self, body: &mut serde_json::Value) {
+        strip_unsupported_anthropic_fields(body);
     }
 
     async fn request(

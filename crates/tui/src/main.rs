@@ -348,10 +348,7 @@ impl App {
         if self.config.enable_raw_logging {
             args.push("--enable-raw-logging".to_owned());
         }
-        match Command::new("cargo")
-            .args(args)
-            .spawn()
-        {
+        match Command::new("cargo").args(args).spawn() {
             Ok(_) => self.message = Some("Proxy started".to_owned()),
             Err(error) => self.message = Some(format!("Proxy start failed: {error}")),
         }

@@ -1,6 +1,5 @@
-use crate::compat::anthropic::{
-    anthropic_stream_to_openai_sse, anthropic_to_openai_response, openai_to_anthropic_messages,
-};
+use crate::compat::anthropic::{anthropic_to_openai_response, openai_to_anthropic_messages};
+use crate::compat::anthropic_streaming::{AnthropicStreamTranslator, ChunkBatcher};
 use crate::errors::AppError;
 use crate::routes::utils::upstream_response;
 use crate::state::AppState;
@@ -61,16 +60,18 @@ async fn chat_completions(
         let status = upstream.status();
         let headers = upstream.headers().clone();
         let model = req.model.clone();
+        let mut batcher = ChunkBatcher::new();
+        let mut translator = AnthropicStreamTranslator::new(model);
         let stream = upstream.bytes_stream().map(move |result| {
             result
                 .map(|bytes| {
                     if is_anthropic {
-                        anthropic_stream_to_openai_sse(
-                            std::str::from_utf8(&bytes).unwrap_or_default(),
-                            &model,
-                        )
-                        .map(Bytes::from)
-                        .unwrap_or_default()
+                        let output = batcher
+                            .push(bytes)
+                            .iter()
+                            .flat_map(|record| translator.translate_sse_record_to_sse(record))
+                            .collect::<String>();
+                        Bytes::from(output)
                     } else {
                         bytes
                     }

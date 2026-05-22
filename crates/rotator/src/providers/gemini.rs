@@ -38,6 +38,14 @@ impl Provider for GeminiProvider {
         self.inner.supports_streaming()
     }
 
+    fn transform_request(&self, body: &mut serde_json::Value) {
+        if let Some(model) = body.get("model").and_then(|value| value.as_str())
+            && !model.starts_with("models/")
+        {
+            body["model"] = serde_json::Value::String(format!("models/{model}"));
+        }
+    }
+
     async fn request(
         &self,
         client: &reqwest::Client,

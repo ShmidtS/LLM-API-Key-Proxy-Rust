@@ -36,6 +36,12 @@ impl Provider for AnthropicProvider {
         true
     }
 
+    fn transform_request(&self, body: &mut serde_json::Value) {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("stream_options");
+        }
+    }
+
     async fn request(
         &self,
         client: &reqwest::Client,
