@@ -5,14 +5,15 @@ pub mod routes;
 pub mod state;
 
 use axum::{
-    Router,
+    Json, Router,
     http::{HeaderName, HeaderValue, Method, StatusCode},
     middleware::{from_fn, from_fn_with_state},
 };
 use proxy_config::ProxyConfig;
+use serde_json::Value;
 use std::time::Duration;
 use tower_http::{
-    compression::{CompressionLayer, CompressionLevel},
+    compression::{CompressionLayer, CompressionLevel, predicate::DefaultPredicate},
     cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer},
     limit::RequestBodyLimitLayer,
     timeout::TimeoutLayer,
@@ -20,6 +21,14 @@ use tower_http::{
 
 pub fn build_app() -> Router {
     build_app_with_state(state::AppState::new())
+}
+
+async fn root_status() -> Json<Value> {
+    Json(serde_json::json!({"Status": "API Key Proxy is running"}))
+}
+
+async fn root_head() -> StatusCode {
+    StatusCode::OK
 }
 
 fn cors_layer(config: &ProxyConfig) -> Option<CorsLayer> {
@@ -37,7 +46,16 @@ fn cors_layer(config: &ProxyConfig) -> Option<CorsLayer> {
                 }
             }
         });
-    let mut cors = CorsLayer::new().allow_origin(AllowOrigin::list(origins));
+    let mut cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .expose_headers([
+            HeaderName::from_static("x-accel-buffering"),
+            HeaderName::from_static("x-request-id"),
+            HeaderName::from_static("x-provider"),
+            HeaderName::from_static("retry-after"),
+            HeaderName::from_static("x-ratelimit-limit"),
+            HeaderName::from_static("x-ratelimit-remaining"),
+        ]);
 
     if !config.cors_allowed_methods.is_empty() {
         let methods = config.cors_allowed_methods.iter().filter_map(|method| {
@@ -91,7 +109,9 @@ pub fn build_app_with_state(app_state: state::AppState) -> Router {
         .merge(routes::images::router())
         .merge(routes::video::router())
         .merge(routes::responses::router())
-        .merge(routes::moderation::router());
+        .merge(routes::moderation::router())
+        .merge(routes::health::protected_router())
+        .merge(routes::models::router());
 
     let proxy_protected = if config.enable_raw_logging {
         proxy_protected.route_layer(from_fn_with_state(
@@ -108,14 +128,8 @@ pub fn build_app_with_state(app_state: state::AppState) -> Router {
     ));
 
     let app = Router::new()
-        .route(
-            "/",
-            axum::routing::get(|| async {
-                axum::Json(serde_json::json!({"Status": "API Key Proxy is running"}))
-            }),
-        )
+        .route("/", axum::routing::get(root_status).head(root_head))
         .merge(routes::health::router())
-        .merge(routes::models::router())
         .merge(proxy_protected)
         .merge(protected)
         .layer(from_fn(middleware::security_headers));
@@ -130,9 +144,13 @@ pub fn build_app_with_state(app_state: state::AppState) -> Router {
         config.max_concurrent_requests,
     ))
     // NOTE: gzip_min_size is not supported by tower-http CompressionLayer in 0.6
-    .layer(CompressionLayer::new().quality(CompressionLevel::Precise(
-        config.gzip_compression_level as i32,
-    )))
+    .layer(
+        CompressionLayer::new()
+            .quality(CompressionLevel::Precise(
+                config.gzip_compression_level as i32,
+            ))
+            .compress_when(DefaultPredicate::new()),
+    )
     .layer(from_fn(middleware::add_request_id))
     .layer(RequestBodyLimitLayer::new(config.max_body_bytes))
     .layer(from_fn_with_state(

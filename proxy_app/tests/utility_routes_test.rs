@@ -351,7 +351,12 @@ async fn admin_cost_estimate_uses_model_prices() {
     let json: Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["estimated_cost_usd"], 12500.0);
+    assert_eq!(json["model"], "gpt-4o");
+    assert_eq!(json["cost"], 12500.0);
+    assert_eq!(json["currency"], "USD");
+    assert_eq!(json["source"], "static");
+    assert_eq!(json["pricing"]["input_cost"], 2500.0);
+    assert_eq!(json["pricing"]["output_cost"], 10000.0);
 
     unsafe {
         std::env::remove_var("ADMIN_TOKEN");

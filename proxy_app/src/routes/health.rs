@@ -4,19 +4,22 @@ use serde_json::json;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
+    Router::new().route("/version", get(version))
+}
+
+pub fn protected_router() -> Router<AppState> {
     Router::new()
         .route("/v1/props", get(props))
         .route("/props", get(props))
-        .route("/version", get(version))
         .route("/v1/model-info/stats", get(model_info_stats))
 }
 
 async fn props() -> Json<serde_json::Value> {
-    Json(json!({"object": "props"}))
+    Json(json!({"version": "1.16", "mode": "llm", "gpu_devices": []}))
 }
 
 async fn version() -> Json<serde_json::Value> {
-    Json(json!({"version": env!("CARGO_PKG_VERSION")}))
+    Json(json!({"version": "1.16"}))
 }
 
 async fn model_info_stats(State(state): State<AppState>) -> Json<serde_json::Value> {

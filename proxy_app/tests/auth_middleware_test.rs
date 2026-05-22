@@ -16,6 +16,10 @@ fn state_with_auth() -> AppState {
     AppState::from_config(config)
 }
 
+fn state_without_auth() -> AppState {
+    AppState::from_config(ProxyConfig::default())
+}
+
 async fn response_json(response: axum::response::Response) -> (StatusCode, Value) {
     let status = response.status();
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -94,7 +98,7 @@ async fn admin_route_without_admin_token_returns_openai_auth_error() {
 }
 
 #[tokio::test]
-async fn models_route_is_public() {
+async fn models_route_requires_proxy_auth_when_key_configured() {
     let response = proxy_app::build_app_with_state(state_with_auth())
         .oneshot(
             Request::builder()
@@ -105,5 +109,44 @@ async fn models_route_is_public() {
         .await
         .unwrap();
 
-    assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn version_route_remains_public() {
+    let response = proxy_app::build_app_with_state(state_with_auth())
+        .oneshot(
+            Request::builder()
+                .uri("/version")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn props_tags_and_providers_require_proxy_auth_when_key_configured() {
+    for uri in ["/v1/props", "/api/tags", "/v1/providers"] {
+        let response = proxy_app::build_app_with_state(state_with_auth())
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn proxy_routes_are_open_when_no_proxy_auth_configured() {
+    for uri in ["/v1/models", "/v1/props", "/api/tags", "/v1/providers"] {
+        let response = proxy_app::build_app_with_state(state_without_auth())
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+    }
 }

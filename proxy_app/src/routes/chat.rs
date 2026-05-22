@@ -4,7 +4,7 @@ use crate::errors::AppError;
 use crate::routes::utils::upstream_response;
 use crate::state::AppState;
 use axum::body::{Body, Bytes};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Router, extract::State, response::Json, routing::post};
 use futures::StreamExt;
@@ -20,11 +20,11 @@ async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, AppError> {
     if !state.registry.is_model_allowed(&req.model) {
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Model not allowed"})),
-        )
-            .into_response());
+        return Ok(crate::errors::invalid_request_error(format!(
+            "Model not allowed: {}",
+            req.model
+        ))
+        .into_response());
     }
 
     let provider = state
@@ -33,7 +33,9 @@ async fn chat_completions(
         .unwrap_or("openai")
         .to_owned();
     let is_anthropic = provider == "anthropic";
-    let body = serde_json::to_value(&req)?;
+    let mut body = serde_json::to_value(&req)?;
+    let override_temperature_zero = state.config.override_temperature_zero.as_deref();
+    apply_temperature_override(&mut body, override_temperature_zero);
     let upstream_body = if is_anthropic {
         openai_to_anthropic_messages(&body)
     } else {
@@ -110,4 +112,28 @@ async fn chat_completions(
         .headers_mut()
         .insert("x-input-tokens", input_tokens_header);
     Ok(response)
+}
+
+fn apply_temperature_override(body: &mut Value, override_temperature_zero: Option<&str>) {
+    let Some(temperature) = body.get("temperature") else {
+        return;
+    };
+    if temperature.as_f64() != Some(0.0) {
+        return;
+    }
+
+    match override_temperature_zero
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("remove") => {
+            if let Some(object) = body.as_object_mut() {
+                object.remove("temperature");
+            }
+        }
+        Some("set") | Some("true") | Some("1") | Some("yes") => {
+            body["temperature"] = serde_json::json!(1.0);
+        }
+        _ => {}
+    }
 }

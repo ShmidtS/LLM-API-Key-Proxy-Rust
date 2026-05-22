@@ -61,6 +61,14 @@ pub fn load_from_env() -> Result<proxy::ProxyConfig, ConfigError> {
     apply_env("MAX_RETRIES", &mut config.max_retries)?;
     apply_env("LOG_REQUEST_BODY", &mut config.log_request_body)?;
     apply_env("ENABLE_RAW_LOGGING", &mut config.enable_raw_logging)?;
+    apply_optional_string_env(
+        "OVERRIDE_TEMPERATURE_ZERO",
+        &mut config.override_temperature_zero,
+    );
+    apply_env("HTTP_SSL_VERIFY", &mut config.http_ssl_verify)?;
+    apply_vec_env("HTTP_SSL_VERIFY_HOSTS", &mut config.http_ssl_verify_hosts);
+    apply_env("HTTP2_ENABLED", &mut config.http2_enabled)?;
+    apply_optional_string_env("HTTP_DNS_RESOLVER", &mut config.http_dns_resolver);
 
     Ok(config)
 }

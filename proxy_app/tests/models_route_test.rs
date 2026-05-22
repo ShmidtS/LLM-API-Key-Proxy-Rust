@@ -87,13 +87,12 @@ fn test_state(providers: Vec<(&str, String)>) -> proxy_app::state::AppState {
 }
 
 async fn get_models(state: proxy_app::state::AppState) -> Value {
+    get_json(state, "/v1/models").await
+}
+
+async fn get_json(state: proxy_app::state::AppState, uri: &str) -> Value {
     let response = proxy_app::build_app_with_state(state)
-        .oneshot(
-            Request::builder()
-                .uri("/v1/models")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -145,4 +144,60 @@ async fn models_route_uses_warm_cache() {
     assert_eq!(second["data"].as_array().unwrap().len(), 1);
     assert_eq!(request_count.load(Ordering::SeqCst), 1);
     assert!(started.elapsed() < Duration::from_millis(100));
+}
+
+#[tokio::test]
+async fn models_route_supports_enriched_false() {
+    let (openai_url, _) = model_server(StatusCode::OK, r#"{"data":[{"id":"gpt-4"}]}"#).await;
+
+    let body = get_json(
+        test_state(vec![("openai", openai_url)]),
+        "/v1/models?enriched=false",
+    )
+    .await;
+
+    assert_eq!(body["object"], "list");
+    assert_eq!(body["data"][0]["id"], "gpt-4");
+    assert!(body["data"][0].get("pricing").is_none());
+}
+
+#[tokio::test]
+async fn models_route_supports_enriched_true() {
+    let (openai_url, _) = model_server(StatusCode::OK, r#"{"data":[{"id":"gpt-4o"}]}"#).await;
+
+    let body = get_json(
+        test_state(vec![("openai", openai_url)]),
+        "/v1/models?enriched=true",
+    )
+    .await;
+
+    assert_eq!(body["object"], "list");
+    assert_eq!(body["data"][0]["id"], "gpt-4o");
+    assert!(body["data"][0]["pricing"].is_object());
+}
+
+#[tokio::test]
+async fn providers_route_returns_plain_array() {
+    let (openai_url, _) = model_server(StatusCode::OK, r#"{"data":[]}"#).await;
+
+    let body = get_json(test_state(vec![("openai", openai_url)]), "/v1/providers").await;
+
+    assert!(body.as_array().is_some());
+    assert_eq!(body[0]["id"], "openai");
+}
+
+#[tokio::test]
+async fn api_tags_returns_ollama_schema() {
+    let (openai_url, _) = model_server(StatusCode::OK, r#"{"data":[{"id":"gpt-4"}]}"#).await;
+
+    let body = get_json(test_state(vec![("openai", openai_url)]), "/api/tags").await;
+
+    assert_eq!(body["models"][0]["name"], "gpt-4");
+    assert_eq!(body["models"][0]["model"], "gpt-4");
+    assert!(body["models"][0]["details"].is_object());
+    assert!(
+        body["models"][0]["details"]
+            .get("quantization_level")
+            .is_some()
+    );
 }

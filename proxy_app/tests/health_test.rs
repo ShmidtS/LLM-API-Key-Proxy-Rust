@@ -34,6 +34,24 @@ async fn test_health_endpoint() {
     assert_eq!(response.status(), 200);
 }
 
+#[tokio::test]
+async fn root_head_returns_ok_with_empty_body() {
+    let response = empty_app()
+        .oneshot(
+            Request::builder()
+                .method(Method::HEAD)
+                .uri("/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(bytes.is_empty());
+}
+
 async fn post_json(uri: &str, body: Value) -> axum::response::Response {
     empty_app()
         .oneshot(
@@ -52,6 +70,44 @@ async fn post_json(uri: &str, body: Value) -> axum::response::Response {
 async fn response_json(response: axum::response::Response) -> Value {
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn props_endpoints_return_parity_schema() {
+    for uri in ["/v1/props", "/props"] {
+        let response = empty_app()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("x-api-key", "test-proxy-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response_json(response).await,
+            json!({"version": "1.16", "mode": "llm", "gpu_devices": []})
+        );
+    }
+}
+
+#[tokio::test]
+async fn version_endpoint_returns_parity_version() {
+    let response = empty_app()
+        .oneshot(
+            Request::builder()
+                .uri("/version")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response_json(response).await, json!({"version": "1.16"}));
 }
 
 #[tokio::test]

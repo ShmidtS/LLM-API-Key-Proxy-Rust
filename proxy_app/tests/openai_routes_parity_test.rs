@@ -208,6 +208,7 @@ mod openai_routes_parity {
                 Request::builder()
                     .method(Method::GET)
                     .uri("/v1/models/openai/gpt-4o")
+                    .header("x-api-key", "test-proxy-token")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -240,10 +241,58 @@ mod openai_routes_parity {
         let status = response.status();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
-        let providers = json["providers"].as_array().unwrap();
+        let providers = json["providers"].as_object().unwrap();
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(providers.len(), 1);
-        assert_eq!(providers[0]["id"], "openai");
+        assert_eq!(providers["openai"]["id"], "openai");
+    }
+
+    #[tokio::test]
+    async fn quota_stats_rejects_invalid_action() {
+        let state = multi_provider_state();
+
+        let response = proxy_app::build_app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/quota-stats")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("authorization", "Bearer test-admin-token")
+                    .body(Body::from(json!({"action":"bad"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn quota_stats_rejects_invalid_scope() {
+        let state = multi_provider_state();
+
+        let response = proxy_app::build_app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/quota-stats")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("authorization", "Bearer test-admin-token")
+                    .body(Body::from(json!({"scope":"bad"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["type"], "invalid_request_error");
     }
 }

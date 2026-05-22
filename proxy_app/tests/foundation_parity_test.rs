@@ -2,7 +2,16 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use proxy_app::state::AppState;
 use proxy_config::ProxyConfig;
+use rotator::{
+    AuthType, CircuitBreakerRegistry, CooldownManager, CredentialManager, HttpClientPool,
+    ProviderDefinition, ProviderRegistry, RateLimiterRegistry, RotatorClient,
+};
 use serde_json::{Value, json};
+use std::{collections::HashMap, sync::Arc};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 use tower::ServiceExt;
 
 fn app_with_config(config: ProxyConfig) -> axum::Router {
@@ -15,6 +24,64 @@ fn auth_config() -> ProxyConfig {
         api_keys: vec!["test-key".to_owned()],
         ..Default::default()
     }
+}
+
+async fn sse_upstream_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buffer = [0; 4096];
+        let _ = socket.read(&mut buffer).await;
+        let response = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "content-type: text/event-stream\r\n",
+            "connection: close\r\n",
+            "\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+    });
+
+    format!("http://{addr}/v1")
+}
+
+fn streaming_test_state(base_url: String) -> AppState {
+    let registry = Arc::new(ProviderRegistry::default());
+    registry.register(ProviderDefinition {
+        id: "openai".to_owned(),
+        display_name: "openai".to_owned(),
+        base_url,
+        auth_type: AuthType::ApiKey,
+        model_patterns: vec![r"^gpt-.*".to_owned()],
+        endpoints: vec!["/chat/completions".to_owned()],
+        features: vec!["chat".to_owned()],
+        model_count: 1,
+        timeout_secs: 30,
+        default_headers: HashMap::new(),
+        token_endpoint: None,
+        client_id: None,
+        client_secret: None,
+    });
+
+    let credentials = CredentialManager::new();
+    credentials.register_keys("openai".to_owned(), vec!["openai-test-key".to_owned()], 10);
+    let rotator = RotatorClient::new(
+        credentials,
+        HttpClientPool::new(30),
+        registry.clone(),
+        Arc::new(RateLimiterRegistry::new()),
+        Arc::new(CooldownManager::new()),
+        Arc::new(CircuitBreakerRegistry::new()),
+        None,
+        0,
+    );
+    let mut state = AppState::with_parts(rotator, registry);
+    state.config.api_keys = vec!["test-key".to_owned()];
+    state
 }
 
 async fn response_json(response: axum::response::Response) -> (StatusCode, Value) {
@@ -149,6 +216,71 @@ async fn foundation_parity_cors_preflight_without_configured_origin_has_no_cors_
             .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn foundation_parity_cors_exposes_proxy_headers() {
+    let mut config = auth_config();
+    config.cors_allowed_origins = vec!["http://localhost:3000".to_owned()];
+    let response = app_with_config(config)
+        .oneshot(
+            Request::builder()
+                .uri("/version")
+                .header(header::ORIGIN, "http://localhost:3000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let expose_headers = response
+        .headers()
+        .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    for expected in [
+        "x-accel-buffering",
+        "x-request-id",
+        "x-provider",
+        "retry-after",
+        "x-ratelimit-limit",
+        "x-ratelimit-remaining",
+    ] {
+        assert!(expose_headers.contains(expected), "{expected}");
+    }
+}
+
+#[tokio::test]
+async fn foundation_parity_sse_streaming_route_is_not_gzip_encoded() {
+    let state = streaming_test_state(sse_upstream_server().await);
+    let response = proxy_app::build_app_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .header("x-api-key", "test-key")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-4o-mini",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
 }
 
 #[tokio::test]

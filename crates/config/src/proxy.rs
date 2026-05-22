@@ -68,6 +68,16 @@ pub struct ProxyConfig {
     pub log_request_body: bool,
     #[serde(default)]
     pub enable_raw_logging: bool,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    pub override_temperature_zero: Option<String>,
+    #[serde(default = "default_http_ssl_verify")]
+    pub http_ssl_verify: bool,
+    #[serde(default, deserialize_with = "deserialize_comma_separated")]
+    pub http_ssl_verify_hosts: Vec<String>,
+    #[serde(default = "default_http2_enabled")]
+    pub http2_enabled: bool,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    pub http_dns_resolver: Option<String>,
 }
 
 impl Default for ProxyConfig {
@@ -96,6 +106,11 @@ impl Default for ProxyConfig {
             max_retries: default_max_retries(),
             log_request_body: default_log_request_body(),
             enable_raw_logging: default_enable_raw_logging(),
+            override_temperature_zero: default_override_temperature_zero(),
+            http_ssl_verify: default_http_ssl_verify(),
+            http_ssl_verify_hosts: default_http_ssl_verify_hosts(),
+            http2_enabled: default_http2_enabled(),
+            http_dns_resolver: default_http_dns_resolver(),
         }
     }
 }
@@ -168,6 +183,21 @@ fn default_log_request_body() -> bool {
 }
 fn default_enable_raw_logging() -> bool {
     false
+}
+fn default_override_temperature_zero() -> Option<String> {
+    None
+}
+fn default_http_ssl_verify() -> bool {
+    true
+}
+fn default_http_ssl_verify_hosts() -> Vec<String> {
+    Vec::new()
+}
+fn default_http2_enabled() -> bool {
+    false
+}
+fn default_http_dns_resolver() -> Option<String> {
+    None
 }
 
 #[cfg(test)]

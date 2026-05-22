@@ -1,20 +1,26 @@
 use crate::state::AppState;
 use axum::{
     Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::Json,
     routing::get,
 };
 use futures::future::join_all;
-use models::common::{ModelInfo, ModelList};
+use models::common::ModelInfo;
 use rotator::{RotatorClient, parse_model_ids_response};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
 
-const MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
+const MODEL_CACHE_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Deserialize)]
+struct ModelsQuery {
+    enriched: Option<bool>,
+}
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -25,17 +31,42 @@ pub fn router() -> Router<AppState> {
         .route("/api/tags", get(ollama_tags))
 }
 
-async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
-    if let Err(error) = state
-        .model_info
-        .write()
-        .await
-        .refresh_if_needed(&state.catalog_client)
-        .await
+async fn list_models(
+    State(state): State<AppState>,
+    Query(query): Query<ModelsQuery>,
+) -> Json<Value> {
+    if query.enriched != Some(false)
+        && let Err(error) = state
+            .model_info
+            .write()
+            .await
+            .refresh_if_needed(&state.catalog_client)
+            .await
     {
         tracing::warn!(error = %error, "failed to refresh model catalog");
     }
 
+    let data = collect_models(&state).await;
+    let data: Vec<Value> = data
+        .into_iter()
+        .map(|model| {
+            if query.enriched == Some(false) {
+                json!({
+                    "id": model.id,
+                    "object": model.object,
+                    "created": model.created,
+                    "owned_by": model.owned_by,
+                })
+            } else {
+                enrich_model(&state, model)
+            }
+        })
+        .collect();
+
+    Json(json!({"object": "list", "data": data}))
+}
+
+async fn collect_models(state: &AppState) -> Vec<ModelInfo> {
     let mut tasks = Vec::new();
     let now = Instant::now();
 
@@ -82,10 +113,7 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelList> {
         }
     }
 
-    Json(ModelList {
-        object: "list".into(),
-        data,
-    })
+    data
 }
 
 async fn fetch_provider_models(
@@ -133,16 +161,14 @@ async fn list_providers(State(state): State<AppState>) -> Json<Value> {
         .map(|provider| json!({"id": provider.id, "base_url": provider.base_url}))
         .collect();
 
-    Json(json!({"object": "list", "data": data}))
+    Json(json!(data))
 }
 
 async fn ollama_tags(State(state): State<AppState>) -> Json<Value> {
-    let models: Vec<_> = state
-        .registry
-        .all_providers()
+    let models: Vec<_> = collect_models(&state)
+        .await
         .into_iter()
-        .flat_map(|provider| provider.model_patterns)
-        .map(|name| json!({"name": name}))
+        .map(ollama_model)
         .collect();
 
     Json(json!({"models": models}))
@@ -155,4 +181,44 @@ fn model_info(id: String, provider_id: &str) -> ModelInfo {
         created: 0,
         owned_by: Some(provider_id.to_owned()),
     }
+}
+
+fn enrich_model(state: &AppState, model: ModelInfo) -> Value {
+    let metadata = state
+        .model_info
+        .try_read()
+        .ok()
+        .and_then(|service| service.get_model(&model.id));
+
+    json!({
+        "id": model.id,
+        "object": model.object,
+        "created": model.created,
+        "owned_by": model.owned_by,
+        "display_name": metadata.as_ref().map(|metadata| metadata.display_name.clone()),
+        "context_length": metadata.as_ref().map(|metadata| metadata.context_length),
+        "pricing": metadata.as_ref().map(|metadata| json!({
+            "input": metadata.pricing_input_per_1k,
+            "output": metadata.pricing_output_per_1k,
+        })),
+        "capabilities": metadata.map(|metadata| metadata.capabilities),
+    })
+}
+
+fn ollama_model(model: ModelInfo) -> Value {
+    json!({
+        "name": model.id,
+        "model": model.id,
+        "modified_at": "1970-01-01T00:00:00Z",
+        "size": 0,
+        "digest": "",
+        "details": {
+            "parent_model": Value::Null,
+            "format": Value::Null,
+            "family": model.owned_by,
+            "families": Value::Null,
+            "parameter_size": Value::Null,
+            "quantization_level": Value::Null,
+        }
+    })
 }

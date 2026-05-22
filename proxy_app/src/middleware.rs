@@ -136,7 +136,7 @@ pub async fn log_requests(
 
     let (request, preview) = if app_state.config.log_request_body {
         let (parts, body) = request.into_parts();
-        let body_bytes = match to_bytes(body, 2048).await {
+        let body_bytes = match to_bytes(body, app_state.config.max_body_bytes).await {
             Ok(bytes) => bytes,
             Err(error) => {
                 tracing::warn!(%method, %uri, error = %error, "failed to read request body");
@@ -190,7 +190,7 @@ fn redacted_headers(headers: &HeaderMap) -> String {
 }
 
 fn request_body_preview(body: &str) -> String {
-    body.chars().take(200).collect()
+    body.chars().take(2048).collect()
 }
 
 #[cfg(test)]
@@ -229,10 +229,10 @@ mod tests {
 
     #[test]
     fn request_body_preview_limits_to_first_200_chars() {
-        let body = "x".repeat(250);
+        let body = "x".repeat(2500);
 
         let preview = request_body_preview(&body);
 
-        assert_eq!(preview.len(), 200);
+        assert_eq!(preview.len(), 2048);
     }
 }
