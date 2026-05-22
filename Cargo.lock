@@ -1708,6 +1708,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "clap",
  "config 0.1.0",
  "futures",
  "models",

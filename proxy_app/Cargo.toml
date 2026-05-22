@@ -9,6 +9,7 @@ license.workspace = true
 rotator = { path = "../crates/rotator" }
 models = { path = "../crates/models" }
 proxy_config = { package = "config", path = "../crates/config" }
+clap = { version = "4", features = ["derive"] }
 axum = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true, features = ["util", "limit"] }

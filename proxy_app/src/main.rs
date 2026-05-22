@@ -1,9 +1,30 @@
-use std::{net::SocketAddr, process, time::Duration};
+use clap::Parser;
+use std::{
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    net::SocketAddr,
+    path::Path,
+    process,
+    time::Duration,
+};
 use tokio::time::timeout;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+#[derive(Debug, Parser)]
+struct Args {
+    #[arg(long)]
+    host: Option<String>,
+    #[arg(long)]
+    port: Option<u16>,
+    #[arg(long, default_value_t = false)]
+    enable_raw_logging: bool,
+    #[arg(long, help = "Launch interactive tool to add a credential")]
+    add_credential: bool,
+}
+
 #[tokio::main]
 async fn main() {
+    let args = Args::parse();
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -12,10 +33,43 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let config = proxy_config::load_from_env().unwrap_or_else(|err| {
+    ensure_env_file().unwrap_or_else(|err| {
+        tracing::error!("failed to create .env: {err}");
+        process::exit(1);
+    });
+
+    if args.add_credential {
+        add_credential_interactive().unwrap_or_else(|err| {
+            tracing::error!("failed to add credential: {err}");
+            process::exit(1);
+        });
+        process::exit(0);
+    }
+
+    let mut config = proxy_config::load_from_env().unwrap_or_else(|err| {
         tracing::error!("failed to load config: {err}");
         process::exit(1);
     });
+    if config.auth_enabled
+        && config
+            .proxy_api_key
+            .as_deref()
+            .is_none_or(|key| key.trim().is_empty())
+    {
+        eprintln!(
+            "Error: PROXY_API_KEY is not set. Run with --add-credential to add credentials, or set PROXY_API_KEY in .env"
+        );
+        process::exit(1);
+    }
+    if let Some(host) = args.host {
+        config.host = host;
+    }
+    if let Some(port) = args.port {
+        config.port = port;
+    }
+    if args.enable_raw_logging {
+        config.enable_raw_logging = true;
+    }
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
         .unwrap_or_else(|err| {
@@ -25,8 +79,9 @@ async fn main() {
     let graceful_shutdown_timeout_secs = config.graceful_shutdown_timeout_secs;
     let state = proxy_app::state::AppState::from_config(config);
     let app = proxy_app::build_app_with_state(state);
-    tracing::info!("listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    tracing::info!("listening on {}", addr);
+    tracing::info!("LLM API Key Proxy Rust app started");
     let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
 
     match timeout(Duration::from_secs(graceful_shutdown_timeout_secs), server).await {
@@ -34,6 +89,34 @@ async fn main() {
         Ok(Err(err)) => tracing::error!("server error: {err}"),
         Err(_) => tracing::warn!("graceful shutdown timed out, forcing exit"),
     }
+}
+
+fn ensure_env_file() -> io::Result<()> {
+    if !Path::new(".env").exists() {
+        let proxy_api_key = uuid::Uuid::new_v4().simple().to_string();
+        fs::write(".env", format!("PROXY_API_KEY={proxy_api_key}\n"))?;
+        println!("Created .env with PROXY_API_KEY={proxy_api_key}");
+    }
+    Ok(())
+}
+
+fn add_credential_interactive() -> io::Result<()> {
+    print!("Provider name (e.g. openai): ");
+    io::stdout().flush()?;
+    let mut provider = String::new();
+    io::stdin().read_line(&mut provider)?;
+    let provider = provider.trim().to_ascii_uppercase();
+
+    print!("API key: ");
+    io::stdout().flush()?;
+    let mut key = String::new();
+    io::stdin().read_line(&mut key)?;
+    let key = key.trim();
+
+    let mut env_file = OpenOptions::new().create(true).append(true).open(".env")?;
+    writeln!(env_file, "{provider}_API_KEY={key}")?;
+    println!("Added credential for provider {provider} to .env");
+    Ok(())
 }
 
 async fn shutdown_signal() {

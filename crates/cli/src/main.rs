@@ -44,6 +44,7 @@ enum Commands {
 enum CredentialCommands {
     List,
     Show { provider: String },
+    Add { provider: String, key: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -73,7 +74,21 @@ fn run_credentials(command: CredentialCommands) -> Result<()> {
     match command {
         CredentialCommands::List => list_credentials(&manager),
         CredentialCommands::Show { provider } => show_credentials(&manager, &provider),
+        CredentialCommands::Add { provider, key } => add_env_credential(&provider, &key),
     }
+}
+
+fn add_env_credential(provider: &str, key: &str) -> Result<()> {
+    let provider = provider.trim().to_ascii_uppercase();
+    let key = key.trim();
+    let mut env_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(".env")
+        .context("open .env")?;
+    writeln!(env_file, "{provider}_API_KEY={key}").context("write credential to .env")?;
+    println!("Added credential for provider {provider} to .env");
+    Ok(())
 }
 
 fn list_credentials(manager: &CredentialManager) -> Result<()> {
