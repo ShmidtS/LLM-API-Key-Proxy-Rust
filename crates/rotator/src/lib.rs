@@ -1,3 +1,4 @@
+pub mod batcher;
 pub mod circuit_breaker;
 pub mod client;
 pub mod cooldown;
@@ -16,6 +17,7 @@ pub mod throttle;
 pub mod tokenizer;
 pub mod usage;
 
+pub use batcher::EmbeddingBatcher;
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerRegistry, CircuitState};
 pub use client::RotatorClient;
 pub use cooldown::{CooldownEntry, CooldownManager};

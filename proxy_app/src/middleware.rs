@@ -8,6 +8,8 @@ use axum::{
 use std::time::Instant;
 use uuid::Uuid;
 
+pub mod raw_io;
+
 use crate::{errors, state::AppState};
 
 pub async fn require_admin_auth(

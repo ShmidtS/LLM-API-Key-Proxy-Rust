@@ -22,12 +22,7 @@ async fn create_embeddings(
             .into_response());
     }
 
-    let provider = state
-        .registry
-        .resolve_provider_by_model(&req.model)
-        .unwrap_or("openai");
-
     let body = serde_json::to_value(&req)?;
-    let resp = state.rotator.request(provider, "embeddings", body).await?;
+    let resp = state.batcher.add_request(body).await?;
     upstream_response(resp).await
 }

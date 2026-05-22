@@ -66,6 +66,8 @@ pub struct ProxyConfig {
     pub max_retries: usize,
     #[serde(default = "default_log_request_body")]
     pub log_request_body: bool,
+    #[serde(default)]
+    pub enable_raw_logging: bool,
 }
 
 impl Default for ProxyConfig {
@@ -93,6 +95,7 @@ impl Default for ProxyConfig {
             usage_batch_size: default_usage_batch_size(),
             max_retries: default_max_retries(),
             log_request_body: default_log_request_body(),
+            enable_raw_logging: default_enable_raw_logging(),
         }
     }
 }
@@ -163,6 +166,9 @@ fn default_max_retries() -> usize {
 fn default_log_request_body() -> bool {
     false
 }
+fn default_enable_raw_logging() -> bool {
+    false
+}
 
 #[cfg(test)]
 mod tests {
@@ -185,5 +191,6 @@ mod tests {
         assert_eq!(config.usage_batch_size, 100);
         assert_eq!(config.max_retries, 3);
         assert!(!config.log_request_body);
+        assert!(!config.enable_raw_logging);
     }
 }

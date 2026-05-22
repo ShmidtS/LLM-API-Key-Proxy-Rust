@@ -1,7 +1,7 @@
 use proxy_config::ProxyConfig;
 use rotator::{
-    CircuitBreakerRegistry, CooldownManager, CredentialManager, HttpClientPool, ModelInfoService,
-    ProviderRegistry, RateLimiterRegistry, RotatorClient, UsageManager,
+    CircuitBreakerRegistry, CooldownManager, CredentialManager, EmbeddingBatcher, HttpClientPool,
+    ModelInfoService, ProviderRegistry, RateLimiterRegistry, RotatorClient, UsageManager,
 };
 use std::{
     collections::HashMap,
@@ -15,6 +15,7 @@ type ModelCache = Arc<RwLock<HashMap<String, (Vec<String>, Instant)>>>;
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub rotator: Arc<RotatorClient>,
+    pub batcher: EmbeddingBatcher,
     pub registry: Arc<ProviderRegistry>,
     pub model_cache: ModelCache,
     pub model_info: Arc<RwLock<ModelInfoService>>,
@@ -62,8 +63,11 @@ impl AppState {
             .connect_timeout(Duration::from_secs(1))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        let rotator = Arc::new(client);
+        let batcher = EmbeddingBatcher::new(rotator.clone(), registry.clone());
         Self {
-            rotator: Arc::new(client),
+            rotator,
+            batcher,
             registry,
             model_cache: Arc::new(RwLock::new(HashMap::new())),
             model_info: Arc::new(RwLock::new(ModelInfoService::new())),
@@ -73,8 +77,11 @@ impl AppState {
     }
 
     pub fn with_parts(rotator: RotatorClient, registry: Arc<ProviderRegistry>) -> Self {
+        let rotator = Arc::new(rotator);
+        let batcher = EmbeddingBatcher::new(rotator.clone(), registry.clone());
         Self {
-            rotator: Arc::new(rotator),
+            rotator,
+            batcher,
             registry,
             model_cache: Arc::new(RwLock::new(HashMap::new())),
             model_info: Arc::new(RwLock::new(ModelInfoService::new())),

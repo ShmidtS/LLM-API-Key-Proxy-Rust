@@ -91,11 +91,21 @@ pub fn build_app_with_state(app_state: state::AppState) -> Router {
         .merge(routes::images::router())
         .merge(routes::video::router())
         .merge(routes::responses::router())
-        .merge(routes::moderation::router())
-        .route_layer(from_fn_with_state(
+        .merge(routes::moderation::router());
+
+    let proxy_protected = if config.enable_raw_logging {
+        proxy_protected.route_layer(from_fn_with_state(
             app_state.clone(),
-            middleware::require_proxy_auth,
-        ));
+            middleware::raw_io::raw_io_logger,
+        ))
+    } else {
+        proxy_protected
+    };
+
+    let proxy_protected = proxy_protected.route_layer(from_fn_with_state(
+        app_state.clone(),
+        middleware::require_proxy_auth,
+    ));
 
     let app = Router::new()
         .route(

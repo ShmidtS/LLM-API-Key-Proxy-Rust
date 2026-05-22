@@ -203,7 +203,14 @@ mod tests {
             body: serde_json::Value,
             api_key: &str,
         ) -> Result<reqwest::Response> {
-            send_json_request(client, self.base_url(), path, body, self.auth_headers(api_key)).await
+            send_json_request(
+                client,
+                self.base_url(),
+                path,
+                body,
+                self.auth_headers(api_key),
+            )
+            .await
         }
 
         async fn list_models(

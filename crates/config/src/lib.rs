@@ -60,6 +60,7 @@ pub fn load_from_env() -> Result<proxy::ProxyConfig, ConfigError> {
     apply_env("USAGE_BATCH_SIZE", &mut config.usage_batch_size)?;
     apply_env("MAX_RETRIES", &mut config.max_retries)?;
     apply_env("LOG_REQUEST_BODY", &mut config.log_request_body)?;
+    apply_env("ENABLE_RAW_LOGGING", &mut config.enable_raw_logging)?;
 
     Ok(config)
 }
