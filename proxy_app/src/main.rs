@@ -8,7 +8,14 @@ use std::{
     time::Duration,
 };
 use tokio::time::timeout;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{
+    Layer,
+    filter::{EnvFilter, LevelFilter},
+    fmt::{self, format::FmtSpan},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+};
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -25,12 +32,49 @@ struct Args {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    std::fs::create_dir_all("logs").unwrap_or_else(|err| {
+        eprintln!("failed to create logs directory: {err}");
+        process::exit(1);
+    });
+
+    let info_file_appender = tracing_appender::rolling::never("logs", "proxy.log");
+    let (info_appender, _info_guard): (_, WorkerGuard) =
+        tracing_appender::non_blocking(info_file_appender);
+    let debug_file_appender = tracing_appender::rolling::never("logs", "proxy_debug.log");
+    let (debug_appender, _debug_guard): (_, WorkerGuard) =
+        tracing_appender::non_blocking(debug_file_appender);
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("proxy_app=debug,tower_http=debug")
+            .add_directive(LevelFilter::INFO.into())
+            .add_directive("hyper=warn".parse().unwrap())
+            .add_directive("reqwest=warn".parse().unwrap())
+            .add_directive("tokio_util=warn".parse().unwrap())
+    });
+
     tracing_subscriber::registry()
+        .with(filter)
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "proxy_app=debug,tower_http=debug".into()),
+            fmt::layer()
+                .with_writer(std::io::stdout)
+                .with_ansi(true)
+                .with_span_events(FmtSpan::NONE)
+                .with_filter(LevelFilter::INFO),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(
+            fmt::layer()
+                .with_writer(info_appender)
+                .with_ansi(false)
+                .json()
+                .with_filter(LevelFilter::INFO),
+        )
+        .with(
+            fmt::layer()
+                .with_writer(debug_appender)
+                .with_ansi(false)
+                .json()
+                .with_filter(LevelFilter::DEBUG),
+        )
         .init();
 
     ensure_env_file().unwrap_or_else(|err| {
