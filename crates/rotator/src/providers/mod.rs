@@ -198,12 +198,12 @@ mod tests {
 
         async fn request(
             &self,
-            _client: &reqwest::Client,
-            _path: &str,
-            _body: serde_json::Value,
-            _api_key: &str,
+            client: &reqwest::Client,
+            path: &str,
+            body: serde_json::Value,
+            api_key: &str,
         ) -> Result<reqwest::Response> {
-            unimplemented!()
+            send_json_request(client, self.base_url(), path, body, self.auth_headers(api_key)).await
         }
 
         async fn list_models(
@@ -211,7 +211,7 @@ mod tests {
             _client: &reqwest::Client,
             _api_key: &str,
         ) -> Result<Vec<serde_json::Value>> {
-            unimplemented!()
+            Ok(vec![])
         }
 
         async fn get_models(

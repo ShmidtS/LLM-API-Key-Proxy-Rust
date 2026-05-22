@@ -78,7 +78,11 @@ impl AppState {
             registry,
             model_cache: Arc::new(RwLock::new(HashMap::new())),
             model_info: Arc::new(RwLock::new(ModelInfoService::new())),
-            catalog_client: reqwest::Client::new(),
+            catalog_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .connect_timeout(Duration::from_secs(1))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             config: ProxyConfig::default(),
         }
     }

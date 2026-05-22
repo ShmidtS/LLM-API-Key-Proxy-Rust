@@ -11,15 +11,19 @@ COPY proxy_app/Cargo.toml ./proxy_app/Cargo.toml
 COPY crates/config/Cargo.toml ./crates/config/Cargo.toml
 COPY crates/models/Cargo.toml ./crates/models/Cargo.toml
 COPY crates/rotator/Cargo.toml ./crates/rotator/Cargo.toml
+COPY crates/cli/Cargo.toml ./crates/cli/Cargo.toml
+COPY crates/tui/Cargo.toml ./crates/tui/Cargo.toml
 
-RUN mkdir -p proxy_app/src crates/config/src crates/models/src crates/rotator/src \
+RUN mkdir -p proxy_app/src crates/config/src crates/models/src crates/rotator/src crates/cli/src crates/tui/src \
     && printf 'fn main() {}\n' > proxy_app/src/main.rs \
     && printf 'pub fn build_app() -> axum::Router { axum::Router::new() }\n' > proxy_app/src/lib.rs \
     && printf '' > crates/config/src/lib.rs \
     && printf '' > crates/models/src/lib.rs \
     && printf '' > crates/rotator/src/lib.rs \
+    && printf 'fn main() {}\n' > crates/cli/src/main.rs \
+    && printf 'fn main() {}\n' > crates/tui/src/main.rs \
     && cargo build --release -p proxy_app \
-    && rm -rf proxy_app/src crates/config/src crates/models/src crates/rotator/src
+    && rm -rf proxy_app/src crates/config/src crates/models/src crates/rotator/src crates/cli/src crates/tui/src
 
 COPY proxy_app ./proxy_app
 COPY crates ./crates
