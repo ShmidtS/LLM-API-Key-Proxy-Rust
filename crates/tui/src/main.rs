@@ -335,17 +335,21 @@ impl App {
 
     async fn run_proxy(&mut self) {
         let port = self.config.port.to_string();
+        let mut args = vec![
+            "run".to_owned(),
+            "--bin".to_owned(),
+            "proxy_app".to_owned(),
+            "--".to_owned(),
+            "--host".to_owned(),
+            self.config.host.clone(),
+            "--port".to_owned(),
+            port,
+        ];
+        if self.config.enable_raw_logging {
+            args.push("--enable-raw-logging".to_owned());
+        }
         match Command::new("cargo")
-            .args([
-                "run",
-                "--bin",
-                "proxy_app",
-                "--",
-                "--host",
-                &self.config.host,
-                "--port",
-                &port,
-            ])
+            .args(args)
             .spawn()
         {
             Ok(_) => self.message = Some("Proxy started".to_owned()),

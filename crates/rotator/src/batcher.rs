@@ -9,7 +9,7 @@ use tokio::time::{Duration, Instant, timeout};
 const EMBEDDING_BATCH_SIZE: usize = 64;
 const EMBEDDING_BATCH_TIMEOUT: Duration = Duration::from_millis(100);
 
-type BatchKey = (String, Option<String>, Option<u64>, Option<String>);
+type BatchKey = (String, Option<String>, Option<u64>, Option<String>, Option<String>);
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingBatcher {
@@ -143,8 +143,12 @@ fn batch_key(body: &Value) -> Result<BatchKey> {
         .get("user")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
+    let encoding_format = body
+        .get("encoding_format")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
 
-    Ok((model, input_type, dimensions, user))
+    Ok((model, input_type, dimensions, user, encoding_format))
 }
 
 fn is_list_input(body: &Value) -> bool {

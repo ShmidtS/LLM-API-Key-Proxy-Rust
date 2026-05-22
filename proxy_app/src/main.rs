@@ -139,7 +139,7 @@ fn ensure_env_file() -> io::Result<()> {
     if !Path::new(".env").exists() {
         let proxy_api_key = uuid::Uuid::new_v4().simple().to_string();
         fs::write(".env", format!("PROXY_API_KEY={proxy_api_key}\n"))?;
-        println!("Created .env with PROXY_API_KEY={proxy_api_key}");
+        println!("Created .env with generated PROXY_API_KEY");
     }
     Ok(())
 }

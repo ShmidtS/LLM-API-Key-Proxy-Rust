@@ -120,12 +120,15 @@ struct StreamLogContext {
 fn response_with_logging(response: Response, context: StreamLogContext) -> Response {
     let (parts, body) = response.into_parts();
     let stream = body.into_data_stream();
+    const MAX_ACCUMULATED: usize = 10_000_000;
     let stream = futures::stream::unfold(
         (stream, Vec::new(), Some(context)),
         |(mut stream, mut accumulated, context)| async move {
             match stream.next().await {
                 Some(Ok(bytes)) => {
-                    accumulated.extend_from_slice(&bytes);
+                    if accumulated.len() < MAX_ACCUMULATED {
+                        accumulated.extend_from_slice(&bytes);
+                    }
                     if let Some(context) = &context
                         && context.log_chunks
                     {
