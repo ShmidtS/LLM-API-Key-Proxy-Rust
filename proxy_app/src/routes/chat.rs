@@ -40,7 +40,8 @@ async fn chat_completions(
 
     let provider = resolve_provider_for_model(&state, &req.model);
     let is_anthropic = provider == "anthropic";
-    let is_responses_compat = matches!(provider.as_str(), "elysiver" | "colin");
+    let is_responses_compat = matches!(provider.as_str(), "elysiver" | "colin")
+        || (provider == "openai" && is_openai_responses_model(&req.model));
     let mut body = serde_json::to_value(&req)?;
     normalize_model_in_body(&mut body, &provider);
     let override_temperature_zero = state.config.override_temperature_zero.as_deref();
@@ -52,6 +53,8 @@ async fn chat_completions(
     };
     let upstream_path = if is_anthropic {
         "messages"
+    } else if is_responses_compat {
+        "responses"
     } else {
         "chat/completions"
     };
@@ -495,6 +498,10 @@ async fn request_chat_upstream(
         "upstream chat completion response"
     );
     Ok(response)
+}
+
+fn is_openai_responses_model(model: &str) -> bool {
+    model.starts_with("gpt-5") || model.starts_with("o4")
 }
 
 fn apply_temperature_override(body: &mut Value, override_temperature_zero: Option<&str>) {
