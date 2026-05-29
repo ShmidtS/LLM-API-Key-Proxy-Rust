@@ -2,8 +2,8 @@ use crate::compat::anthropic::{anthropic_to_openai_response, openai_to_anthropic
 use crate::compat::anthropic_streaming::{AnthropicStreamTranslator, ChunkBatcher};
 use crate::errors::AppError;
 use crate::guardrails_adapter::{
-    append_nudge_message, buffered_json_response, build_guardrail_request,
-    decision_to_error_response, should_enable_guardrails,
+    buffered_json_response, build_guardrail_request, decision_to_error_response,
+    should_enable_guardrails,
 };
 use crate::routes::utils::{
     normalize_model_in_body, resolve_provider_for_model, upstream_response,
@@ -207,8 +207,8 @@ async fn chat_completions(
             .await?;
 
         match decision {
-            GuardrailDecision::Accept => {
-                let mut response = buffered_json_response(status, &headers, response_json);
+            GuardrailDecision::Accept { response: accepted, .. } => {
+                let mut response = buffered_json_response(status, &headers, accepted.body);
                 response
                     .headers_mut()
                     .insert("x-input-tokens", input_tokens_header);
@@ -219,8 +219,8 @@ async fn chat_completions(
                 }
                 return Ok(response);
             }
-            GuardrailDecision::CompactAndRetry { compacted_body, .. } => {
-                let mut response = buffered_json_response(status, &headers, compacted_body);
+            GuardrailDecision::Repair { response: repaired, .. } => {
+                let mut response = buffered_json_response(status, &headers, repaired.body);
                 response
                     .headers_mut()
                     .insert("x-input-tokens", input_tokens_header);
@@ -231,7 +231,7 @@ async fn chat_completions(
                 }
                 return Ok(response);
             }
-            GuardrailDecision::RetryWithNudge { nudge_message, .. } => {
+            GuardrailDecision::Retry { request, .. } => {
                 let max_guardrail_retries = adapter
                     .config()
                     .max_guardrail_retries
@@ -242,8 +242,7 @@ async fn chat_completions(
                     }
                     .into());
                 }
-                guardrail_body = preprocessed_body;
-                append_nudge_message(&mut guardrail_body, nudge_message);
+                guardrail_body = request.body;
                 guardrail_attempts += 1;
             }
             decision @ (GuardrailDecision::Reject { .. } | GuardrailDecision::Abort { .. }) => {

@@ -27,6 +27,8 @@ pub mod qwen_code;
 pub mod xai;
 pub mod zai;
 
+// Legacy provider modules are helper implementations only. Runtime parity must be wired through
+// ProviderRegistry/provider_runtime before changing dispatch behavior here.
 pub(crate) fn bearer_auth_headers(api_key: &str) -> Vec<(String, String)> {
     vec![("authorization".to_owned(), format!("Bearer {api_key}"))]
 }

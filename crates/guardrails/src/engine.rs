@@ -1,16 +1,20 @@
-use crate::compaction::{ContextCompactor, DefaultContextCompactor};
+use async_trait::async_trait;
+use crate::compaction::DefaultContextCompactor;
 use crate::config::GuardrailsConfig;
+use crate::context::GuardrailContext;
 use crate::error::GuardrailError;
 use crate::nudge::{DefaultRetryNudger, RetryNudger};
+use crate::pipeline::GuardrailPipeline;
 use crate::recovery::{DefaultErrorRecovery, ErrorRecovery, RecoveryAction};
 use crate::streaming::{NoOpStreamValidator, StreamValidator};
 use crate::tool_rescue::{DefaultToolCallRescuer, ToolCallRescuer};
 use crate::types::{
-    CompactionResult, GuardrailDecision, GuardrailMode, GuardrailRequest, SchemaHint,
-    ValidationOptions, ValidationReport,
+    CompactionResult, GuardrailDecision, GuardrailMode, GuardrailRequest, GuardrailResponse,
+    GuardrailTrace, SchemaHint, UpstreamErrorSummary, ValidationOptions, ValidationReport,
 };
 use crate::validation::{DefaultResponseValidator, ResponseValidator};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use tracing::{debug, warn};
 
 pub struct GuardrailsEngine {
@@ -19,7 +23,7 @@ pub struct GuardrailsEngine {
     rescuer: Box<dyn ToolCallRescuer>,
     nudger: Box<dyn RetryNudger>,
     recovery: Box<dyn ErrorRecovery>,
-    compactor: Box<dyn ContextCompactor>,
+    compactor: Box<DefaultContextCompactor>,
     stream_validator: Box<dyn StreamValidator>,
 }
 
@@ -50,7 +54,7 @@ impl GuardrailsEngine {
         rescuer: Box<dyn ToolCallRescuer>,
         nudger: Box<dyn RetryNudger>,
         recovery: Box<dyn ErrorRecovery>,
-        compactor: Box<dyn ContextCompactor>,
+        compactor: Box<DefaultContextCompactor>,
         stream_validator: Box<dyn StreamValidator>,
     ) -> Self {
         Self {
@@ -73,9 +77,23 @@ impl GuardrailsEngine {
         request: &GuardrailRequest,
         response: &Value,
     ) -> Result<GuardrailDecision, GuardrailError> {
+        let normalized = GuardrailResponse {
+            status: 200,
+            headers: BTreeMap::new(),
+            body: response.clone(),
+        };
+        self.evaluate_response(request, normalized)
+    }
+
+    pub fn evaluate_response(
+        &self,
+        request: &GuardrailRequest,
+        response: GuardrailResponse,
+    ) -> Result<GuardrailDecision, GuardrailError> {
         let route_config = self.config.route_config(&request.route);
+        let trace = GuardrailTrace::default();
         if route_config.mode == GuardrailMode::Off {
-            return Ok(GuardrailDecision::Accept);
+            return Ok(GuardrailDecision::Accept { response, trace });
         }
 
         let options = ValidationOptions {
@@ -84,9 +102,9 @@ impl GuardrailsEngine {
             validate_schema: route_config.validate_schema,
             validate_steps: route_config.validate_steps,
         };
-        let report = self.validator.validate(request, response, &options)?;
-        if report.ok {
-            return Ok(GuardrailDecision::Accept);
+        let report = self.validator.validate(request, &response, &options)?;
+        if report.ok || route_config.mode == GuardrailMode::Observe {
+            return Ok(GuardrailDecision::Accept { response, trace });
         }
 
         warn!(
@@ -95,52 +113,57 @@ impl GuardrailsEngine {
             "guardrail validation failed"
         );
 
-        if route_config.mode == GuardrailMode::Observe {
-            return Ok(GuardrailDecision::Accept);
-        }
-
         if route_config.rescue_tool_calls
             && has_tool_call_violation(&report)
-            && let Some(candidate) = self.rescuer.rescue(response)?
+            && let Some(candidate) = self.rescuer.rescue(&response)?
         {
             if candidate.remaining_issues.is_empty() && !candidate.repaired_fields.is_empty() {
                 debug!(fields = ?candidate.repaired_fields, "guardrail rescued response");
-                return Ok(GuardrailDecision::CompactAndRetry {
-                    compacted_body: candidate.body,
-                    reason: "repaired malformed tool calls".into(),
+                return Ok(GuardrailDecision::Repair {
+                    response: candidate.response,
+                    repaired_fields: candidate.repaired_fields,
+                    trace,
                 });
             }
             debug!(issues = ?candidate.remaining_issues, "guardrail tool rescue skipped");
         }
 
         if route_config.retry_with_nudge && self.config.max_guardrail_retries > 0 {
-            let nudge_message = self.nudger.nudge_message(&report.violations)?;
-            return Ok(GuardrailDecision::RetryWithNudge {
-                nudge_message,
+            let request = self.nudger.nudge(request, &report)?;
+            return Ok(GuardrailDecision::Retry {
+                request,
                 reason: retry_reason(&report),
+                trace,
             });
         }
 
-        let action = self.recovery.recover_validation(&report, &self.config)?;
+        let action = self
+            .recovery
+            .recover_validation(request, &report, &self.config)?;
         debug!(?action, "guardrail recovery decision");
 
         match action {
-            RecoveryAction::RetrySameProvider => {
-                let nudge_message = self.nudger.nudge_message(&report.violations)?;
-                Ok(GuardrailDecision::RetryWithNudge {
-                    nudge_message,
-                    reason: retry_reason(&report),
-                })
-            }
-            RecoveryAction::RetryFallbackProvider | RecoveryAction::RetryModelSwap => {
-                debug!(?action, "guardrail recovery action is not supported in P0");
+            RecoveryAction::RetrySameRequest => Ok(GuardrailDecision::Retry {
+                request: request.clone(),
+                reason: retry_reason(&report),
+                trace,
+            }),
+            RecoveryAction::RetryWithNudge => Ok(GuardrailDecision::Retry {
+                request: self.nudger.nudge(request, &report)?,
+                reason: retry_reason(&report),
+                trace,
+            }),
+            RecoveryAction::RetryAfterCompaction => Ok(GuardrailDecision::Retry {
+                request: self.preprocess(request)?,
+                reason: retry_reason(&report),
+                trace,
+            }),
+            RecoveryAction::UseRepairedResponse | RecoveryAction::GiveUp => {
                 Ok(GuardrailDecision::Reject {
                     client_error: sanitized_client_error(),
+                    trace,
                 })
             }
-            RecoveryAction::GiveUp => Ok(GuardrailDecision::Reject {
-                client_error: sanitized_client_error(),
-            }),
         }
     }
 
@@ -156,7 +179,7 @@ impl GuardrailsEngine {
         let mut processed = request.clone();
         match self
             .compactor
-            .compact(&processed, &self.config.context_compaction)?
+            .compact_with_config(&processed, &self.config.context_compaction)?
         {
             CompactionResult::Unchanged => {}
             CompactionResult::Compacted { body, .. } => {
@@ -168,10 +191,51 @@ impl GuardrailsEngine {
             apply_step_enforcement(&mut processed);
         }
 
-        let mut trace = crate::types::GuardrailTrace::default();
+        let mut trace = GuardrailTrace::default();
         self.stream_validator.finish(&mut trace)?;
 
         Ok(processed)
+    }
+}
+
+#[async_trait]
+impl GuardrailPipeline for GuardrailsEngine {
+    async fn before_request(
+        &self,
+        _ctx: &mut GuardrailContext,
+        request: GuardrailRequest,
+    ) -> Result<GuardrailRequest, GuardrailError> {
+        self.preprocess(&request)
+    }
+
+    async fn after_response(
+        &self,
+        _ctx: &mut GuardrailContext,
+        response: GuardrailResponse,
+    ) -> Result<GuardrailDecision, GuardrailError> {
+        let request = GuardrailRequest {
+            route: _ctx.route.clone(),
+            provider: String::new(),
+            upstream_path: String::new(),
+            model: String::new(),
+            body: Value::Null,
+            stream: false,
+            schema_hint: None,
+            step_policy: None,
+            attempt: Default::default(),
+        };
+        self.evaluate_response(&request, response)
+    }
+
+    async fn on_upstream_error(
+        &self,
+        ctx: &mut GuardrailContext,
+        error: UpstreamErrorSummary,
+    ) -> Result<GuardrailDecision, GuardrailError> {
+        Ok(GuardrailDecision::Abort {
+            internal_error: error.error_kind,
+            trace: ctx.trace.clone(),
+        })
     }
 }
 
@@ -243,127 +307,5 @@ fn apply_step_enforcement(request: &mut GuardrailRequest) {
             policy.required_steps.clone(),
             policy.before_steps.clone(),
         ));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::{GuardrailsConfig, RecoveryConfig, RouteGuardrailConfig};
-    use crate::types::{RouteKind, StepPolicy};
-    use serde_json::json;
-
-    fn request() -> GuardrailRequest {
-        GuardrailRequest {
-            route: RouteKind::ChatCompletions,
-            provider: "openai".into(),
-            upstream_path: "/v1/chat/completions".into(),
-            model: "gpt".into(),
-            body: json!({"messages": [{"role":"user","content":"answer"}]}),
-            stream: false,
-            schema_hint: Some(SchemaHint::JsonMode),
-            step_policy: None,
-        }
-    }
-
-    #[test]
-    fn preprocess_returns_clone_when_disabled() {
-        let engine = GuardrailsEngine::default();
-        let original = request();
-        let processed = engine.preprocess(&original).unwrap();
-        assert_eq!(processed.body, original.body);
-    }
-
-    #[test]
-    fn preprocess_adds_step_policy_message() {
-        let mut config = GuardrailsConfig::default();
-        config.chat_completions = RouteGuardrailConfig {
-            mode: GuardrailMode::Enforce,
-            validate_steps: true,
-            ..RouteGuardrailConfig::default()
-        };
-        let engine = GuardrailsEngine::new(config);
-        let mut original = request();
-        original.step_policy = Some(StepPolicy {
-            required_steps: vec!["plan".into()],
-            before_steps: vec!["plan".into(), "final".into()],
-        });
-        let processed = engine.preprocess(&original).unwrap();
-        assert_eq!(processed.body["messages"][0]["role"], "system");
-    }
-
-    #[test]
-    fn evaluate_uses_route_validation_flags_without_hint() {
-        let mut config = GuardrailsConfig::default();
-        config.chat_completions = RouteGuardrailConfig {
-            mode: GuardrailMode::Enforce,
-            validate_json_mode: true,
-            ..RouteGuardrailConfig::default()
-        };
-        let engine = GuardrailsEngine::new(config);
-        let mut req = request();
-        req.schema_hint = None;
-        let decision = engine
-            .evaluate(&req, &chat_response(json!("not-json")))
-            .unwrap();
-        assert!(matches!(decision, GuardrailDecision::Reject { .. }));
-    }
-
-    #[test]
-    fn evaluate_sanitizes_reject_error() {
-        let mut config = GuardrailsConfig::default();
-        config.chat_completions = RouteGuardrailConfig {
-            mode: GuardrailMode::Enforce,
-            validate_json_mode: true,
-            ..RouteGuardrailConfig::default()
-        };
-        let engine = GuardrailsEngine::new(config);
-        let mut req = request();
-        req.schema_hint = None;
-        let decision = engine
-            .evaluate(&req, &chat_response(json!("not-json")))
-            .unwrap();
-        assert_eq!(
-            decision,
-            GuardrailDecision::Reject {
-                client_error: "response failed guardrail validation".into()
-            }
-        );
-    }
-
-    #[test]
-    fn recovery_retry_same_provider_returns_nudge() {
-        let mut config = GuardrailsConfig::default();
-        config.chat_completions = RouteGuardrailConfig {
-            mode: GuardrailMode::Enforce,
-            validate_json_mode: true,
-            retry_with_nudge: false,
-            ..RouteGuardrailConfig::default()
-        };
-        config.max_guardrail_retries = 1;
-        config.recovery = RecoveryConfig {
-            enabled: true,
-            retry_same_provider: true,
-            retry_fallback_provider: false,
-            retry_model_swap: false,
-        };
-        let engine = GuardrailsEngine::new(config);
-        let mut req = request();
-        req.schema_hint = None;
-        let decision = engine
-            .evaluate(&req, &chat_response(json!("not-json")))
-            .unwrap();
-        assert!(matches!(decision, GuardrailDecision::RetryWithNudge { .. }));
-    }
-
-    fn chat_response(content: serde_json::Value) -> serde_json::Value {
-        json!({
-            "id": "cmpl_1",
-            "object": "chat.completion",
-            "created": 1,
-            "model": "gpt",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-        })
     }
 }

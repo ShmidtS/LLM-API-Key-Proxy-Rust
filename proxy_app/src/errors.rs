@@ -112,10 +112,15 @@ impl IntoResponse for AppError {
                 (StatusCode::BAD_GATEWAY, e.to_string())
             }
         };
+        let error_type = if status == StatusCode::BAD_REQUEST {
+            "invalid_request_error"
+        } else {
+            "api_error"
+        };
         let body = Json(ErrorResponse {
             error: ApiError {
                 message,
-                r#type: Some("api_error".into()),
+                r#type: Some(error_type.into()),
                 param: None,
                 code: Some(status.as_u16().to_string()),
             },

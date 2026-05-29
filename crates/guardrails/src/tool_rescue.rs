@@ -1,20 +1,20 @@
 use crate::error::GuardrailError;
-use crate::types::{RescueCandidate, ValidationIssue};
+use crate::types::{GuardrailResponse, RescueCandidate, ValidationIssue};
 use serde_json::Value;
 
 const MAX_TOOL_CALLS_TO_REPAIR: usize = 16;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
 
 pub trait ToolCallRescuer: Send + Sync {
-    fn rescue(&self, response: &Value) -> Result<Option<RescueCandidate>, GuardrailError>;
+    fn rescue(&self, response: &GuardrailResponse) -> Result<Option<RescueCandidate>, GuardrailError>;
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct DefaultToolCallRescuer;
 
 impl ToolCallRescuer for DefaultToolCallRescuer {
-    fn rescue(&self, response: &Value) -> Result<Option<RescueCandidate>, GuardrailError> {
-        let mut body = response.clone();
+    fn rescue(&self, response: &GuardrailResponse) -> Result<Option<RescueCandidate>, GuardrailError> {
+        let mut body = response.body.clone();
         let mut repaired_fields = Vec::new();
         let mut remaining_issues = Vec::new();
 
@@ -97,7 +97,11 @@ impl ToolCallRescuer for DefaultToolCallRescuer {
             Ok(None)
         } else {
             Ok(Some(RescueCandidate {
-                body,
+                response: GuardrailResponse {
+                    status: response.status,
+                    headers: response.headers.clone(),
+                    body,
+                },
                 repaired_fields,
                 remaining_issues,
             }))
@@ -268,17 +272,21 @@ mod tests {
 
     #[test]
     fn rescues_response_tool_arguments() {
-        let response = json!({
-            "choices": [{
-                "message": {
-                    "tool_calls": [{
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {"name": "lookup", "arguments": "{foo: 'bar',}"}
-                    }]
-                }
-            }]
-        });
+        let response = GuardrailResponse {
+            status: 200,
+            headers: Default::default(),
+            body: json!({
+                "choices": [{
+                    "message": {
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{foo: 'bar',}"}
+                        }]
+                    }
+                }]
+            }),
+        };
         let candidate = DefaultToolCallRescuer.rescue(&response).unwrap().unwrap();
         assert_eq!(candidate.repaired_fields.len(), 1);
         assert!(candidate.remaining_issues.is_empty());
@@ -295,7 +303,11 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let response = json!({"choices": [{"message": {"tool_calls": tool_calls}}]});
+        let response = GuardrailResponse {
+            status: 200,
+            headers: Default::default(),
+            body: json!({"choices": [{"message": {"tool_calls": tool_calls}}]}),
+        };
         let candidate = DefaultToolCallRescuer.rescue(&response).unwrap().unwrap();
         assert_eq!(candidate.repaired_fields.len(), 16);
         assert_eq!(candidate.remaining_issues.len(), 1);
@@ -303,13 +315,17 @@ mod tests {
 
     #[test]
     fn skips_repair_when_arguments_too_large() {
-        let response = json!({
-            "choices": [{"message": {"tool_calls": [{
-                "id": "call_1",
-                "type": "function",
-                "function": {"name": "lookup", "arguments": "x".repeat(MAX_TOOL_ARGUMENT_BYTES + 1)}
-            }]}}]
-        });
+        let response = GuardrailResponse {
+            status: 200,
+            headers: Default::default(),
+            body: json!({
+                "choices": [{"message": {"tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "x".repeat(MAX_TOOL_ARGUMENT_BYTES + 1)}
+                }]}}]
+            }),
+        };
         let candidate = DefaultToolCallRescuer.rescue(&response).unwrap().unwrap();
         assert!(candidate.repaired_fields.is_empty());
         assert_eq!(candidate.remaining_issues.len(), 1);

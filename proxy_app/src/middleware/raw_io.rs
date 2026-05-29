@@ -53,8 +53,7 @@ pub async fn raw_io_logger(
         .map(ToOwned::to_owned);
     let provider = model
         .as_deref()
-        .and_then(|model| app_state.registry.resolve_provider_by_model(model))
-        .map(ToOwned::to_owned);
+        .and_then(|model| app_state.registry.resolve_provider_by_model(model));
 
     spawn_write_json(
         log_dir.clone(),

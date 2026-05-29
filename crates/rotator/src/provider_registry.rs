@@ -1,4 +1,7 @@
+use crate::dynamic_provider::{dynamic_provider_id, parse_models_csv};
 use crate::model_filter::ModelFilterEngine;
+use crate::provider_normalization::normalize_provider_id;
+use crate::provider_runtime::{RuntimeProviderKind, RuntimeProviderRoute};
 use dashmap::DashMap;
 use regex::Regex;
 use serde_json::Value;
@@ -54,16 +57,35 @@ impl ProviderRegistry {
         registry
     }
 
-    pub fn register(&self, def: ProviderDefinition) {
+    pub fn register(&self, mut def: ProviderDefinition) {
+        def.id = normalize_provider_id(&def.id);
         self.providers.insert(def.id.clone(), def);
     }
 
     pub fn get(&self, id: &str) -> Option<ProviderDefinition> {
-        self.providers.get(id).map(|entry| entry.value().clone())
+        let id = normalize_provider_id(id);
+        self.providers.get(&id).map(|entry| entry.value().clone())
     }
 
     pub fn resolve_base_url(&self, id: &str) -> Option<String> {
         self.get(id).map(|def| def.base_url)
+    }
+
+    pub fn resolve_runtime_route(
+        &self,
+        provider_id: &str,
+        action: &str,
+    ) -> Option<RuntimeProviderRoute> {
+        let provider_id = normalize_provider_id(provider_id);
+        let definition = self.get(&provider_id)?;
+        let action = self.resolve_action(&provider_id, action);
+
+        Some(RuntimeProviderRoute {
+            provider_id,
+            kind: RuntimeProviderKind::Registry,
+            base_url: definition.base_url,
+            action,
+        })
     }
 
     /// Load provider definitions from environment variables.
@@ -94,7 +116,7 @@ impl ProviderRegistry {
         provider_keys.dedup();
 
         for provider_key in provider_keys {
-            let id = provider_key.to_ascii_lowercase();
+            let id = dynamic_provider_id(&provider_key);
             let Some(base_url) = std::env::var(format!("PROXY_{provider_key}_URL"))
                 .ok()
                 .or_else(|| std::env::var(format!("{provider_key}_API_BASE")).ok())
@@ -109,14 +131,7 @@ impl ProviderRegistry {
                 .unwrap_or(AuthType::Bearer);
             let model_patterns = std::env::var(format!("PROXY_{provider_key}_MODELS"))
                 .ok()
-                .map(|models| {
-                    models
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|model| !model.is_empty())
-                        .map(ToOwned::to_owned)
-                        .collect()
-                })
+                .map(|models| parse_models_csv(&models))
                 .or_else(|| self.get(&id).map(|def| def.model_patterns))
                 .unwrap_or_default();
             let display_name = std::env::var(format!("PROXY_{provider_key}_DISPLAY_NAME"))
@@ -127,12 +142,12 @@ impl ProviderRegistry {
                 .ok()
                 .map(|endpoints| parse_csv_list(&endpoints))
                 .or_else(|| self.get(&id).map(|def| def.endpoints))
-                .unwrap_or_default();
+                .unwrap_or_else(|| provider_endpoints(&id));
             let features = std::env::var(format!("PROXY_{provider_key}_FEATURES"))
                 .ok()
                 .map(|features| parse_csv_list(&features))
                 .or_else(|| self.get(&id).map(|def| def.features))
-                .unwrap_or_default();
+                .unwrap_or_else(|| provider_features(&id));
             let model_count = std::env::var(format!("PROXY_{provider_key}_MODEL_COUNT"))
                 .ok()
                 .and_then(|count| count.parse().ok())
@@ -208,13 +223,14 @@ impl ProviderRegistry {
     }
 
     pub fn resolve_endpoint_path(&self, provider: &str, path: &str, body: &Value) -> String {
-        if matches!(provider, "elysiver" | "colin")
+        let provider = normalize_provider_id(provider);
+        if matches!(provider.as_str(), "elysiver" | "colin")
             && path.trim_start_matches('/') == "chat/completions"
         {
             return "responses".to_owned();
         }
 
-        match (provider, provider_action(path)) {
+        match (provider.as_str(), provider_action(path)) {
             ("gemini", Some(ProviderAction::Chat)) => body
                 .get("model")
                 .and_then(Value::as_str)
@@ -225,8 +241,16 @@ impl ProviderRegistry {
                 .and_then(Value::as_str)
                 .map(|model| format!("{model}:embedContent"))
                 .unwrap_or_else(|| path.trim_start_matches('/').to_owned()),
-            _ => path.trim_start_matches('/').to_owned(),
+            _ => self.resolve_action(&provider, path),
         }
+    }
+
+    fn resolve_action(&self, provider: &str, action: &str) -> String {
+        let action = action.trim_start_matches('/');
+        if matches!(provider, "elysiver" | "colin") && action == "chat/completions" {
+            return "responses".to_owned();
+        }
+        action.to_owned()
     }
 
     pub fn get_provider_catalog(&self) -> Vec<ProviderDefinition> {
@@ -234,6 +258,13 @@ impl ProviderRegistry {
     }
 
     pub fn find_provider_for_model(&self, model: &str) -> Option<String> {
+        if let Some((provider, _)) = model.split_once('/') {
+            let provider = normalize_provider_id(provider);
+            if self.get(&provider).is_some() {
+                return Some(provider);
+            }
+        }
+
         static_provider_for_model(model)
             .map(ToOwned::to_owned)
             .or_else(|| {
@@ -248,17 +279,36 @@ impl ProviderRegistry {
             })
     }
 
-    pub fn resolve_provider_by_model(&self, model: &str) -> Option<&str> {
+    pub fn resolve_provider_by_model(&self, model: &str) -> Option<String> {
+        if let Some((provider, _)) = model.split_once('/') {
+            let provider = normalize_provider_id(provider);
+            if self.get(&provider).is_some() {
+                return Some(provider);
+            }
+        }
+
         self.provider_models
             .iter()
             .find_map(|(provider, models)| {
                 models
                     .iter()
                     .any(|name| name == model)
-                    .then_some(provider.as_str())
+                    .then_some(normalize_provider_id(provider))
             })
-            .or_else(|| static_provider_for_model(model))
-            .or_else(|| prefix_provider_for_model(model))
+            .or_else(|| {
+                self.all_providers().into_iter().find_map(|provider| {
+                    let provider_key = provider_env_key(&provider.id);
+                    let env_name = format!("{provider_key}_MODELS");
+                    std::env::var(env_name).ok().and_then(|models| {
+                        parse_models_csv(&models)
+                            .into_iter()
+                            .any(|name| name == model)
+                            .then_some(provider.id)
+                    })
+                })
+            })
+            .or_else(|| static_provider_for_model(model).map(ToOwned::to_owned))
+            .or_else(|| prefix_provider_for_model(model).map(ToOwned::to_owned))
     }
 
     pub fn is_model_allowed(&self, model: &str) -> bool {
@@ -797,7 +847,7 @@ mod tests {
         );
         assert_eq!(
             registry.resolve_provider_by_model("gpt-5.5"),
-            Some("elysiver")
+            Some("elysiver".to_owned())
         );
     }
 
@@ -807,9 +857,12 @@ mod tests {
 
         assert_eq!(
             registry.resolve_provider_by_model("gpt-5.3-codex"),
-            Some("colin")
+            Some("colin".to_owned())
         );
-        assert_eq!(registry.resolve_provider_by_model("gpt-5.4"), Some("colin"));
+        assert_eq!(
+            registry.resolve_provider_by_model("gpt-5.4"),
+            Some("colin".to_owned())
+        );
     }
 
     #[test]
@@ -873,15 +926,15 @@ mod tests {
 
         assert_eq!(
             registry.resolve_provider_by_model("gpt-4o-mini"),
-            Some("custom")
+            Some("custom".to_owned())
         );
         assert_eq!(
             registry.resolve_provider_by_model("claude-3-5-sonnet-20241022"),
-            Some("anthropic")
+            Some("anthropic".to_owned())
         );
         assert_eq!(
             registry.resolve_provider_by_model("text-embedding-3-small"),
-            Some("openai")
+            Some("openai".to_owned())
         );
         assert_eq!(registry.resolve_provider_by_model("unknown-model"), None);
 

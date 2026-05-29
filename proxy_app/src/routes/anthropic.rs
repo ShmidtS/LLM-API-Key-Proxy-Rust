@@ -159,7 +159,6 @@ fn resolve_anthropic_provider_for_body(state: &AppState, body: &Value) -> String
             state
                 .registry
                 .resolve_provider_by_model(model)
-                .map(ToOwned::to_owned)
                 .or_else(|| state.registry.find_provider_for_model(model))
         })
         .unwrap_or_else(|| "anthropic".to_owned())

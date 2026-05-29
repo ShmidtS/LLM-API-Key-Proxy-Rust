@@ -907,6 +907,7 @@ dependencies = [
 name = "guardrails"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "models",
  "serde",
  "serde_json",

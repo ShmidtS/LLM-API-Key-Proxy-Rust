@@ -107,7 +107,6 @@ async fn process_group(
     };
     let provider = registry
         .resolve_provider_by_model(&key.0)
-        .map(ToOwned::to_owned)
         .or_else(|| registry.find_provider_for_model(&key.0))
         .unwrap_or_else(|| "openai".to_owned());
     let list_input = is_list_input(&group[0].body);

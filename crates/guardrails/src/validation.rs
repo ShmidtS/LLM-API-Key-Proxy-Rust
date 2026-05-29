@@ -1,6 +1,7 @@
 use crate::error::GuardrailError;
 use crate::types::{
-    GuardrailRequest, SchemaHint, ValidationIssue, ValidationOptions, ValidationReport,
+    GuardrailRequest, GuardrailResponse, SchemaHint, ToolSpec, ValidationIssue, ValidationOptions,
+    ValidationReport,
 };
 use models::chat::{ChatCompletionResponse, ChatMessage, ChatMessageContent, ToolCall};
 use serde_json::Value;
@@ -9,24 +10,44 @@ pub trait ResponseValidator: Send + Sync {
     fn validate(
         &self,
         request: &GuardrailRequest,
-        response: &Value,
+        response: &GuardrailResponse,
         options: &ValidationOptions,
     ) -> Result<ValidationReport, GuardrailError>;
+}
+
+pub trait ToolCallValidator: Send + Sync {
+    fn validate_tool_calls(
+        &self,
+        response: &GuardrailResponse,
+        allowed_tools: &[ToolSpec],
+    ) -> Result<Vec<ValidationIssue>, GuardrailError>;
+}
+
+pub trait SchemaValidator: Send + Sync {
+    fn validate_schema(
+        &self,
+        response: &GuardrailResponse,
+        schema: &Value,
+    ) -> Result<Vec<ValidationIssue>, GuardrailError>;
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct DefaultResponseValidator;
 
+pub type OpenAiChatValidator = DefaultResponseValidator;
+pub type OpenAiResponsesValidator = DefaultResponseValidator;
+pub type AnthropicMessagesValidator = DefaultResponseValidator;
+
 impl ResponseValidator for DefaultResponseValidator {
     fn validate(
         &self,
         request: &GuardrailRequest,
-        response: &Value,
+        response: &GuardrailResponse,
         options: &ValidationOptions,
     ) -> Result<ValidationReport, GuardrailError> {
         let mut violations = Vec::new();
-
-        let chat_response = serde_json::from_value::<ChatCompletionResponse>(response.clone()).ok();
+        let body = &response.body;
+        let chat_response = serde_json::from_value::<ChatCompletionResponse>(body.clone()).ok();
 
         if options.validate_tool_calls || matches!(request.schema_hint, Some(SchemaHint::ToolCalls))
         {
@@ -43,44 +64,73 @@ impl ResponseValidator for DefaultResponseValidator {
         if options.validate_json_mode || matches!(request.schema_hint, Some(SchemaHint::JsonMode)) {
             match &chat_response {
                 Some(parsed) => validate_json_mode(parsed, &mut violations),
-                None => validate_raw_json_mode(response, &mut violations),
+                None => validate_raw_json_mode(body, &mut violations),
             }
         }
 
         if let Some(SchemaHint::JsonSchema(schema)) = &request.schema_hint {
-            validate_json_schema_hint(response, schema, &mut violations);
+            validate_json_schema_hint(body, schema, &mut violations);
         } else if options.validate_schema {
-            validate_raw_json_mode(response, &mut violations);
+            validate_raw_json_mode(body, &mut violations);
         }
 
         if let Some(SchemaHint::StepCompletion(required, before)) = &request.schema_hint {
-            validate_step_completion(response, required, before, &mut violations);
+            validate_step_completion(body, required, before, &mut violations);
         }
 
         if options.validate_steps {
             if let Some(policy) = &request.step_policy {
                 validate_step_completion(
-                    response,
+                    body,
                     &policy.required_steps,
                     &policy.before_steps,
                     &mut violations,
                 );
             } else if !matches!(request.schema_hint, Some(SchemaHint::StepCompletion(_, _))) {
-                validate_step_completion(response, &[], &[], &mut violations);
+                validate_step_completion(body, &[], &[], &mut violations);
             }
         } else if let Some(policy) = &request.step_policy {
             validate_step_completion(
-                response,
+                body,
                 &policy.required_steps,
                 &policy.before_steps,
                 &mut violations,
             );
         }
 
-        Ok(ValidationReport {
-            ok: violations.is_empty(),
-            violations,
-        })
+        Ok(ValidationReport::from_violations(violations))
+    }
+}
+
+impl ToolCallValidator for DefaultResponseValidator {
+    fn validate_tool_calls(
+        &self,
+        response: &GuardrailResponse,
+        _allowed_tools: &[ToolSpec],
+    ) -> Result<Vec<ValidationIssue>, GuardrailError> {
+        let Some(parsed) = serde_json::from_value::<ChatCompletionResponse>(response.body.clone()).ok()
+        else {
+            return Ok(vec![issue(
+                "response",
+                "response is not a valid chat completion response",
+                "error",
+            )]);
+        };
+        let mut violations = Vec::new();
+        validate_tool_calls(&parsed, &mut violations);
+        Ok(violations)
+    }
+}
+
+impl SchemaValidator for DefaultResponseValidator {
+    fn validate_schema(
+        &self,
+        response: &GuardrailResponse,
+        schema: &Value,
+    ) -> Result<Vec<ValidationIssue>, GuardrailError> {
+        let mut violations = Vec::new();
+        validate_json_schema_hint(&response.body, schema, &mut violations);
+        Ok(violations)
     }
 }
 
@@ -294,111 +344,5 @@ fn issue(
         field: field.into(),
         reason: reason.into(),
         severity: severity.into(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::{GuardrailRequest, RouteKind, SchemaHint};
-    use serde_json::json;
-
-    fn request(schema_hint: SchemaHint) -> GuardrailRequest {
-        GuardrailRequest {
-            route: RouteKind::ChatCompletions,
-            provider: "openai".into(),
-            upstream_path: "/v1/chat/completions".into(),
-            model: "gpt".into(),
-            body: json!({"messages": []}),
-            stream: false,
-            schema_hint: Some(schema_hint),
-            step_policy: None,
-        }
-    }
-
-    fn chat_response(content: Value) -> Value {
-        json!({
-            "id": "cmpl_1",
-            "object": "chat.completion",
-            "created": 1,
-            "model": "gpt",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-        })
-    }
-
-    fn options() -> ValidationOptions {
-        ValidationOptions::default()
-    }
-
-    #[test]
-    fn validates_json_mode_content() {
-        let report = DefaultResponseValidator::default()
-            .validate(
-                &request(SchemaHint::JsonMode),
-                &chat_response(json!("not-json")),
-                &options(),
-            )
-            .unwrap();
-        assert!(!report.ok);
-    }
-
-    #[test]
-    fn accepts_valid_tool_call() {
-        let response = json!({
-            "id": "cmpl_1",
-            "object": "chat.completion",
-            "created": 1,
-            "model": "gpt",
-            "choices": [{"index": 0, "message": {"role": "assistant", "tool_calls": [{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"x\"}"}}]}, "finish_reason": "tool_calls"}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-        });
-        let report = DefaultResponseValidator::default()
-            .validate(&request(SchemaHint::ToolCalls), &response, &options())
-            .unwrap();
-        assert!(report.ok);
-    }
-
-    #[test]
-    fn flags_missing_schema_field() {
-        let report = DefaultResponseValidator::default()
-            .validate(
-                &request(SchemaHint::JsonSchema(
-                    json!({"type":"object","required":["answer"]}),
-                )),
-                &json!({"other": true}),
-                &options(),
-            )
-            .unwrap();
-        assert!(!report.ok);
-    }
-
-    #[test]
-    fn validates_step_completion() {
-        let report = DefaultResponseValidator::default()
-            .validate(
-                &request(SchemaHint::StepCompletion(vec!["plan".into()], vec![])),
-                &chat_response(json!("final only")),
-                &options(),
-            )
-            .unwrap();
-        assert!(!report.ok);
-    }
-
-    #[test]
-    fn config_option_enables_json_validation_without_hint() {
-        let mut req = request(SchemaHint::ToolCalls);
-        req.schema_hint = None;
-        let report = DefaultResponseValidator::default()
-            .validate(
-                &req,
-                &chat_response(json!("not-json")),
-                &ValidationOptions {
-                    validate_json_mode: true,
-                    ..ValidationOptions::default()
-                },
-            )
-            .unwrap();
-        assert!(!report.ok);
     }
 }

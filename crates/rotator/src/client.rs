@@ -4,10 +4,12 @@ use crate::credentials::{CredentialManager, CredentialPermit};
 use crate::error::{Result, RotatorError};
 use crate::http_pool::HttpClientPool;
 use crate::provider_registry::{AuthType, ProviderRegistry};
+use crate::provider_runtime::normalize_upstream_url;
 use crate::provider_utils::extract_usage;
 use crate::providers::oauth::{OAuthManager, OAuthToken, refresh_oauth_token};
 use crate::providers::transform_request_for_provider;
 use crate::rate_limiter::RateLimiterRegistry;
+use crate::request_sanitizer::{SanitizerContext, sanitize_request};
 use crate::retry_policy::{
     FailureClass, RetryDecision, classify_upstream_failure, decide_retry, get_retry_backoff,
 };
@@ -23,28 +25,6 @@ fn oauth_cache_key(provider: &str, key: &str) -> String {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     format!("{}:{}", provider, hasher.finish())
-}
-
-pub fn normalize_upstream_url(base_url: &str, action: &str) -> String {
-    let base_url = base_url.trim_end_matches('/');
-    let action = action.trim_start_matches('/');
-
-    if base_url.ends_with("/v1")
-        || base_url.ends_with("/v1/openai")
-        || base_url.contains(action)
-        || action.contains(':')
-    {
-        return format!("{base_url}/{action}");
-    }
-
-    if let Ok(url) = reqwest::Url::parse(base_url) {
-        let path = url.path();
-        if path.len() > 1 {
-            return format!("{base_url}/{action}");
-        }
-    }
-
-    format!("{base_url}/v1/{action}")
 }
 
 #[derive(Debug, Clone)]
@@ -99,7 +79,7 @@ impl RotatorClient {
         path: &str,
         mut body: serde_json::Value,
     ) -> Result<reqwest::Response> {
-        Self::transform_request(provider, &mut body);
+        Self::transform_request(provider, path, &mut body);
 
         for attempt in 0..=self.max_retries {
             if !self.circuit_breakers.is_allowed(provider) {
@@ -130,10 +110,21 @@ impl RotatorClient {
             } else {
                 self.http_pool.get_or_create(provider)
             };
-            let upstream_path = self
+            let route = self
                 .provider_registry
-                .resolve_endpoint_path(provider, path, &body);
-            let url = normalize_upstream_url(&self.resolve_base_url(provider), &upstream_path);
+                .resolve_runtime_route(provider, path)
+                .unwrap_or_else(|| crate::provider_runtime::RuntimeProviderRoute {
+                    provider_id: provider.to_owned(),
+                    kind: crate::provider_runtime::RuntimeProviderKind::LegacyModule,
+                    base_url: self.resolve_base_url(provider),
+                    action: path.trim_start_matches('/').to_owned(),
+                });
+            let upstream_path = self.provider_registry.resolve_endpoint_path(
+                &route.provider_id,
+                &route.action,
+                &body,
+            );
+            let url = normalize_upstream_url(&route.base_url, &upstream_path);
             let token = self.resolve_auth_token(provider, permit.key()).await?;
             let request = self.apply_auth_headers(provider, client.post(&url), &token);
             let started_at = Instant::now();
@@ -601,7 +592,20 @@ impl RotatorClient {
         result.map_err(|e| RotatorError::Http(e.to_string()))
     }
 
-    pub fn transform_request(provider: &str, body: &mut serde_json::Value) {
+    pub fn transform_request(provider: &str, path: &str, body: &mut serde_json::Value) {
+        let model = body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        sanitize_request(
+            &SanitizerContext {
+                provider_id: provider.to_owned(),
+                model,
+                endpoint: path.trim_start_matches('/').to_owned(),
+            },
+            body,
+        );
         transform_request_for_provider(provider, body);
     }
 
@@ -1180,7 +1184,7 @@ mod tests {
             "stream_options": {"include_usage": true}
         });
 
-        RotatorClient::transform_request("anthropic", &mut body);
+        RotatorClient::transform_request("anthropic", "messages", &mut body);
 
         assert!(body.get("stream_options").is_none());
         assert_eq!(body["messages"][0]["content"], "hello");
@@ -1189,10 +1193,10 @@ mod tests {
     #[test]
     fn gemini_transform_prefixes_model_name_once() {
         let mut body = serde_json::json!({"model": "gemini-2.5-flash"});
-        RotatorClient::transform_request("gemini", &mut body);
+        RotatorClient::transform_request("gemini", "chat/completions", &mut body);
         assert_eq!(body["model"], "models/gemini-2.5-flash");
 
-        RotatorClient::transform_request("gemini", &mut body);
+        RotatorClient::transform_request("gemini", "chat/completions", &mut body);
         assert_eq!(body["model"], "models/gemini-2.5-flash");
     }
 
@@ -1213,7 +1217,7 @@ mod tests {
             }]
         });
 
-        RotatorClient::transform_request("nvidia", &mut body);
+        RotatorClient::transform_request("nvidia", "chat/completions", &mut body);
 
         assert!(body.get("thinking").is_none());
         assert!(body.get("cache_control").is_none());
@@ -1239,7 +1243,7 @@ mod tests {
         });
         let original = body.clone();
 
-        RotatorClient::transform_request("unknown", &mut body);
+        RotatorClient::transform_request("unknown", "chat/completions", &mut body);
 
         assert_eq!(body, original);
     }

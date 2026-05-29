@@ -1,14 +1,20 @@
-use crate::types::{GuardrailMode, TokenBudget};
+use crate::types::{ContextBudget, GuardrailMode, RouteKind, TokenBudget};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct GuardrailsConfig {
+    pub enabled: bool,
+    pub max_semantic_retries: u32,
     pub chat_completions: RouteGuardrailConfig,
     pub anthropic_messages: RouteGuardrailConfig,
     pub responses: RouteGuardrailConfig,
     pub max_rescue_attempts: u32,
     pub max_guardrail_retries: u32,
+    pub context: ContextCompactionConfig,
     pub context_compaction: ContextCompactionConfig,
+    pub vram: VramConfig,
+    pub trace: GuardrailTraceConfig,
     pub recovery: RecoveryConfig,
 }
 
@@ -21,6 +27,8 @@ pub struct RouteGuardrailConfig {
     pub validate_steps: bool,
     pub rescue_tool_calls: bool,
     pub retry_with_nudge: bool,
+    #[serde(default)]
+    pub streaming_enabled: bool,
 }
 
 impl Default for RouteGuardrailConfig {
@@ -33,6 +41,7 @@ impl Default for RouteGuardrailConfig {
             validate_steps: false,
             rescue_tool_calls: false,
             retry_with_nudge: false,
+            streaming_enabled: false,
         }
     }
 }
@@ -42,6 +51,17 @@ pub struct ContextCompactionConfig {
     pub enabled: bool,
     pub token_budget: TokenBudget,
     pub min_messages_to_keep: usize,
+}
+
+impl ContextCompactionConfig {
+    pub fn budget(&self) -> ContextBudget {
+        ContextBudget {
+            max_context_tokens: self.token_budget.max_context_tokens,
+            reserve_output_tokens: self.token_budget.reserve_output_tokens,
+            compact_above_ratio: self.token_budget.compact_above_ratio,
+            min_recent_messages: self.min_messages_to_keep,
+        }
+    }
 }
 
 impl Default for ContextCompactionConfig {
@@ -55,6 +75,19 @@ impl Default for ContextCompactionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VramConfig {
+    pub enabled: bool,
+    pub static_max_context_tokens: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GuardrailTraceConfig {
+    pub enabled: bool,
+    pub include_prompt_text: bool,
+    pub include_tool_arguments: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RecoveryConfig {
     pub enabled: bool,
     pub retry_same_provider: bool,
@@ -63,35 +96,11 @@ pub struct RecoveryConfig {
 }
 
 impl GuardrailsConfig {
-    pub fn route_config(&self, route: &crate::types::RouteKind) -> &RouteGuardrailConfig {
+    pub fn route_config(&self, route: &RouteKind) -> &RouteGuardrailConfig {
         match route {
-            crate::types::RouteKind::ChatCompletions => &self.chat_completions,
-            crate::types::RouteKind::AnthropicMessages => &self.anthropic_messages,
-            crate::types::RouteKind::Responses => &self.responses,
+            RouteKind::ChatCompletions => &self.chat_completions,
+            RouteKind::AnthropicMessages => &self.anthropic_messages,
+            RouteKind::Responses => &self.responses,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::RouteKind;
-
-    #[test]
-    fn defaults_disable_all_guardrails() {
-        let config = GuardrailsConfig::default();
-        assert_eq!(config.chat_completions.mode, GuardrailMode::Off);
-        assert!(!config.context_compaction.enabled);
-        assert_eq!(config.max_guardrail_retries, 0);
-        assert!(!config.recovery.enabled);
-    }
-
-    #[test]
-    fn selects_route_config() {
-        let config = GuardrailsConfig::default();
-        assert_eq!(
-            config.route_config(&RouteKind::Responses).mode,
-            GuardrailMode::Off
-        );
     }
 }

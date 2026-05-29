@@ -103,6 +103,7 @@ pub fn build_guardrail_request(
         stream,
         schema_hint: None,
         step_policy: None,
+        attempt: guardrails::GuardrailAttempt::default(),
     }
 }
 
@@ -153,14 +154,14 @@ fn validate_adapter_target(provider: &str, path: &str) -> Result<(), GuardrailEr
 
 pub fn decision_to_error_response(decision: &GuardrailDecision) -> Option<Response> {
     match decision {
-        GuardrailDecision::Reject { client_error } => {
+        GuardrailDecision::Reject { client_error, .. } => {
             tracing::warn!(reason = %client_error, "guardrail rejected response");
             Some(
                 crate::errors::invalid_request_error("Response failed guardrail validation")
                     .into_response(),
             )
         }
-        GuardrailDecision::Abort { internal_error } => {
+        GuardrailDecision::Abort { internal_error, .. } => {
             tracing::error!(reason = %internal_error, "guardrail aborted response processing");
             Some(crate::errors::api_error("Guardrail processing failed").into_response())
         }
@@ -190,27 +191,34 @@ pub fn buffered_bytes_response(response: BufferedUpstreamResponse) -> Response {
 }
 
 pub fn guardrails_config_from_proxy(config: &GuardrailsProxyConfig) -> GuardrailsConfig {
+    let context_compaction = ContextCompactionConfig {
+        enabled: config.chat.compact_context
+            || config.anthropic.compact_context
+            || config.responses.compact_context,
+        token_budget: TokenBudget {
+            max_context_tokens: config.context_compaction.max_context_messages,
+            compact_above_ratio: config.context_compaction.compact_above_ratio as f32,
+            ..TokenBudget::default()
+        },
+        ..ContextCompactionConfig::default()
+    };
     GuardrailsConfig {
+        enabled: config.enabled,
+        max_semantic_retries: config.max_guardrail_retries.min(1) as u32,
         chat_completions: route_config_from_proxy(&config.chat, config),
         anthropic_messages: route_config_from_proxy(&config.anthropic, config),
         responses: route_config_from_proxy(&config.responses, config),
         max_rescue_attempts: config.max_rescue_attempts as u32,
         max_guardrail_retries: config.max_guardrail_retries.min(1) as u32,
-        context_compaction: ContextCompactionConfig {
-            enabled: config.chat.compact_context
-                || config.anthropic.compact_context
-                || config.responses.compact_context,
-            token_budget: TokenBudget {
-                max_context_tokens: config.context_compaction.max_context_messages,
-                compact_above_ratio: config.context_compaction.compact_above_ratio as f32,
-                ..TokenBudget::default()
-            },
-            ..ContextCompactionConfig::default()
-        },
+        context: context_compaction.clone(),
+        context_compaction,
+        vram: guardrails::VramConfig::default(),
+        trace: guardrails::GuardrailTraceConfig::default(),
         recovery: RecoveryConfig {
             enabled: config.chat.recover_errors
                 || config.anthropic.recover_errors
                 || config.responses.recover_errors,
+            retry_same_provider: true,
             ..RecoveryConfig::default()
         },
     }
@@ -228,6 +236,7 @@ fn route_config_from_proxy(
         validate_steps: route.enforce_steps,
         rescue_tool_calls: route.recover_errors,
         retry_with_nudge: route.recover_errors,
+        streaming_enabled: false,
     }
 }
 

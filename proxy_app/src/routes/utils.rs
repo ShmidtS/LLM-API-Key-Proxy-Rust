@@ -49,14 +49,12 @@ pub fn resolve_provider_for_model(state: &AppState, model: &str) -> String {
     state
         .registry
         .resolve_provider_by_model(model)
-        .map(ToOwned::to_owned)
         .or_else(|| state.registry.find_provider_for_model(model))
         .unwrap_or_else(|| "openai".to_owned())
 }
 
 pub fn strip_provider_prefix(model: &str, provider: &str) -> String {
-    let prefix = format!("{provider}/");
-    model.strip_prefix(&prefix).unwrap_or(model).to_owned()
+    rotator::strip_provider_prefix(model, provider)
 }
 
 pub fn normalize_model_in_body(body: &mut Value, provider: &str) {

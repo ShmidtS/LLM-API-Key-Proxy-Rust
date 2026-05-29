@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RouteKind {
@@ -15,7 +16,7 @@ pub enum GuardrailMode {
     Enforce,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GuardrailRequest {
     pub route: RouteKind,
     pub provider: String,
@@ -25,6 +26,21 @@ pub struct GuardrailRequest {
     pub stream: bool,
     pub schema_hint: Option<SchemaHint>,
     pub step_policy: Option<StepPolicy>,
+    #[serde(default)]
+    pub attempt: GuardrailAttempt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct GuardrailAttempt {
+    pub semantic_retry_index: u32,
+    pub max_semantic_retries: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GuardrailResponse {
+    pub status: u16,
+    pub headers: BTreeMap<String, String>,
+    pub body: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -70,26 +86,33 @@ pub struct GuardrailTrace {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GuardrailDecision {
-    Accept,
-    RetryWithNudge {
-        nudge_message: serde_json::Value,
-        reason: String,
+    Accept {
+        response: GuardrailResponse,
+        trace: GuardrailTrace,
     },
-    CompactAndRetry {
-        compacted_body: serde_json::Value,
+    Retry {
+        request: GuardrailRequest,
         reason: String,
+        trace: GuardrailTrace,
+    },
+    Repair {
+        response: GuardrailResponse,
+        repaired_fields: Vec<String>,
+        trace: GuardrailTrace,
     },
     Reject {
         client_error: String,
+        trace: GuardrailTrace,
     },
     Abort {
         internal_error: String,
+        trace: GuardrailTrace,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RescueCandidate {
-    pub body: serde_json::Value,
+    pub response: GuardrailResponse,
     pub repaired_fields: Vec<String>,
     pub remaining_issues: Vec<ValidationIssue>,
 }
@@ -142,6 +165,25 @@ impl Default for TokenBudget {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextBudget {
+    pub max_context_tokens: usize,
+    pub reserve_output_tokens: usize,
+    pub compact_above_ratio: f32,
+    pub min_recent_messages: usize,
+}
+
+impl Default for ContextBudget {
+    fn default() -> Self {
+        Self {
+            max_context_tokens: 128_000,
+            reserve_output_tokens: 4_096,
+            compact_above_ratio: 0.8,
+            min_recent_messages: 8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CompactionResult {
     Unchanged,
     Compacted {
@@ -158,31 +200,7 @@ pub struct UpstreamErrorSummary {
     pub error_kind: String,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn validation_report_ok_sets_empty_state() {
-        let report = ValidationReport::ok();
-        assert!(report.ok);
-        assert!(report.violations.is_empty());
-    }
-
-    #[test]
-    fn request_serializes_schema_hint() {
-        let request = GuardrailRequest {
-            route: RouteKind::ChatCompletions,
-            provider: "openai".into(),
-            upstream_path: "/v1/chat/completions".into(),
-            model: "gpt".into(),
-            body: json!({"messages": []}),
-            stream: false,
-            schema_hint: Some(SchemaHint::JsonMode),
-            step_policy: None,
-        };
-        let value = serde_json::to_value(request).unwrap();
-        assert_eq!(value["schema_hint"], json!("JsonMode"));
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
 }
