@@ -904,6 +904,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "guardrails"
+version = "0.1.0"
+dependencies = [
+ "models",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1743,6 +1754,7 @@ dependencies = [
  "clap",
  "config 0.1.0",
  "futures",
+ "guardrails",
  "models",
  "reqwest",
  "rotator",

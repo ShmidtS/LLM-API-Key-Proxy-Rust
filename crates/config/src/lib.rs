@@ -215,4 +215,35 @@ mod tests {
             std::env::remove_var("TIMEOUT_READ_STREAMING");
         }
     }
+
+    #[test]
+    fn load_from_env_reads_nested_guardrails_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("PROXY__GUARDRAILS__ENABLED", "true");
+            std::env::set_var("PROXY__GUARDRAILS__MODE", "rescue");
+            std::env::set_var("PROXY__GUARDRAILS__CHAT__VALIDATE_TOOLS", "true");
+            std::env::set_var(
+                "PROXY__GUARDRAILS__CONTEXT_COMPACTION__COMPACT_ABOVE_RATIO",
+                "0.8",
+            );
+        }
+
+        let config = load_from_env().unwrap();
+
+        assert!(config.guardrails.enabled);
+        assert_eq!(config.guardrails.mode, "rescue");
+        assert!(config.guardrails.chat.validate_tools);
+        assert_eq!(
+            config.guardrails.context_compaction.compact_above_ratio,
+            0.8
+        );
+
+        unsafe {
+            std::env::remove_var("PROXY__GUARDRAILS__ENABLED");
+            std::env::remove_var("PROXY__GUARDRAILS__MODE");
+            std::env::remove_var("PROXY__GUARDRAILS__CHAT__VALIDATE_TOOLS");
+            std::env::remove_var("PROXY__GUARDRAILS__CONTEXT_COMPACTION__COMPACT_ABOVE_RATIO");
+        }
+    }
 }

@@ -89,6 +89,10 @@ impl RotatorClient {
         }
     }
 
+    pub fn max_retries(&self) -> usize {
+        self.max_retries
+    }
+
     pub async fn request(
         &self,
         provider: &str,

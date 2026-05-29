@@ -1,3 +1,4 @@
+use crate::guardrails_adapter::{GuardrailsAdapter, any_guardrails_enabled};
 use proxy_config::ProxyConfig;
 use rotator::{
     CircuitBreakerRegistry, CooldownManager, CredentialManager, EmbeddingBatcher, HttpClientPool,
@@ -15,6 +16,7 @@ type ModelCache = Arc<RwLock<HashMap<String, (Vec<String>, Instant)>>>;
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub rotator: Arc<RotatorClient>,
+    pub guardrails: Option<Arc<GuardrailsAdapter>>,
     pub batcher: EmbeddingBatcher,
     pub registry: Arc<ProviderRegistry>,
     pub model_cache: ModelCache,
@@ -67,9 +69,16 @@ impl AppState {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         let rotator = Arc::new(client);
+        let guardrails = any_guardrails_enabled(&cfg.guardrails).then(|| {
+            Arc::new(GuardrailsAdapter::from_proxy_config(
+                rotator.clone(),
+                &cfg.guardrails,
+            ))
+        });
         let batcher = EmbeddingBatcher::new(rotator.clone(), registry.clone());
         Self {
             rotator,
+            guardrails,
             batcher,
             registry,
             model_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -84,6 +93,7 @@ impl AppState {
         let batcher = EmbeddingBatcher::new(rotator.clone(), registry.clone());
         Self {
             rotator,
+            guardrails: None,
             batcher,
             registry,
             model_cache: Arc::new(RwLock::new(HashMap::new())),

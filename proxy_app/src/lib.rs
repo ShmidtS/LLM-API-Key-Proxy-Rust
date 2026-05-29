@@ -1,5 +1,6 @@
 pub mod compat;
 pub mod errors;
+pub mod guardrails_adapter;
 pub mod middleware;
 pub mod routes;
 pub mod state;

@@ -1,5 +1,5 @@
 [workspace]
-members = ["proxy_app", "crates/*"]
+members = ["proxy_app", "crates/guardrails", "crates/*"]
 resolver = "3"
 
 [workspace.package]

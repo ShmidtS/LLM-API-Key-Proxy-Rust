@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 rotator = { path = "../crates/rotator" }
 models = { path = "../crates/models" }
+guardrails = { path = "../crates/guardrails" }
 proxy_config = { package = "config", path = "../crates/config" }
 clap = { version = "4", features = ["derive"] }
 axum = { workspace = true }

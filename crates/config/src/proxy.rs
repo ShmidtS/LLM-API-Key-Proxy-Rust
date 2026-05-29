@@ -20,6 +20,82 @@ where
     Ok(s.filter(|x| !x.is_empty()))
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct GuardrailsRouteConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub validate_tools: bool,
+    #[serde(default)]
+    pub validate_json: bool,
+    #[serde(default)]
+    pub enforce_steps: bool,
+    #[serde(default)]
+    pub compact_context: bool,
+    #[serde(default)]
+    pub recover_errors: bool,
+    #[serde(default)]
+    pub validate_streaming: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ContextCompactionConfig {
+    #[serde(default)]
+    pub max_context_messages: usize,
+    #[serde(default)]
+    pub compact_above_ratio: f64,
+}
+
+impl Default for ContextCompactionConfig {
+    fn default() -> Self {
+        Self {
+            max_context_messages: 0,
+            compact_above_ratio: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GuardrailsProxyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_guardrails_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub chat: GuardrailsRouteConfig,
+    #[serde(default)]
+    pub anthropic: GuardrailsRouteConfig,
+    #[serde(default)]
+    pub responses: GuardrailsRouteConfig,
+    #[serde(default)]
+    pub max_rescue_attempts: usize,
+    #[serde(default)]
+    pub max_guardrail_retries: usize,
+    #[serde(default)]
+    pub context_compaction: ContextCompactionConfig,
+}
+
+impl Default for GuardrailsProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: default_guardrails_mode(),
+            chat: GuardrailsRouteConfig::default(),
+            anthropic: GuardrailsRouteConfig::default(),
+            responses: GuardrailsRouteConfig::default(),
+            max_rescue_attempts: 0,
+            max_guardrail_retries: 0,
+            context_compaction: ContextCompactionConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct GuardrailsConfig {
+    #[serde(default)]
+    pub proxy: GuardrailsProxyConfig,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProxyConfig {
     #[serde(default = "default_host")]
@@ -82,6 +158,8 @@ pub struct ProxyConfig {
     pub http2_enabled: bool,
     #[serde(default, deserialize_with = "deserialize_optional_string")]
     pub http_dns_resolver: Option<String>,
+    #[serde(default)]
+    pub guardrails: GuardrailsProxyConfig,
 }
 
 impl Default for ProxyConfig {
@@ -117,8 +195,13 @@ impl Default for ProxyConfig {
             http_ssl_verify_hosts: default_http_ssl_verify_hosts(),
             http2_enabled: default_http2_enabled(),
             http_dns_resolver: default_http_dns_resolver(),
+            guardrails: GuardrailsProxyConfig::default(),
         }
     }
+}
+
+fn default_guardrails_mode() -> String {
+    "off".into()
 }
 
 fn default_host() -> String {
@@ -230,5 +313,85 @@ mod tests {
         assert_eq!(config.max_retries, 3);
         assert!(!config.log_request_body);
         assert!(!config.enable_raw_logging);
+        assert!(!config.guardrails.enabled);
+        assert_eq!(config.guardrails.mode, "off");
+        assert!(!config.guardrails.chat.enabled);
+        assert!(!config.guardrails.chat.validate_tools);
+        assert!(!config.guardrails.chat.validate_json);
+        assert!(!config.guardrails.chat.enforce_steps);
+        assert!(!config.guardrails.chat.compact_context);
+        assert!(!config.guardrails.chat.recover_errors);
+        assert!(!config.guardrails.chat.validate_streaming);
+        assert_eq!(config.guardrails.max_rescue_attempts, 0);
+        assert_eq!(config.guardrails.max_guardrail_retries, 0);
+        assert_eq!(config.guardrails.context_compaction.max_context_messages, 0);
+        assert_eq!(
+            config.guardrails.context_compaction.compact_above_ratio,
+            0.0
+        );
+    }
+
+    #[test]
+    fn parses_guardrails_config() {
+        let config: ProxyConfig = external_config::Config::builder()
+            .add_source(external_config::File::from_str(
+                r#"
+                    [guardrails]
+                    enabled = true
+                    mode = "rescue"
+                    max_rescue_attempts = 2
+                    max_guardrail_retries = 3
+
+                    [guardrails.chat]
+                    enabled = true
+                    validate_tools = true
+                    validate_json = true
+                    enforce_steps = true
+                    compact_context = true
+                    recover_errors = true
+                    validate_streaming = true
+
+                    [guardrails.anthropic]
+                    enabled = true
+                    validate_json = true
+
+                    [guardrails.responses]
+                    validate_tools = true
+
+                    [guardrails.context_compaction]
+                    max_context_messages = 50
+                    compact_above_ratio = 0.75
+                "#,
+                external_config::FileFormat::Toml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+
+        assert!(config.guardrails.enabled);
+        assert_eq!(config.guardrails.mode, "rescue");
+        assert_eq!(config.guardrails.max_rescue_attempts, 2);
+        assert_eq!(config.guardrails.max_guardrail_retries, 3);
+        assert!(config.guardrails.chat.enabled);
+        assert!(config.guardrails.chat.validate_tools);
+        assert!(config.guardrails.chat.validate_json);
+        assert!(config.guardrails.chat.enforce_steps);
+        assert!(config.guardrails.chat.compact_context);
+        assert!(config.guardrails.chat.recover_errors);
+        assert!(config.guardrails.chat.validate_streaming);
+        assert!(config.guardrails.anthropic.enabled);
+        assert!(config.guardrails.anthropic.validate_json);
+        assert!(!config.guardrails.anthropic.validate_tools);
+        assert!(!config.guardrails.responses.enabled);
+        assert!(config.guardrails.responses.validate_tools);
+        assert_eq!(
+            config.guardrails.context_compaction.max_context_messages,
+            50
+        );
+        assert_eq!(
+            config.guardrails.context_compaction.compact_above_ratio,
+            0.75
+        );
     }
 }

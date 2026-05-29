@@ -136,6 +136,12 @@ impl From<serde_json::Error> for AppError {
     }
 }
 
+impl From<guardrails::GuardrailError> for AppError {
+    fn from(e: guardrails::GuardrailError) -> Self {
+        AppError::Internal(e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
