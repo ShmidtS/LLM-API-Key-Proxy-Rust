@@ -501,7 +501,8 @@ async fn request_chat_upstream(
 }
 
 fn is_openai_responses_model(model: &str) -> bool {
-    model.starts_with("gpt-5") || model.starts_with("o4")
+    let bare = model.strip_prefix("openai/").unwrap_or(model);
+    bare.starts_with("gpt-5") || bare.starts_with("o4")
 }
 
 fn apply_temperature_override(body: &mut Value, override_temperature_zero: Option<&str>) {
