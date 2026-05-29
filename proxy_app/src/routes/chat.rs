@@ -75,14 +75,9 @@ async fn chat_completions(
                 "streaming chat request bypasses guardrails because validate_streaming is disabled"
             );
         }
-        let upstream = request_chat_upstream(
-            &state,
-            &provider,
-            upstream_path,
-            upstream_body,
-            &req.model,
-        )
-        .await?;
+        let upstream =
+            request_chat_upstream(&state, &provider, upstream_path, upstream_body, &req.model)
+                .await?;
         let status = upstream.status();
         let headers = upstream.headers().clone();
         let model = req.model.clone();
@@ -115,14 +110,9 @@ async fn chat_completions(
     if state.guardrails.is_none()
         || !should_enable_guardrails(RouteKind::ChatCompletions, &state.config.guardrails)
     {
-        let resp = request_chat_upstream(
-            &state,
-            &provider,
-            upstream_path,
-            upstream_body,
-            &req.model,
-        )
-        .await?;
+        let resp =
+            request_chat_upstream(&state, &provider, upstream_path, upstream_body, &req.model)
+                .await?;
         let mut response = if provider == "anthropic" {
             let status = resp.status();
             let headers = resp.headers().clone();
@@ -146,14 +136,9 @@ async fn chat_completions(
     }
 
     let Some(adapter) = state.guardrails.as_ref() else {
-        let resp = request_chat_upstream(
-            &state,
-            &provider,
-            upstream_path,
-            upstream_body,
-            &req.model,
-        )
-        .await?;
+        let resp =
+            request_chat_upstream(&state, &provider, upstream_path, upstream_body, &req.model)
+                .await?;
         let mut response = if provider == "anthropic" {
             let (status, headers, response_json) =
                 buffer_chat_response(resp, is_anthropic, &req.model).await?;

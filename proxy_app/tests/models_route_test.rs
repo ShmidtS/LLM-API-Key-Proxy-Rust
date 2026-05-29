@@ -133,8 +133,8 @@ async fn models_route_parses_openai_gemini_and_partial_failure() {
         .iter()
         .map(|model| model["id"].as_str().unwrap())
         .collect();
-    assert!(ids.contains(&"gpt-4"));
-    assert!(ids.contains(&"models/gemini-pro"));
+    assert!(ids.contains(&"openai/gpt-4"));
+    assert!(ids.contains(&"gemini/models/gemini-pro"));
     assert!(!ids.contains(&"boom"));
 }
 
@@ -151,7 +151,7 @@ async fn models_route_returns_static_models_when_upstream_fails() {
         .map(|model| model["id"].as_str().unwrap())
         .collect();
 
-    assert!(ids.contains(&"gpt-4o"));
+    assert!(ids.contains(&"openai/gpt-4o"));
 }
 
 #[tokio::test]
@@ -182,9 +182,9 @@ async fn models_route_returns_static_models_when_upstream_times_out() {
         .collect();
 
     assert!(started.elapsed() < Duration::from_secs(10));
-    assert!(ids.contains(&"gpt-4o"));
-    assert!(ids.contains(&"models/gemini-live"));
-    assert!(!ids.contains(&"slow-live-model"));
+    assert!(ids.contains(&"openai/gpt-4o"));
+    assert!(ids.contains(&"gemini/models/gemini-live"));
+    assert!(!ids.contains(&"openai/slow-live-model"));
 }
 
 #[tokio::test]
@@ -224,7 +224,7 @@ async fn models_route_returns_static_models_without_credentials() {
         .map(|model| model["id"].as_str().unwrap())
         .collect();
 
-    assert!(ids.contains(&"gpt-4o"));
+    assert!(ids.contains(&"openai/gpt-4o"));
 }
 
 #[tokio::test]
@@ -239,8 +239,8 @@ async fn models_route_returns_discovered_models_when_upstream_works() {
         .map(|model| model["id"].as_str().unwrap())
         .collect();
 
-    assert!(ids.contains(&"live-model"));
-    assert!(!ids.contains(&"gpt-4o"));
+    assert!(ids.contains(&"openai/live-model"));
+    assert!(!ids.contains(&"openai/gpt-4o"));
 }
 
 #[tokio::test]
@@ -298,9 +298,9 @@ async fn models_route_applies_provider_model_filters() {
         .map(|model| model["id"].as_str().unwrap())
         .collect();
 
-    assert!(ids.contains(&"gpt-4o"));
-    assert!(ids.contains(&"gpt-3.5"));
-    assert!(!ids.contains(&"gpt-4-turbo"));
+    assert!(ids.contains(&"filtertest/gpt-4o"));
+    assert!(ids.contains(&"filtertest/gpt-3.5"));
+    assert!(!ids.contains(&"filtertest/gpt-4-turbo"));
 
     unsafe {
         std::env::remove_var("IGNORE_MODELS_FILTERTEST");
@@ -336,7 +336,7 @@ async fn models_route_supports_enriched_false() {
     .await;
 
     assert_eq!(body["object"], "list");
-    assert_eq!(body["data"][0]["id"], "gpt-4");
+    assert_eq!(body["data"][0]["id"], "openai/gpt-4");
     assert!(body["data"][0].get("pricing").is_none());
 }
 
@@ -351,7 +351,7 @@ async fn models_route_supports_enriched_true() {
     .await;
 
     assert_eq!(body["object"], "list");
-    assert_eq!(body["data"][0]["id"], "gpt-4o");
+    assert_eq!(body["data"][0]["id"], "openai/gpt-4o");
     assert!(body["data"][0]["pricing"].is_object());
 }
 
@@ -371,8 +371,8 @@ async fn api_tags_returns_ollama_schema() {
 
     let body = get_json(test_state(vec![("openai", openai_url)]), "/api/tags").await;
 
-    assert_eq!(body["models"][0]["name"], "gpt-4");
-    assert_eq!(body["models"][0]["model"], "gpt-4");
+    assert_eq!(body["models"][0]["name"], "openai/gpt-4");
+    assert_eq!(body["models"][0]["model"], "openai/gpt-4");
     assert!(body["models"][0]["details"].is_object());
     assert!(
         body["models"][0]["details"]

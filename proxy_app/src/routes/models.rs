@@ -203,6 +203,11 @@ async fn ollama_tags(State(state): State<AppState>) -> Json<Value> {
 }
 
 fn model_info(id: String, provider_id: &str) -> ModelInfo {
+    let id = if id.starts_with(&format!("{provider_id}/")) {
+        id
+    } else {
+        format!("{provider_id}/{id}")
+    };
     ModelInfo {
         id,
         object: "model".into(),
