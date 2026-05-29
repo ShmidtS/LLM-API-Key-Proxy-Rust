@@ -73,14 +73,74 @@ pub(crate) async fn list_data_models(
 }
 
 pub fn transform_request_for_provider(provider: &str, body: &mut serde_json::Value) {
-    sanitize_gpt5_request(body);
-
     match provider {
-        "anthropic" => anthropic::AnthropicProvider::new().transform_request(body),
-        "gemini" => gemini::GeminiProvider::new().transform_request(body),
-        "nvidia" => nvidia::NvidiaProvider::new().transform_request(body),
-        _ => {}
+        "elysiver" | "colin" => {
+            transform_responses_compat_request(provider, body);
+        }
+        _ => {
+            sanitize_gpt5_request(body);
+            match provider {
+                "anthropic" => anthropic::AnthropicProvider::new().transform_request(body),
+                "gemini" => gemini::GeminiProvider::new().transform_request(body),
+                "nvidia" => nvidia::NvidiaProvider::new().transform_request(body),
+                _ => {}
+            }
+        }
     }
+}
+
+fn transform_responses_compat_request(provider: &str, body: &mut serde_json::Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+
+    if let Some(model) = object.get("model").and_then(serde_json::Value::as_str) {
+        let prefix = format!("{provider}/");
+        if let Some(stripped) = model.strip_prefix(&prefix) {
+            object.insert(
+                "model".to_owned(),
+                serde_json::Value::String(stripped.to_owned()),
+            );
+        }
+    }
+
+    if let Some(messages) = object.remove("messages") {
+        let mut input = Vec::new();
+        let mut instructions = Vec::new();
+        if let Some(messages) = messages.as_array() {
+            for message in messages {
+                if message.get("role").and_then(serde_json::Value::as_str) == Some("system") {
+                    if let Some(content) = message.get("content") {
+                        instructions.push(message_content_to_text(content));
+                    }
+                    continue;
+                }
+                input.push(message.clone());
+            }
+        }
+        object.insert("input".to_owned(), serde_json::Value::Array(input));
+        if !instructions.is_empty() {
+            object.insert(
+                "instructions".to_owned(),
+                serde_json::Value::String(instructions.join("\n")),
+            );
+        }
+    }
+
+    if let Some(max_tokens) = object.remove("max_tokens") {
+        object.insert("max_output_tokens".to_owned(), max_tokens);
+    }
+    if let Some(max_completion_tokens) = object.remove("max_completion_tokens") {
+        object.insert("max_output_tokens".to_owned(), max_completion_tokens);
+    }
+    object.insert("stream".to_owned(), serde_json::Value::Bool(true));
+}
+
+fn message_content_to_text(content: &serde_json::Value) -> String {
+    content
+        .as_str()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| content.to_string())
 }
 
 fn sanitize_gpt5_request(body: &mut serde_json::Value) {
@@ -291,10 +351,40 @@ mod tests {
             "max_tokens": 128
         });
 
-        transform_request_for_provider("elysiver", &mut body);
+        transform_request_for_provider("openai", &mut body);
 
         assert!(body.get("temperature").is_none());
         assert!(body.get("max_tokens").is_none());
         assert_eq!(body["max_completion_tokens"], 128);
+    }
+
+    #[test]
+    fn elysiver_transform_uses_responses_api_body_and_forces_streaming() {
+        let mut body = serde_json::json!({
+            "model": "elysiver/gpt-5.5",
+            "messages": [
+                {"role": "system", "content": "You are concise."},
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"}
+            ],
+            "max_tokens": 128,
+            "stream": false
+        });
+
+        transform_request_for_provider("elysiver", &mut body);
+
+        assert_eq!(body["model"], "gpt-5.5");
+        assert_eq!(body["instructions"], "You are concise.");
+        assert!(body.get("messages").is_none());
+        assert_eq!(
+            body["input"],
+            serde_json::json!([
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"}
+            ])
+        );
+        assert_eq!(body["max_output_tokens"], 128);
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["stream"], true);
     }
 }

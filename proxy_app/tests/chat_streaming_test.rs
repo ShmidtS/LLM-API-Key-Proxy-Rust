@@ -16,7 +16,7 @@ use tokio::{
 };
 use tower::ServiceExt;
 
-async fn anthropic_stream_server(chunks: Vec<&'static str>) -> String {
+async fn sse_stream_server(chunks: Vec<&'static str>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -43,15 +43,20 @@ async fn anthropic_stream_server(chunks: Vec<&'static str>) -> String {
     format!("http://{addr}/v1")
 }
 
-fn anthropic_test_state(base_url: String) -> AppState {
+fn provider_test_state(provider: &str, base_url: String) -> AppState {
     let registry = Arc::new(ProviderRegistry::default());
+    let endpoint = if provider == "anthropic" {
+        "/messages"
+    } else {
+        "/responses"
+    };
     registry.register(ProviderDefinition {
-        id: "anthropic".to_owned(),
-        display_name: "anthropic".to_owned(),
+        id: provider.to_owned(),
+        display_name: provider.to_owned(),
         base_url,
         auth_type: AuthType::ApiKey,
-        model_patterns: vec![r"^claude-.*".to_owned()],
-        endpoints: vec!["/messages".to_owned()],
+        model_patterns: vec![format!(r"^{provider}/.*")],
+        endpoints: vec![endpoint.to_owned()],
         features: vec!["chat".to_owned()],
         model_count: 1,
         timeout_secs: 30,
@@ -62,7 +67,7 @@ fn anthropic_test_state(base_url: String) -> AppState {
     });
 
     let credentials = CredentialManager::new();
-    credentials.register_keys("anthropic".to_owned(), vec!["test-key".to_owned()], 10);
+    credentials.register_keys(provider.to_owned(), vec!["test-key".to_owned()], 10);
     let rotator = RotatorClient::new(
         credentials,
         HttpClientPool::new(30),
@@ -76,6 +81,10 @@ fn anthropic_test_state(base_url: String) -> AppState {
     let mut state = AppState::with_parts(rotator, registry);
     state.config.api_keys = vec!["test-proxy-token".to_owned()];
     state
+}
+
+fn anthropic_test_state(base_url: String) -> AppState {
+    provider_test_state("anthropic", base_url)
 }
 
 fn openai_stream_payloads(body: &[u8]) -> Vec<String> {
@@ -137,7 +146,7 @@ async fn chat_completions_stream_true_returns_valid_http_response() {
 
 #[tokio::test]
 async fn anthropic_streaming_route_handles_split_chunks_and_done() {
-    let base_url = anthropic_stream_server(vec![
+    let base_url = sse_stream_server(vec![
         "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-test\",\"role\":\"assistant\"}}\n\n",
         "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"He",
         "l\"}}\n\n",
@@ -202,7 +211,7 @@ async fn anthropic_streaming_route_handles_split_chunks_and_done() {
 
 #[tokio::test]
 async fn anthropic_streaming_route_ignores_malformed_chunks_without_crashing() {
-    let base_url = anthropic_stream_server(vec![
+    let base_url = sse_stream_server(vec![
         "event: content_block_delta\ndata: not-json\n\n",
         "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
         "data: [DONE]\n\n",
@@ -246,4 +255,110 @@ async fn anthropic_streaming_route_ignores_malformed_chunks_without_crashing() {
         .collect();
 
     assert_eq!(text, "ok");
+}
+
+#[tokio::test]
+async fn elysiver_non_streaming_chat_aggregates_responses_sse() {
+    let base_url = sse_stream_server(vec![
+        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"created_at\":123,\"status\":\"in_progress\",\"model\":\"gpt-5.5\",\"output\":[]}}\n\n",
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hel\"}\n\n",
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"lo\"}\n\n",
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"created_at\":123,\"status\":\"completed\",\"model\":\"gpt-5.5\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}},\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}\n\n",
+        "data: [DONE]\n\n",
+    ])
+    .await;
+    let state = provider_test_state("elysiver", base_url);
+
+    let response = proxy_app::build_app_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-api-key", "test-proxy-token")
+                .body(Body::from(
+                    json!({
+                        "model": "elysiver/gpt-5.5",
+                        "messages": [
+                            {"role": "system", "content": "You are concise."},
+                            {"role": "user", "content": "hello"}
+                        ],
+                        "max_tokens": 32,
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(value["object"], "chat.completion");
+    assert_eq!(value["model"], "gpt-5.5");
+    assert_eq!(value["choices"][0]["message"]["content"], "Hello");
+    assert_eq!(value["choices"][0]["finish_reason"], "stop");
+    assert_eq!(
+        value["usage"],
+        json!({"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5})
+    );
+}
+
+#[tokio::test]
+async fn colin_streaming_chat_converts_responses_sse_to_chat_sse() {
+    let base_url = sse_stream_server(vec![
+        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_2\",\"created_at\":456,\"status\":\"in_progress\",\"model\":\"gpt-5.4\",\"output\":[]}}\n\n",
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"OK\"}\n\n",
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\",\"created_at\":456,\"status\":\"completed\",\"model\":\"gpt-5.4\",\"output\":[]}}\n\n",
+        "data: [DONE]\n\n",
+    ])
+    .await;
+    let state = provider_test_state("colin", base_url);
+
+    let response = proxy_app::build_app_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-api-key", "test-proxy-token")
+                .body(Body::from(
+                    json!({
+                        "model": "colin/gpt-5.4",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payloads = openai_stream_payloads(&body);
+
+    assert_eq!(payloads.last().map(String::as_str), Some("[DONE]"));
+    let chunks: Vec<Value> = payloads[..payloads.len() - 1]
+        .iter()
+        .map(|payload| serde_json::from_str(payload).unwrap())
+        .collect();
+    let text: String = chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+        .collect();
+
+    assert_eq!(
+        chunks[0]["choices"][0]["delta"],
+        json!({"role": "assistant"})
+    );
+    assert_eq!(text, "OK");
+    assert_eq!(
+        chunks.last().unwrap()["choices"][0]["finish_reason"],
+        json!("stop")
+    );
 }

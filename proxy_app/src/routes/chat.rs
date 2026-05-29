@@ -16,7 +16,8 @@ use axum::{Router, extract::State, response::Json, routing::post};
 use futures::StreamExt;
 use guardrails::{GuardrailDecision, RouteKind};
 use models::chat::ChatCompletionRequest;
-use serde_json::Value;
+use serde_json::{Value, json};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
@@ -39,6 +40,7 @@ async fn chat_completions(
 
     let provider = resolve_provider_for_model(&state, &req.model);
     let is_anthropic = provider == "anthropic";
+    let is_responses_compat = matches!(provider.as_str(), "elysiver" | "colin");
     let mut body = serde_json::to_value(&req)?;
     normalize_model_in_body(&mut body, &provider);
     let override_temperature_zero = state.config.override_temperature_zero.as_deref();
@@ -82,7 +84,7 @@ async fn chat_completions(
         let headers = upstream.headers().clone();
         let model = req.model.clone();
         let mut batcher = ChunkBatcher::new();
-        let mut translator = AnthropicStreamTranslator::new(model);
+        let mut translator = AnthropicStreamTranslator::new(model.clone());
         let stream = upstream.bytes_stream().map(move |result| {
             result
                 .map(|bytes| {
@@ -93,6 +95,8 @@ async fn chat_completions(
                             .flat_map(|record| translator.translate_sse_record_to_sse(record))
                             .collect::<String>();
                         Bytes::from(output)
+                    } else if is_responses_compat {
+                        Bytes::from(translate_responses_sse_chunk(&bytes, &model))
                     } else {
                         bytes
                     }
@@ -126,6 +130,8 @@ async fn chat_completions(
                 builder = builder.header(header::CONTENT_TYPE, ct);
             }
             builder.body(Body::from(data.to_string())).unwrap()
+        } else if is_responses_compat {
+            responses_sse_to_json_response(resp, &req.model).await?
         } else {
             upstream_response(resp).await?
         };
@@ -265,6 +271,203 @@ async fn buffer_chat_response(
     };
 
     Ok((status, headers, data))
+}
+
+async fn responses_sse_to_json_response(
+    resp: reqwest::Response,
+    fallback_model: &str,
+) -> Result<Response, AppError> {
+    let status =
+        StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| rotator::RotatorError::Http(e.to_string()))?;
+    let body = aggregate_responses_sse(&bytes, fallback_model);
+
+    Ok(Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap())
+}
+
+fn aggregate_responses_sse(bytes: &[u8], fallback_model: &str) -> Value {
+    let mut id = "chatcmpl-responses-compat".to_owned();
+    let mut created = now_unix_seconds();
+    let mut model = fallback_model.to_owned();
+    let mut content = String::new();
+    let mut usage = json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
+
+    for data in sse_data_records(bytes) {
+        if data == "[DONE]" {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.output_text.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    content.push_str(delta);
+                }
+            }
+            Some("response.created") | Some("response.completed") => {
+                if let Some(response) = event.get("response") {
+                    if let Some(value) = response.get("id").and_then(Value::as_str) {
+                        id = value.to_owned();
+                    }
+                    if let Some(value) = response.get("created_at").and_then(Value::as_i64) {
+                        created = value;
+                    }
+                    if let Some(value) = response.get("model").and_then(Value::as_str) {
+                        model = value.to_owned();
+                    }
+                    if let Some(value) = response.get("usage") {
+                        usage = response_usage_to_chat_usage(value);
+                    }
+                    if content.is_empty() {
+                        content.push_str(&response_output_text(response));
+                    }
+                }
+                if let Some(value) = event.get("usage") {
+                    usage = response_usage_to_chat_usage(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    json!({
+        "id": id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop"
+        }],
+        "usage": usage
+    })
+}
+
+fn translate_responses_sse_chunk(bytes: &[u8], fallback_model: &str) -> String {
+    let mut output = String::new();
+    for data in sse_data_records(bytes) {
+        if data == "[DONE]" {
+            output.push_str("data: [DONE]\n\n");
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.created") => {
+                output.push_str(&chat_sse_payload(
+                    &event,
+                    fallback_model,
+                    json!({"role": "assistant"}),
+                    None,
+                ));
+            }
+            Some("response.output_text.delta") => {
+                let delta = event
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                output.push_str(&chat_sse_payload(
+                    &event,
+                    fallback_model,
+                    json!({"content": delta}),
+                    None,
+                ));
+            }
+            Some("response.completed") => {
+                output.push_str(&chat_sse_payload(
+                    &event,
+                    fallback_model,
+                    json!({}),
+                    Some("stop"),
+                ));
+            }
+            _ => {}
+        }
+    }
+    output
+}
+
+fn chat_sse_payload(
+    event: &Value,
+    fallback_model: &str,
+    delta: Value,
+    finish_reason: Option<&str>,
+) -> String {
+    let response = event.get("response");
+    let id = response
+        .and_then(|value| value.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("chatcmpl-responses-compat");
+    let created = response
+        .and_then(|value| value.get("created_at"))
+        .and_then(Value::as_i64)
+        .unwrap_or_else(now_unix_seconds);
+    let model = response
+        .and_then(|value| value.get("model"))
+        .and_then(Value::as_str)
+        .unwrap_or(fallback_model);
+    let payload = json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
+    });
+    format!("data: {payload}\n\n")
+}
+
+fn sse_data_records(bytes: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(bytes)
+        .split("\n\n")
+        .filter_map(|record| {
+            let lines: Vec<_> = record
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .collect();
+            (!lines.is_empty()).then(|| lines.join("\n"))
+        })
+        .collect()
+}
+
+fn response_output_text(response: &Value) -> String {
+    response
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|item| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|content| content.get("text").and_then(Value::as_str))
+        .collect()
+}
+
+fn response_usage_to_chat_usage(usage: &Value) -> Value {
+    json!({
+        "prompt_tokens": usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+        "completion_tokens": usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
+        "total_tokens": usage.get("total_tokens").and_then(Value::as_u64).unwrap_or(0)
+    })
+}
+
+fn now_unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 async fn request_chat_upstream(

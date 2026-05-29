@@ -234,14 +234,18 @@ impl ProviderRegistry {
     }
 
     pub fn find_provider_for_model(&self, model: &str) -> Option<String> {
-        self.all_providers().into_iter().find_map(|provider| {
-            provider
-                .model_patterns
-                .iter()
-                .filter_map(|pattern| Regex::new(pattern).ok())
-                .any(|regex| regex.is_match(model))
-                .then_some(provider.id)
-        })
+        static_provider_for_model(model)
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                self.all_providers().into_iter().find_map(|provider| {
+                    provider
+                        .model_patterns
+                        .iter()
+                        .filter_map(|pattern| Regex::new(pattern).ok())
+                        .any(|regex| regex.is_match(model))
+                        .then_some(provider.id)
+                })
+            })
     }
 
     pub fn resolve_provider_by_model(&self, model: &str) -> Option<&str> {
@@ -253,6 +257,7 @@ impl ProviderRegistry {
                     .any(|name| name == model)
                     .then_some(provider.as_str())
             })
+            .or_else(|| static_provider_for_model(model))
             .or_else(|| prefix_provider_for_model(model))
     }
 
@@ -345,8 +350,13 @@ fn static_provider_models(id: &str) -> &'static [&'static str] {
         "qwen_code" => &["qwen_code/qwen3-coder-plus", "qwen3-coder-plus"],
         "zai" => &["glm-4.5", "glm-4.5-air", "zai/glm-4.5"],
         "iflow" => &["iflow/Qwen3-Coder", "kimi-k2", "Qwen3-Coder"],
-        "colin" => &["colin/claude-sonnet-4", "colin/claude-3-7-sonnet"],
-        "elysiver" => &["elysiver/claude-sonnet-4", "elysiver/gpt-4o"],
+        "colin" => &[
+            "colin/claude-sonnet-4",
+            "colin/claude-3-7-sonnet",
+            "gpt-5.3-codex",
+            "gpt-5.4",
+        ],
+        "elysiver" => &["elysiver/claude-sonnet-4", "elysiver/gpt-4o", "gpt-5.5"],
         "chutes" => &["chutes/deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-R1"],
         "nanogpt" => &["nanogpt/gpt-4o", "nano-gpt/claude-sonnet-4"],
         "opencode" => &["opencode/zen", "zen/gpt-4o"],
@@ -360,6 +370,33 @@ fn static_provider_models(id: &str) -> &'static [&'static str] {
         "kilocode" => &["kilocode/claude-sonnet-4", "kilocode/gpt-4o"],
         _ => &[],
     }
+}
+
+fn static_provider_for_model(model: &str) -> Option<&'static str> {
+    [
+        "colin",
+        "elysiver",
+        "openai",
+        "gemini",
+        "gemini_cli",
+        "anthropic",
+        "fireworks",
+        "nvidia",
+        "qwen",
+        "qwen_code",
+        "zai",
+        "iflow",
+        "chutes",
+        "nanogpt",
+        "opencode",
+        "firmware",
+        "antigravity",
+        "openrouter",
+        "xai",
+        "kilocode",
+    ]
+    .into_iter()
+    .find(|provider| static_provider_models(provider).contains(&model))
 }
 
 fn prefix_provider_for_model(model: &str) -> Option<&'static str> {
@@ -740,30 +777,39 @@ mod tests {
                 .as_deref(),
             Some("anthropic")
         );
-        // gpt-5.5 is no longer hardcoded to any provider; client should use provider/model prefix
-        assert_eq!(registry.resolve_provider_by_model("openai/gpt-5.5"), None);
         assert_eq!(
-            registry
-                .find_provider_for_model("openai/gpt-5.5")
-                .as_deref(),
-            Some("openai")
+            registry.find_provider_for_model("elysiver/gpt-5.5"),
+            Some("elysiver".to_owned())
+        );
+        assert_eq!(
+            registry.find_provider_for_model("openai/gpt-5.5"),
+            Some("openai".to_owned())
         );
     }
 
     #[test]
-    fn gpt5_without_prefix_resolves_via_prefix_fallback_to_openai() {
+    fn gpt55_without_prefix_resolves_to_elysiver_static_catalog() {
         let registry = ProviderRegistry::new();
 
-        // Without provider prefix, gpt-5.5 falls through to prefix fallback (gpt- -> openai)
         assert_eq!(
             registry.find_provider_for_model("gpt-5.5"),
-            Some("openai".to_owned())
+            Some("elysiver".to_owned())
         );
-        // resolve_provider_by_model also falls back to prefix_provider_for_model
         assert_eq!(
             registry.resolve_provider_by_model("gpt-5.5"),
-            Some("openai")
+            Some("elysiver")
         );
+    }
+
+    #[test]
+    fn colin_static_catalog_contains_codex_and_gpt54() {
+        let registry = ProviderRegistry::new();
+
+        assert_eq!(
+            registry.resolve_provider_by_model("gpt-5.3-codex"),
+            Some("colin")
+        );
+        assert_eq!(registry.resolve_provider_by_model("gpt-5.4"), Some("colin"));
     }
 
     #[test]

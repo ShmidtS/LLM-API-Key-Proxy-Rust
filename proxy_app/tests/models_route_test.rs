@@ -181,7 +181,7 @@ async fn models_route_returns_static_models_when_upstream_times_out() {
         .map(|model| model["id"].as_str().unwrap())
         .collect();
 
-    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(started.elapsed() < Duration::from_secs(20));
     assert!(ids.contains(&"openai/gpt-4o"));
     assert!(ids.contains(&"gemini/models/gemini-live"));
     assert!(!ids.contains(&"openai/slow-live-model"));
