@@ -16,6 +16,7 @@ use std::{
 };
 
 const MODEL_CACHE_TTL: Duration = Duration::from_secs(60);
+const PROVIDER_MODEL_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 struct ModelsQuery {
@@ -71,14 +72,12 @@ async fn collect_models(state: &AppState) -> Vec<ModelInfo> {
     let now = Instant::now();
 
     for provider in state.registry.all_providers() {
-        if state
+        let has_credentials = state
             .rotator
             .credentials
             .get_least_loaded(&provider.id)
-            .is_none()
-        {
-            continue;
-        }
+            .is_some();
+        let static_models = state.registry.get_static_models(&provider.id);
 
         let provider_id = provider.id;
         let cached = state
@@ -94,6 +93,8 @@ async fn collect_models(state: &AppState) -> Vec<ModelInfo> {
         tasks.push(tokio::spawn(fetch_provider_models(
             provider_id,
             cached,
+            static_models,
+            has_credentials,
             rotator,
         )));
     }
@@ -109,7 +110,16 @@ async fn collect_models(state: &AppState) -> Vec<ModelInfo> {
                 .write()
                 .await
                 .insert(provider_id.clone(), (models.clone(), Instant::now()));
-            data.extend(models.into_iter().map(|id| model_info(id, &provider_id)));
+            data.extend(
+                models
+                    .into_iter()
+                    .filter(|id| {
+                        state
+                            .registry
+                            .is_provider_model_allowed(Some(&provider_id), id)
+                    })
+                    .map(|id| model_info(id, &provider_id)),
+            );
         }
     }
 
@@ -119,23 +129,41 @@ async fn collect_models(state: &AppState) -> Vec<ModelInfo> {
 async fn fetch_provider_models(
     provider_id: String,
     cached: Option<Vec<String>>,
+    static_models: Vec<String>,
+    has_credentials: bool,
     rotator: Arc<RotatorClient>,
 ) -> (String, Option<Vec<String>>) {
     if let Some(models) = cached {
         return (provider_id, Some(models));
     }
 
-    let models = match rotator.list_models(&provider_id).await {
-        Ok(response) => parse_model_ids_response(&provider_id, response).await,
-        Err(error) => {
-            tracing::warn!(
-                provider = %provider_id,
-                error = %error,
-                "failed to fetch provider models"
-            );
-            None
+    if !has_credentials {
+        return (provider_id, Some(static_models));
+    }
+
+    let models =
+        match tokio::time::timeout(PROVIDER_MODEL_TIMEOUT, rotator.list_models(&provider_id)).await
+        {
+            Ok(Ok(response)) => parse_model_ids_response(&provider_id, response).await,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    provider = %provider_id,
+                    error = %error,
+                    "failed to fetch provider models"
+                );
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    provider = %provider_id,
+                    timeout_secs = PROVIDER_MODEL_TIMEOUT.as_secs(),
+                    "timed out fetching provider models"
+                );
+                None
+            }
         }
-    };
+        .filter(|models| !models.is_empty())
+        .or_else(|| (!static_models.is_empty()).then_some(static_models));
     (provider_id, models)
 }
 

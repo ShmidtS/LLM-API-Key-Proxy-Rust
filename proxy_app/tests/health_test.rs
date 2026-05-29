@@ -72,6 +72,41 @@ async fn response_json(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+async fn assert_chat_model_routes_to_provider(model: &str, provider: &str) {
+    let response = post_json(
+        "/v1/chat/completions",
+        json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+    )
+    .await;
+    let body = response_json(response).await;
+
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!(
+                "no credentials available for provider: {provider}"
+            )),
+        "model {model} did not resolve to provider {provider}: {body}"
+    );
+}
+
+#[tokio::test]
+async fn chat_provider_resolution_uses_regex_fallback_before_openai_default() {
+    for (model, provider) in [
+        ("gemini/gemini-2.5-flash", "gemini"),
+        ("anthropic/claude-3-5-sonnet-20241022", "anthropic"),
+        ("openai/gpt-4o", "openai"),
+        ("openrouter/openai/gpt-4o", "openrouter"),
+        ("unknown-model", "openai"),
+    ] {
+        assert_chat_model_routes_to_provider(model, provider).await;
+    }
+}
+
 #[tokio::test]
 async fn props_endpoints_return_parity_schema() {
     for uri in ["/v1/props", "/props"] {

@@ -25,6 +25,28 @@ fn oauth_cache_key(provider: &str, key: &str) -> String {
     format!("{}:{}", provider, hasher.finish())
 }
 
+pub fn normalize_upstream_url(base_url: &str, action: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    let action = action.trim_start_matches('/');
+
+    if base_url.ends_with("/v1")
+        || base_url.ends_with("/v1/openai")
+        || base_url.contains(action)
+        || action.contains(':')
+    {
+        return format!("{base_url}/{action}");
+    }
+
+    if let Ok(url) = reqwest::Url::parse(base_url) {
+        let path = url.path();
+        if path.len() > 1 {
+            return format!("{base_url}/{action}");
+        }
+    }
+
+    format!("{base_url}/v1/{action}")
+}
+
 #[derive(Debug, Clone)]
 pub struct RotatorClient {
     pub credentials: Arc<CredentialManager>,
@@ -95,12 +117,19 @@ impl RotatorClient {
                 continue;
             }
 
-            let client = self.http_pool.get_or_create(provider);
-            let url = format!(
-                "{}/{}",
-                self.resolve_base_url(provider),
-                path.trim_start_matches('/')
-            );
+            let stream = body
+                .get("stream")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let client = if stream {
+                self.http_pool.get_or_create_streaming(provider)
+            } else {
+                self.http_pool.get_or_create(provider)
+            };
+            let upstream_path = self
+                .provider_registry
+                .resolve_endpoint_path(provider, path, &body);
+            let url = normalize_upstream_url(&self.resolve_base_url(provider), &upstream_path);
             let token = self.resolve_auth_token(provider, permit.key()).await?;
             let request = self.apply_auth_headers(provider, client.post(&url), &token);
             let started_at = Instant::now();
@@ -111,10 +140,6 @@ impl RotatorClient {
             match result {
                 Ok(resp) if resp.status().is_success() => {
                     self.circuit_breakers.record_success(provider);
-                    let stream = body
-                        .get("stream")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
                     return self
                         .record_usage_from_response(provider, permit.key(), resp, stream)
                         .await;
@@ -467,6 +492,10 @@ impl RotatorClient {
             .unwrap_or_default()
     }
 
+    pub fn active_cooldowns(&self) -> Vec<(String, String, Duration)> {
+        self.cooldown.get_active_cooldowns()
+    }
+
     pub fn last_latency_ms(&self, provider: &str) -> Option<u64> {
         self.last_latency_ms.get(provider).map(|entry| *entry)
     }
@@ -746,9 +775,45 @@ mod tests {
     use crate::provider_registry::ProviderDefinition;
     use crate::rate_limiter::RateLimiterRegistry;
     use std::collections::HashMap;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn normalize_upstream_url_keeps_versioned_bases() {
+        assert_eq!(
+            normalize_upstream_url("https://api.openai.com/v1", "chat/completions"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            normalize_upstream_url("https://api.fireworks.ai/inference/v1", "chat/completions"),
+            "https://api.fireworks.ai/inference/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalize_upstream_url_inserts_v1_for_unversioned_bases() {
+        assert_eq!(
+            normalize_upstream_url("https://api.deepseek.com", "chat/completions"),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        assert_eq!(
+            normalize_upstream_url("https://api.z.ai/api/coding/paas/v4", "chat/completions"),
+            "https://api.z.ai/api/coding/paas/v4/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalize_upstream_url_preserves_provider_specific_actions() {
+        assert_eq!(
+            normalize_upstream_url(
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                "gemini-2.5-flash:generateContent"
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        );
+    }
 
     async fn test_provider(statuses: Vec<u16>) -> (Arc<ProviderRegistry>, Arc<AtomicUsize>) {
         test_provider_with_body(statuses, "{}".to_string()).await
@@ -802,6 +867,89 @@ mod tests {
         });
 
         (registry, calls)
+    }
+
+    async fn captured_path_provider(provider: &str) -> (Arc<ProviderRegistry>, Arc<Mutex<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured_path = Arc::new(Mutex::new(String::new()));
+        let server_path = captured_path.clone();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = [0; 2048];
+            let Ok(size) = socket.read(&mut buffer).await else {
+                return;
+            };
+            let request = String::from_utf8_lossy(&buffer[..size]);
+            if let Some(path) = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+            {
+                *server_path.lock().unwrap() = path.to_owned();
+            }
+            let body = "{}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let registry = Arc::new(ProviderRegistry::default());
+        registry.register(ProviderDefinition {
+            id: provider.to_owned(),
+            display_name: provider.to_owned(),
+            base_url: format!("http://{addr}/v1beta"),
+            auth_type: AuthType::ApiKey,
+            model_patterns: Vec::new(),
+            endpoints: vec!["/chat/completions".to_string()],
+            features: vec!["chat".to_string()],
+            model_count: 1,
+            timeout_secs: 60,
+            default_headers: HashMap::new(),
+            token_endpoint: None,
+            client_id: None,
+            client_secret: None,
+        });
+
+        (registry, captured_path)
+    }
+
+    #[tokio::test]
+    async fn request_uses_gemini_native_chat_endpoint() {
+        let (registry, captured_path) = captured_path_provider("gemini").await;
+        let credentials = CredentialManager::new();
+        credentials.register_keys("gemini".to_string(), vec!["key-1".to_string()], 1);
+        let client = RotatorClient::new(
+            credentials,
+            HttpClientPool::new(30),
+            registry,
+            Arc::new(RateLimiterRegistry::new()),
+            Arc::new(CooldownManager::new()),
+            Arc::new(CircuitBreakerRegistry::new()),
+            None,
+            0,
+        );
+
+        let response = client
+            .request(
+                "gemini",
+                "chat/completions",
+                serde_json::json!({"model": "gemini-2.5-flash"}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            captured_path.lock().unwrap().as_str(),
+            "/v1beta/models/gemini-2.5-flash:generateContent?key=key-1"
+        );
     }
 
     #[tokio::test]

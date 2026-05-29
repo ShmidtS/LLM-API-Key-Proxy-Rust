@@ -13,7 +13,10 @@ use proxy_config::ProxyConfig;
 use serde_json::Value;
 use std::time::Duration;
 use tower_http::{
-    compression::{CompressionLayer, CompressionLevel, predicate::DefaultPredicate},
+    compression::{
+        CompressionLayer, CompressionLevel,
+        predicate::{DefaultPredicate, NotForContentType, Predicate},
+    },
     cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer},
     limit::RequestBodyLimitLayer,
     timeout::TimeoutLayer,
@@ -149,7 +152,7 @@ pub fn build_app_with_state(app_state: state::AppState) -> Router {
             .quality(CompressionLevel::Precise(
                 config.gzip_compression_level as i32,
             ))
-            .compress_when(DefaultPredicate::new()),
+            .compress_when(DefaultPredicate::new().and(NotForContentType::SSE)),
     )
     .layer(from_fn(middleware::add_request_id))
     .layer(RequestBodyLimitLayer::new(config.max_body_bytes))

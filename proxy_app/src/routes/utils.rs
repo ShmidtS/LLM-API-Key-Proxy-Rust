@@ -1,4 +1,5 @@
 use crate::errors::AppError;
+use crate::state::AppState;
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
@@ -42,4 +43,52 @@ pub fn json_body(body: axum::body::Bytes) -> Result<Value, AppError> {
         return Ok(serde_json::json!({}));
     }
     Ok(serde_json::from_slice(&body)?)
+}
+
+pub fn resolve_provider_for_model(state: &AppState, model: &str) -> String {
+    state
+        .registry
+        .resolve_provider_by_model(model)
+        .map(ToOwned::to_owned)
+        .or_else(|| state.registry.find_provider_for_model(model))
+        .unwrap_or_else(|| "openai".to_owned())
+}
+
+pub fn strip_provider_prefix(model: &str, provider: &str) -> String {
+    let prefix = format!("{provider}/");
+    model.strip_prefix(&prefix).unwrap_or(model).to_owned()
+}
+
+pub fn normalize_model_in_body(body: &mut Value, provider: &str) {
+    let Some(model) = body.get("model").and_then(Value::as_str) else {
+        return;
+    };
+    let normalized = strip_provider_prefix(model, provider);
+    if provider != "openai" && normalized != model {
+        body["model"] = Value::String(normalized);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_provider_prefix;
+
+    #[test]
+    fn strip_provider_prefix_removes_matching_provider_prefix() {
+        assert_eq!(strip_provider_prefix("openai/gpt-5.5", "openai"), "gpt-5.5");
+        assert_eq!(
+            strip_provider_prefix("anthropic/claude-3-5-sonnet", "anthropic"),
+            "claude-3-5-sonnet"
+        );
+        assert_eq!(strip_provider_prefix("zai/glm-5.1", "zai"), "glm-5.1");
+    }
+
+    #[test]
+    fn strip_provider_prefix_keeps_non_matching_model() {
+        assert_eq!(strip_provider_prefix("gpt-5.5", "openai"), "gpt-5.5");
+        assert_eq!(
+            strip_provider_prefix("anthropic/claude-3-5-sonnet", "openai"),
+            "anthropic/claude-3-5-sonnet"
+        );
+    }
 }

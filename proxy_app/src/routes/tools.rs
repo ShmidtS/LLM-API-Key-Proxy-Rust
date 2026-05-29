@@ -1,5 +1,5 @@
 use crate::errors::{AppError, invalid_request_error};
-use crate::routes::utils::upstream_response;
+use crate::routes::utils::{resolve_provider_for_model, upstream_response};
 use crate::state::AppState;
 use axum::body::Body;
 use axum::extract::{OriginalUri, Query, State};
@@ -80,9 +80,8 @@ async fn tool_web_search(
     let provider = body
         .get("model")
         .and_then(Value::as_str)
-        .and_then(|model| state.registry.resolve_provider_by_model(model))
-        .unwrap_or("openai")
-        .to_owned();
+        .map(|model| resolve_provider_for_model(&state, model))
+        .unwrap_or_else(|| "openai".to_owned());
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let upstream = state
         .rotator

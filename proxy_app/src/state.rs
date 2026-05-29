@@ -36,7 +36,10 @@ impl AppState {
 
     pub fn from_config(cfg: ProxyConfig) -> Self {
         let creds = CredentialManager::from_env();
-        let pool = HttpClientPool::new(cfg.request_timeout_secs);
+        let pool = HttpClientPool::with_timeouts(
+            cfg.timeout_read_non_streaming_secs,
+            cfg.timeout_read_streaming_secs,
+        );
         let mut registry = ProviderRegistry::new();
         registry.load_from_env();
         let registry = Arc::new(registry);
@@ -59,8 +62,8 @@ impl AppState {
             cfg.max_retries,
         );
         let catalog_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(cfg.request_timeout_secs.min(2)))
-            .connect_timeout(Duration::from_secs(1))
+            .timeout(Duration::from_secs(cfg.request_timeout_secs))
+            .connect_timeout(Duration::from_secs(5))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         let rotator = Arc::new(client);
@@ -86,8 +89,8 @@ impl AppState {
             model_cache: Arc::new(RwLock::new(HashMap::new())),
             model_info: Arc::new(RwLock::new(ModelInfoService::new())),
             catalog_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(2))
-                .connect_timeout(Duration::from_secs(1))
+                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(5))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             config: ProxyConfig::default(),

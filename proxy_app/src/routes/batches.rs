@@ -1,5 +1,5 @@
 use crate::errors::AppError;
-use crate::routes::utils::upstream_response;
+use crate::routes::utils::{resolve_provider_for_model, upstream_response};
 use crate::state::AppState;
 use axum::extract::Query;
 use axum::response::Response;
@@ -23,7 +23,8 @@ async fn create_batch(
     State(state): State<AppState>,
     Json(req): Json<Value>,
 ) -> Result<Response, AppError> {
-    let upstream = state.rotator.request("openai", "batches", req).await?;
+    let provider = resolve_provider_from_body(&state, &req);
+    let upstream = state.rotator.request(&provider, "batches", req).await?;
     upstream_response(upstream).await
 }
 
@@ -31,10 +32,11 @@ async fn list_batches(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, AppError> {
-    let query_vec = params.into_iter().collect::<Vec<_>>();
+    let provider = resolve_provider_from_query(&state, &params);
+    let query_vec = upstream_query(params);
     let upstream = state
         .rotator
-        .get_with_query("openai", "batches", &query_vec)
+        .get_with_query(&provider, "batches", &query_vec)
         .await?;
     upstream_response(upstream).await
 }
@@ -42,10 +44,12 @@ async fn list_batches(
 async fn retrieve_batch(
     State(state): State<AppState>,
     Path(batch_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, AppError> {
+    let provider = resolve_provider_from_query(&state, &params);
     let upstream = state
         .rotator
-        .get("openai", &format!("batches/{batch_id}"))
+        .get(&provider, &format!("batches/{batch_id}"))
         .await?;
     upstream_response(upstream).await
 }
@@ -53,10 +57,49 @@ async fn retrieve_batch(
 async fn cancel_batch(
     State(state): State<AppState>,
     Path(batch_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, AppError> {
+    let provider = resolve_provider_from_query(&state, &params);
     let upstream = state
         .rotator
-        .request("openai", &format!("batches/{batch_id}/cancel"), json!({}))
+        .request(&provider, &format!("batches/{batch_id}/cancel"), json!({}))
         .await?;
     upstream_response(upstream).await
+}
+
+fn resolve_provider_from_body(state: &AppState, body: &Value) -> String {
+    explicit_provider(body)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            body.get("model")
+                .and_then(Value::as_str)
+                .map(|model| resolve_provider_for_model(state, model))
+        })
+        .unwrap_or_else(|| "openai".to_owned())
+}
+
+fn resolve_provider_from_query(state: &AppState, params: &HashMap<String, String>) -> String {
+    params
+        .get("provider")
+        .or_else(|| params.get("custom_llm_provider"))
+        .cloned()
+        .or_else(|| {
+            params
+                .get("model")
+                .map(|model| resolve_provider_for_model(state, model))
+        })
+        .unwrap_or_else(|| "openai".to_owned())
+}
+
+fn explicit_provider(body: &Value) -> Option<&str> {
+    body.get("provider")
+        .or_else(|| body.get("custom_llm_provider"))
+        .and_then(Value::as_str)
+}
+
+fn upstream_query(params: HashMap<String, String>) -> Vec<(String, String)> {
+    params
+        .into_iter()
+        .filter(|(key, _)| key != "provider" && key != "custom_llm_provider" && key != "model")
+        .collect()
 }

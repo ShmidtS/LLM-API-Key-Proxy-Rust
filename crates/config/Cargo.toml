@@ -10,4 +10,5 @@ name = "proxy_config"
 serde = { workspace = true }
 dotenvy = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 external_config = { package = "config", version = "0.14" }

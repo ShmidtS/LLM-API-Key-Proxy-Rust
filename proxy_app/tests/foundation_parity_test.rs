@@ -284,6 +284,26 @@ async fn foundation_parity_sse_streaming_route_is_not_gzip_encoded() {
 }
 
 #[tokio::test]
+async fn foundation_parity_normal_response_is_gzip_encoded() {
+    let response = app_with_config(ProxyConfig::default())
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_ENCODING).unwrap(),
+        "gzip"
+    );
+}
+
+#[tokio::test]
 async fn foundation_parity_request_id_header_is_present() {
     let response = app_with_config(ProxyConfig::default())
         .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())

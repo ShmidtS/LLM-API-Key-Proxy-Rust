@@ -89,6 +89,7 @@ pub enum AppError {
     Unauthorized,
     NotFound,
     Internal(String),
+    UpstreamTimeout(String),
     Rotator(rotator::RotatorError),
 }
 
@@ -105,6 +106,7 @@ impl IntoResponse for AppError {
                     "Internal server error".into(),
                 )
             }
+            AppError::UpstreamTimeout(msg) => (StatusCode::GATEWAY_TIMEOUT, msg),
             AppError::Rotator(e) => {
                 tracing::error!("rotator error: {}", e);
                 (StatusCode::BAD_GATEWAY, e.to_string())

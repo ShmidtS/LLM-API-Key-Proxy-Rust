@@ -403,6 +403,7 @@ dependencies = [
  "dotenvy",
  "serde",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

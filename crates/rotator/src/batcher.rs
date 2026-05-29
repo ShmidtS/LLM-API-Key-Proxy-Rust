@@ -251,10 +251,19 @@ mod tests {
     use tokio::net::TcpListener;
 
     async fn embedding_server(expected_requests: usize) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let (base_url, requests, _) = embedding_server_with_paths(expected_requests).await;
+        (base_url, requests)
+    }
+
+    async fn embedding_server_with_paths(
+        expected_requests: usize,
+    ) -> (String, Arc<Mutex<Vec<Value>>>, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let paths = Arc::new(Mutex::new(Vec::new()));
         let server_requests = requests.clone();
+        let server_paths = paths.clone();
 
         tokio::spawn(async move {
             for _ in 0..expected_requests {
@@ -266,6 +275,13 @@ mod tests {
                     return;
                 };
                 let text = String::from_utf8_lossy(&buffer[..n]);
+                if let Some(path) = text
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                {
+                    server_paths.lock().unwrap().push(path.to_owned());
+                }
                 let body = text.split("\r\n\r\n").nth(1).unwrap_or_default();
                 let request: Value = serde_json::from_str(body).unwrap();
                 server_requests.lock().unwrap().push(request.clone());
@@ -300,18 +316,34 @@ mod tests {
             }
         });
 
-        (format!("http://{addr}/v1"), requests)
+        (format!("http://{addr}/v1"), requests, paths)
     }
 
     fn batcher(base_url: String) -> EmbeddingBatcher {
+        provider_batcher(
+            "openai",
+            base_url,
+            AuthType::Bearer,
+            "^text-embedding-.*",
+            vec!["/embeddings".to_owned()],
+        )
+    }
+
+    fn provider_batcher(
+        provider: &str,
+        base_url: String,
+        auth_type: AuthType,
+        model_pattern: &str,
+        endpoints: Vec<String>,
+    ) -> EmbeddingBatcher {
         let registry = Arc::new(ProviderRegistry::default());
         registry.register(ProviderDefinition {
-            id: "openai".to_owned(),
-            display_name: "OpenAI".to_owned(),
+            id: provider.to_owned(),
+            display_name: provider.to_owned(),
             base_url,
-            auth_type: AuthType::Bearer,
-            model_patterns: vec!["^text-embedding-.*".to_owned()],
-            endpoints: vec!["/embeddings".to_owned()],
+            auth_type,
+            model_patterns: vec![model_pattern.to_owned()],
+            endpoints,
             features: vec!["embeddings".to_owned()],
             model_count: 1,
             timeout_secs: 30,
@@ -321,7 +353,7 @@ mod tests {
             client_secret: None,
         });
         let credentials = CredentialManager::new();
-        credentials.register_keys("openai".to_owned(), vec!["test-key".to_owned()], 1);
+        credentials.register_keys(provider.to_owned(), vec!["test-key".to_owned()], 1);
         let rotator = RotatorClient::new(
             credentials,
             HttpClientPool::new(30),
@@ -365,6 +397,32 @@ mod tests {
         assert_eq!(captured[0]["input"], json!(["one", "two"]));
         assert_eq!(captured[0]["dimensions"], 128);
         assert_eq!(captured[0]["user"], "user-1");
+    }
+
+    #[tokio::test]
+    async fn gemini_embeddings_use_native_model_endpoint() {
+        let (base_url, _, paths) = embedding_server_with_paths(1).await;
+        let batcher = provider_batcher(
+            "gemini",
+            base_url,
+            AuthType::ApiKey,
+            "^(models/)?gemini[-/].*",
+            vec!["/embeddings".to_owned()],
+        );
+
+        let response = batcher
+            .add_request(json!({
+                "model": "gemini-embedding-001",
+                "input": "hello"
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            paths.lock().unwrap()[0],
+            "/v1/models/gemini-embedding-001:embedContent?key=test-key"
+        );
     }
 
     #[tokio::test]

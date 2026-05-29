@@ -281,6 +281,87 @@ async fn admin_stats_returns_provider_key_and_request_counts() {
 }
 
 #[tokio::test]
+async fn quota_stats_returns_viewer_shape_and_formats() {
+    let _guard = ADMIN_TOKEN_LOCK.lock().await;
+    unsafe {
+        std::env::set_var("ADMIN_TOKEN", "test-admin-token");
+    }
+
+    let json_response = app_without_credentials()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/quota-stats?provider=openai")
+                .header("authorization", "Bearer test-admin-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = json_response.status();
+    let body = to_bytes(json_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["summary"]["total_providers"], 1);
+    assert!(json["providers"]["openai"]["credentials"].is_array());
+    assert!(json["summary"]["tokens"]["input_uncached"].is_number());
+    assert!(json["global_summary"].is_object());
+    assert!(json["timestamp"].is_number());
+    assert!(json["timestamp_iso"].is_string());
+
+    let text_response = app_without_credentials()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/quota-stats?format=text")
+                .header("authorization", "Bearer test-admin-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let text_status = text_response.status();
+    let text_content_type = text_response.headers()["content-type"].clone();
+    let text_body = to_bytes(text_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(text_body.to_vec()).unwrap();
+
+    assert_eq!(text_status, StatusCode::OK);
+    assert_eq!(text_content_type, "text/plain; charset=utf-8");
+    assert!(text.contains("Quota & Usage Statistics"));
+
+    let html_response = app_without_credentials()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/quota-stats?format=html")
+                .header("authorization", "Bearer test-admin-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html_status = html_response.status();
+    let html_content_type = html_response.headers()["content-type"].clone();
+    let html_body = to_bytes(html_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = String::from_utf8(html_body.to_vec()).unwrap();
+
+    assert_eq!(html_status, StatusCode::OK);
+    assert_eq!(html_content_type, "text/html; charset=utf-8");
+    assert!(html.contains("<table>"));
+
+    unsafe {
+        std::env::remove_var("ADMIN_TOKEN");
+    }
+}
+
+#[tokio::test]
 async fn admin_token_count_uses_bpe_chat_tokens() {
     let _guard = ADMIN_TOKEN_LOCK.lock().await;
     unsafe {

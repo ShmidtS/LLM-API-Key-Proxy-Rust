@@ -146,13 +146,18 @@ impl ModelInfoService {
 pub async fn fetch_openrouter_catalog(
     client: &reqwest::Client,
 ) -> Result<Vec<ModelMetadata>, ModelInfoError> {
-    let payload = client
+    let response = client
         .get("https://openrouter.ai/api/v1/models")
         .send()
         .await?
-        .error_for_status()?
-        .json::<Value>()
-        .await?;
+        .error_for_status()?;
+    let payload = match response.json::<Value>().await {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to decode OpenRouter catalog as JSON; skipping enrichment");
+            return Ok(Vec::new());
+        }
+    };
     normalize_openrouter_catalog(payload)
 }
 

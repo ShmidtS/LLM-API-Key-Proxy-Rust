@@ -1,5 +1,7 @@
 use crate::errors::{AppError, invalid_request_error};
-use crate::routes::utils::upstream_response;
+use crate::routes::utils::{
+    normalize_model_in_body, resolve_provider_for_model, upstream_response,
+};
 use crate::state::AppState;
 use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, Path, Query, State};
@@ -68,16 +70,25 @@ async fn create_response(
     }
 
     let chat_request = responses_request_to_chat_request(original_request.clone())?;
-    let provider = state
-        .registry
-        .resolve_provider_by_model(&chat_request.model)
-        .unwrap_or("openai")
-        .to_owned();
-    let upstream_body = serde_json::to_value(&chat_request)?;
+    let provider = resolve_provider_for_model(&state, &chat_request.model);
+    let mut upstream_body = serde_json::to_value(&chat_request)?;
+    normalize_model_in_body(&mut upstream_body, &provider);
+    tracing::info!(
+        method = "POST",
+        provider = %provider,
+        model = %chat_request.model,
+        upstream_path = "chat/completions",
+        "forwarding responses request"
+    );
     let upstream = state
         .rotator
         .request(&provider, "chat/completions", upstream_body)
         .await?;
+    tracing::info!(
+        provider = %provider,
+        status = %upstream.status(),
+        "upstream responses response"
+    );
 
     if original_request.stream == Some(true) {
         let status = upstream.status();

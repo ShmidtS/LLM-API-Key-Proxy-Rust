@@ -172,6 +172,106 @@ mod openai_routes_parity {
     }
 
     #[tokio::test]
+    async fn anthropic_messages_resolves_provider_from_model_prefix() {
+        let (base_url, request_rx) = capture_server().await;
+        let state = test_state("old-api", base_url, r"^old-api/claude-.*");
+
+        let response = proxy_app::build_app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-api-key", "test-proxy-token")
+                    .body(Body::from(
+                        json!({
+                            "model": "old-api/claude-3-5-sonnet",
+                            "max_tokens": 16,
+                            "messages": []
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let request = request_rx.await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            request
+                .lines()
+                .next()
+                .unwrap()
+                .starts_with("POST /v1/chat/completions")
+        );
+        assert!(request.contains("x-api-key: test-key"));
+        assert!(request.contains(r#""model":"claude-3-5-sonnet""#));
+    }
+
+    #[tokio::test]
+    async fn batches_create_resolves_provider_from_model() {
+        let (base_url, request_rx) = capture_server().await;
+        let state = test_state("anthropic", base_url, r"^claude-.*");
+
+        let response = proxy_app::build_app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/batches")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-api-key", "test-proxy-token")
+                    .body(Body::from(
+                        json!({"model":"claude-3-5-sonnet-20241022","input_file_id":"file_123"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let request = request_rx.await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            request
+                .lines()
+                .next()
+                .unwrap()
+                .starts_with("POST /v1/batches")
+        );
+        assert!(request.contains("x-api-key: test-key"));
+    }
+
+    #[tokio::test]
+    async fn batches_list_resolves_provider_from_query() {
+        let (base_url, request_rx) = capture_server().await;
+        let state = test_state("anthropic", base_url, r"^claude-.*");
+
+        let response = proxy_app::build_app_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/batches?provider=anthropic&limit=5")
+                    .header("x-api-key", "test-proxy-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let request = request_rx.await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            request
+                .lines()
+                .next()
+                .unwrap()
+                .contains("/v1/batches?limit=5")
+        );
+        assert!(request.contains("x-api-key: test-key"));
+    }
+
+    #[tokio::test]
     async fn files_delete_reaches_upstream() {
         let (base_url, request_rx) = capture_server().await;
         let state = test_state("openai", base_url, r"^gpt-.*");

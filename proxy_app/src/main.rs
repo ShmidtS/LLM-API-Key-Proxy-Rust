@@ -3,11 +3,8 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
     net::SocketAddr,
-    path::Path,
     process,
-    time::Duration,
 };
-use tokio::time::timeout;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{
     Layer,
@@ -120,7 +117,7 @@ async fn main() {
             tracing::error!("failed to parse socket address: {err}");
             process::exit(1);
         });
-    let graceful_shutdown_timeout_secs = config.graceful_shutdown_timeout_secs;
+    let _graceful_shutdown_timeout_secs = config.graceful_shutdown_timeout_secs;
     let state = proxy_app::state::AppState::from_config(config);
     let app = proxy_app::build_app_with_state(state);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -128,15 +125,13 @@ async fn main() {
     tracing::info!("LLM API Key Proxy Rust app started");
     let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
 
-    match timeout(Duration::from_secs(graceful_shutdown_timeout_secs), server).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => tracing::error!("server error: {err}"),
-        Err(_) => tracing::warn!("graceful shutdown timed out, forcing exit"),
+    if let Err(err) = server.await {
+        tracing::error!("server error: {err}");
     }
 }
 
 fn ensure_env_file() -> io::Result<()> {
-    if !Path::new(".env").exists() {
+    if proxy_config::find_env_file().is_none() {
         let proxy_api_key = uuid::Uuid::new_v4().simple().to_string();
         fs::write(".env", format!("PROXY_API_KEY={proxy_api_key}\n"))?;
         println!("Created .env with generated PROXY_API_KEY");

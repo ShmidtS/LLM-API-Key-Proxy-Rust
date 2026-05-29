@@ -5,6 +5,139 @@ pub fn openai_to_anthropic_messages(body: &Value) -> Value {
     translate_anthropic_request(body)
 }
 
+pub fn anthropic_to_openai_chat_request(body: &Value) -> Value {
+    let mut output = json!({
+        "model": body.get("model").cloned().unwrap_or(Value::Null),
+        "messages": anthropic_to_openai_messages(body.get("messages").unwrap_or(&Value::Null)),
+    });
+
+    copy_optional(body, &mut output, "max_tokens", "max_tokens");
+    copy_optional(body, &mut output, "stream", "stream");
+    copy_optional(body, &mut output, "temperature", "temperature");
+    copy_optional(body, &mut output, "top_p", "top_p");
+    copy_optional(body, &mut output, "top_k", "top_k");
+    copy_optional(body, &mut output, "stop_sequences", "stop");
+
+    if let Some(system) = anthropic_system_to_openai_message(body.get("system"))
+        && let Some(messages) = output.get_mut("messages").and_then(Value::as_array_mut)
+    {
+        messages.insert(0, system);
+    }
+    if let Some(tools) = body.get("tools") {
+        output["tools"] = anthropic_tools_to_openai_tools(tools);
+    }
+    if let Some(tool_choice) = body.get("tool_choice") {
+        output["tool_choice"] = anthropic_tool_choice_to_openai_tool_choice(tool_choice);
+    }
+    if body.pointer("/thinking/type").and_then(Value::as_str) == Some("enabled")
+        && body
+            .pointer("/thinking/budget_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            > 0
+    {
+        output["reasoning_effort"] = Value::String("high".to_owned());
+    }
+
+    output
+}
+
+pub fn anthropic_to_openai_messages(messages: &Value) -> Value {
+    Value::Array(
+        messages
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(anthropic_message_to_openai_messages)
+            .collect(),
+    )
+}
+
+pub fn anthropic_tools_to_openai_tools(tools: &Value) -> Value {
+    Value::Array(
+        tools
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|tool| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name").and_then(Value::as_str).unwrap_or_default(),
+                        "description": tool.get("description").and_then(Value::as_str).unwrap_or_default(),
+                        "parameters": tool.get("input_schema").cloned().unwrap_or_else(|| json!({})),
+                    }
+                })
+            })
+            .collect(),
+    )
+}
+
+pub fn anthropic_tool_choice_to_openai_tool_choice(tool_choice: &Value) -> Value {
+    match tool_choice {
+        Value::String(choice) => match choice.as_str() {
+            "any" => Value::String("required".to_owned()),
+            "auto" | "none" => Value::String(choice.clone()),
+            _ => Value::Null,
+        },
+        Value::Object(_) => match tool_choice.get("type").and_then(Value::as_str) {
+            Some("any") => Value::String("required".to_owned()),
+            Some("auto") => Value::String("auto".to_owned()),
+            Some("none") => Value::String("none".to_owned()),
+            Some("tool") => json!({
+                "type": "function",
+                "function": {
+                    "name": tool_choice.get("name").and_then(Value::as_str).unwrap_or_default(),
+                }
+            }),
+            _ => Value::Null,
+        },
+        _ => Value::Null,
+    }
+}
+
+pub fn openai_chat_to_anthropic_response(response: &Value, model: &str) -> Value {
+    let message = response
+        .pointer("/choices/0/message")
+        .unwrap_or(&Value::Null);
+    let mut content = Vec::new();
+
+    if let Some(text) = message.get("content").and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        content.push(json!({"type": "text", "text": text}));
+    }
+    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for tool_call in tool_calls {
+            let input = tool_call
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
+                .unwrap_or_else(|| json!({}));
+            content.push(json!({
+                "type": "tool_use",
+                "id": tool_call.get("id").and_then(Value::as_str).unwrap_or_default(),
+                "name": tool_call.pointer("/function/name").and_then(Value::as_str).unwrap_or_default(),
+                "input": input,
+            }));
+        }
+    }
+
+    json!({
+        "id": response.get("id").and_then(Value::as_str).unwrap_or("msg_openai"),
+        "type": "message",
+        "role": "assistant",
+        "model": response.get("model").and_then(Value::as_str).unwrap_or(model),
+        "content": content,
+        "stop_reason": openai_finish_reason_to_anthropic(response.pointer("/choices/0/finish_reason").and_then(Value::as_str)),
+        "stop_sequence": Value::Null,
+        "usage": {
+            "input_tokens": response.pointer("/usage/prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
+            "output_tokens": response.pointer("/usage/completion_tokens").and_then(Value::as_u64).unwrap_or(0),
+        }
+    })
+}
+
 pub fn translate_anthropic_request(body: &Value) -> Value {
     let mut output = json!({
         "model": body.get("model").cloned().unwrap_or(Value::Null),
@@ -195,6 +328,147 @@ pub fn anthropic_stream_to_openai_sse(chunk: &str, model: &str) -> Option<String
 fn copy_optional(input: &Value, output: &mut Value, from: &str, to: &str) {
     if let Some(value) = input.get(from) {
         output[to] = value.clone();
+    }
+}
+
+fn anthropic_system_to_openai_message(system: Option<&Value>) -> Option<Value> {
+    let content = match system? {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    };
+
+    (!content.is_empty()).then_some(json!({"role": "system", "content": content}))
+}
+
+fn anthropic_message_to_openai_messages(message: &Value) -> Vec<Value> {
+    let role = message
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("user");
+    let content = message.get("content").unwrap_or(&Value::Null);
+
+    match content {
+        Value::String(text) => vec![json!({"role": role, "content": text})],
+        Value::Array(blocks) => anthropic_blocks_to_openai_messages(role, blocks),
+        _ => vec![json!({"role": role, "content": ""})],
+    }
+}
+
+fn anthropic_blocks_to_openai_messages(role: &str, blocks: &[Value]) -> Vec<Value> {
+    if let Some(tool_result) = anthropic_tool_result_message(blocks) {
+        return vec![tool_result];
+    }
+
+    let tool_calls = anthropic_tool_use_calls(blocks);
+    if !tool_calls.is_empty() {
+        let mut message = json!({"role": "assistant", "content": Value::Null});
+        message["tool_calls"] = Value::Array(tool_calls);
+        return vec![message];
+    }
+
+    let parts = blocks
+        .iter()
+        .filter_map(anthropic_content_block_to_openai_part)
+        .collect::<Vec<_>>();
+
+    if parts
+        .iter()
+        .all(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+    {
+        let text = parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+        vec![json!({"role": role, "content": text})]
+    } else {
+        vec![json!({"role": role, "content": parts})]
+    }
+}
+
+fn anthropic_content_block_to_openai_part(block: &Value) -> Option<Value> {
+    match block.get("type").and_then(Value::as_str) {
+        Some("text") => block
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| json!({"type": "text", "text": text})),
+        Some("image") => anthropic_source_to_openai_image_url(block.get("source")?),
+        Some("document") => anthropic_source_to_openai_image_url(block.get("source")?),
+        _ => None,
+    }
+}
+
+fn anthropic_source_to_openai_image_url(source: &Value) -> Option<Value> {
+    let url = match source.get("type").and_then(Value::as_str) {
+        Some("base64") => format!(
+            "data:{};base64,{}",
+            source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream"),
+            source
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        ),
+        Some("url") => source.get("url").and_then(Value::as_str)?.to_owned(),
+        _ => return None,
+    };
+    Some(json!({"type": "image_url", "image_url": {"url": url}}))
+}
+
+fn anthropic_tool_use_calls(blocks: &[Value]) -> Vec<Value> {
+    blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .map(|block| {
+            json!({
+                "id": block.get("id").and_then(Value::as_str).unwrap_or_default(),
+                "type": "function",
+                "function": {
+                    "name": block.get("name").and_then(Value::as_str).unwrap_or_default(),
+                    "arguments": block.get("input").map(Value::to_string).unwrap_or_else(|| "{}".to_owned()),
+                }
+            })
+        })
+        .collect()
+}
+
+fn anthropic_tool_result_message(blocks: &[Value]) -> Option<Value> {
+    let block = blocks
+        .iter()
+        .find(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))?;
+    let content = match block.get("content").unwrap_or(&Value::Null) {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" "),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    };
+    Some(json!({
+        "role": "tool",
+        "tool_call_id": block.get("tool_use_id").and_then(Value::as_str).unwrap_or_default(),
+        "content": content,
+    }))
+}
+
+fn openai_finish_reason_to_anthropic(reason: Option<&str>) -> Value {
+    match reason {
+        Some("length") => Value::String("max_tokens".to_owned()),
+        Some("tool_calls") => Value::String("tool_use".to_owned()),
+        Some("stop") => Value::String("end_turn".to_owned()),
+        Some(other) => Value::String(other.to_owned()),
+        None => Value::Null,
     }
 }
 
@@ -784,6 +1058,129 @@ mod tests {
         assert_eq!(
             output["thinking"],
             json!({"type": "enabled", "budget_tokens": 8192})
+        );
+    }
+
+    #[test]
+    fn converts_anthropic_request_to_openai_chat_shape() {
+        let input = json!({
+            "model": "fireworks/llama",
+            "system": [{"type": "text", "text": "Be terse"}, {"type": "image", "source": {}}],
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Look"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}}
+                ]
+            }],
+            "max_tokens": 99,
+            "stream": false,
+            "stop_sequences": ["END"],
+            "metadata": {"user_id": "drop-me"},
+            "thinking": {"type": "enabled", "budget_tokens": 1000}
+        });
+
+        let output = anthropic_to_openai_chat_request(&input);
+
+        assert_eq!(output["model"], "fireworks/llama");
+        assert_eq!(
+            output["messages"][0],
+            json!({"role": "system", "content": "Be terse"})
+        );
+        assert_eq!(output["messages"][1]["role"], "user");
+        assert_eq!(
+            output["messages"][1]["content"][0],
+            json!({"type": "text", "text": "Look"})
+        );
+        assert_eq!(
+            output["messages"][1]["content"][1],
+            json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}})
+        );
+        assert_eq!(output["stop"], json!(["END"]));
+        assert_eq!(output["reasoning_effort"], "high");
+        assert_eq!(output.get("metadata"), None);
+    }
+
+    #[test]
+    fn converts_anthropic_tools_and_tool_choice_to_openai() {
+        let tools = json!([{
+            "name": "lookup",
+            "description": "Lookup weather",
+            "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+        }]);
+
+        let output = anthropic_tools_to_openai_tools(&tools);
+
+        assert_eq!(output[0]["type"], "function");
+        assert_eq!(output[0]["function"]["name"], "lookup");
+        assert_eq!(output[0]["function"]["parameters"]["type"], "object");
+        assert_eq!(
+            anthropic_tool_choice_to_openai_tool_choice(&json!("any")),
+            "required"
+        );
+        assert_eq!(
+            anthropic_tool_choice_to_openai_tool_choice(&json!({"type": "tool", "name": "lookup"})),
+            json!({"type": "function", "function": {"name": "lookup"}})
+        );
+    }
+
+    #[test]
+    fn converts_anthropic_tool_blocks_to_openai_messages() {
+        let input = json!([{
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"city": "Paris"}}]
+        }, {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "sunny"}]}]
+        }]);
+
+        let output = anthropic_to_openai_messages(&input);
+
+        assert_eq!(output[0]["role"], "assistant");
+        assert_eq!(output[0]["content"], Value::Null);
+        assert_eq!(
+            output[0]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"Paris\"}"
+        );
+        assert_eq!(
+            output[1],
+            json!({"role": "tool", "tool_call_id": "toolu_1", "content": "sunny"})
+        );
+    }
+
+    #[test]
+    fn converts_openai_chat_response_to_anthropic_shape() {
+        let input = json!({
+            "id": "chatcmpl_1",
+            "model": "fireworks/llama",
+            "choices": [{
+                "message": {
+                    "content": "Hello",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{\"q\":\"rust\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4}
+        });
+
+        let output = openai_chat_to_anthropic_response(&input, "fallback-model");
+
+        assert_eq!(output["id"], "chatcmpl_1");
+        assert_eq!(output["model"], "fireworks/llama");
+        assert_eq!(
+            output["content"][0],
+            json!({"type": "text", "text": "Hello"})
+        );
+        assert_eq!(output["content"][1]["type"], "tool_use");
+        assert_eq!(output["content"][1]["input"]["q"], "rust");
+        assert_eq!(output["stop_reason"], "tool_use");
+        assert_eq!(
+            output["usage"],
+            json!({"input_tokens": 3, "output_tokens": 4})
         );
     }
 

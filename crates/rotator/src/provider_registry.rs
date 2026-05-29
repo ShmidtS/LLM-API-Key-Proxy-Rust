@@ -1,5 +1,7 @@
+use crate::model_filter::ModelFilterEngine;
 use dashmap::DashMap;
 use regex::Regex;
+use serde_json::Value;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7,6 +9,12 @@ pub enum AuthType {
     ApiKey,
     OAuth,
     Bearer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderAction {
+    Chat,
+    Embeddings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,8 +38,7 @@ pub struct ProviderDefinition {
 pub struct ProviderRegistry {
     providers: DashMap<String, ProviderDefinition>,
     provider_models: HashMap<String, Vec<String>>,
-    allowlist: Option<Vec<Regex>>,
-    denylist: Option<Vec<Regex>>,
+    model_filter: ModelFilterEngine,
 }
 
 impl ProviderRegistry {
@@ -39,8 +46,7 @@ impl ProviderRegistry {
         let registry = Self {
             providers: DashMap::new(),
             provider_models: parse_provider_models_env(),
-            allowlist: None,
-            denylist: None,
+            model_filter: ModelFilterEngine::default(),
         };
         for provider in default_provider_definitions() {
             registry.register(provider);
@@ -63,28 +69,44 @@ impl ProviderRegistry {
     /// Load provider definitions from environment variables.
     /// Variables are expected in the form:
     ///   PROXY_<PROVIDER>_URL=https://...
+    ///   <PROVIDER>_API_BASE=https://...
     ///   PROXY_<PROVIDER>_AUTH=api_key|bearer|oauth
     ///   PROXY_<PROVIDER>_MODELS=pattern1,pattern2
     ///   PROXY_<PROVIDER>_TIMEOUT=60
     /// If a variable is set for a provider already in the default registry, it overrides the default.
     pub fn load_from_env(&mut self) {
-        self.allowlist = parse_model_filter_env("MODEL_ALLOWLIST");
-        self.denylist = parse_model_filter_env("MODEL_DENYLIST");
-
-        for (key, base_url) in std::env::vars() {
-            let Some(provider_key) = key
+        let mut provider_keys: Vec<String> = self
+            .providers
+            .iter()
+            .map(|entry| provider_env_key(entry.key()))
+            .collect();
+        for (key, _) in std::env::vars() {
+            if let Some(provider_key) = key
                 .strip_prefix("PROXY_")
                 .and_then(|key| key.strip_suffix("_URL"))
+            {
+                provider_keys.push(provider_key.to_owned());
+            } else if let Some(provider_key) = key.strip_suffix("_API_BASE") {
+                provider_keys.push(provider_key.to_owned());
+            }
+        }
+        provider_keys.sort();
+        provider_keys.dedup();
+
+        for provider_key in provider_keys {
+            let id = provider_key.to_ascii_lowercase();
+            let Some(base_url) = std::env::var(format!("PROXY_{provider_key}_URL"))
+                .ok()
+                .or_else(|| std::env::var(format!("{provider_key}_API_BASE")).ok())
+                .or_else(|| self.get(&id).map(|def| def.base_url))
             else {
                 continue;
             };
-
-            let id = provider_key.to_ascii_lowercase();
             let auth_type = std::env::var(format!("PROXY_{provider_key}_AUTH"))
                 .ok()
                 .and_then(|auth| parse_auth_type(&auth))
                 .or_else(|| self.get(&id).map(|def| def.auth_type))
-                .unwrap_or(AuthType::ApiKey);
+                .unwrap_or(AuthType::Bearer);
             let model_patterns = std::env::var(format!("PROXY_{provider_key}_MODELS"))
                 .ok()
                 .map(|models| {
@@ -151,6 +173,13 @@ impl ProviderRegistry {
                 client_secret,
             });
         }
+
+        let provider_ids: Vec<String> = self
+            .providers
+            .iter()
+            .map(|entry| entry.key().to_owned())
+            .collect();
+        self.model_filter = ModelFilterEngine::from_env(provider_ids.iter().map(String::as_str));
     }
 
     pub fn all_providers(&self) -> Vec<ProviderDefinition> {
@@ -169,6 +198,29 @@ impl ProviderRegistry {
 
     pub fn get_provider_features(&self, id: &str) -> Option<Vec<String>> {
         self.get(id).map(|def| def.features)
+    }
+
+    pub fn get_static_models(&self, id: &str) -> Vec<String> {
+        static_provider_models(id)
+            .iter()
+            .map(|model| (*model).to_owned())
+            .collect()
+    }
+
+    pub fn resolve_endpoint_path(&self, provider: &str, path: &str, body: &Value) -> String {
+        match (provider, provider_action(path)) {
+            ("gemini", Some(ProviderAction::Chat)) => body
+                .get("model")
+                .and_then(Value::as_str)
+                .map(|model| format!("{model}:generateContent"))
+                .unwrap_or_else(|| path.trim_start_matches('/').to_owned()),
+            ("gemini", Some(ProviderAction::Embeddings)) => body
+                .get("model")
+                .and_then(Value::as_str)
+                .map(|model| format!("{model}:embedContent"))
+                .unwrap_or_else(|| path.trim_start_matches('/').to_owned()),
+            _ => path.trim_start_matches('/').to_owned(),
+        }
     }
 
     pub fn get_provider_catalog(&self) -> Vec<ProviderDefinition> {
@@ -199,32 +251,16 @@ impl ProviderRegistry {
     }
 
     pub fn is_model_allowed(&self, model: &str) -> bool {
-        if let Some(allowlist) = &self.allowlist
-            && !allowlist.iter().any(|regex| regex.is_match(model))
-        {
-            return false;
-        }
+        self.is_provider_model_allowed(None, model)
+    }
 
-        if let Some(denylist) = &self.denylist
-            && denylist.iter().any(|regex| regex.is_match(model))
-        {
-            return false;
-        }
-
-        true
+    pub fn is_provider_model_allowed(&self, provider: Option<&str>, model: &str) -> bool {
+        self.model_filter.is_allowed(provider, model)
     }
 }
 
-fn parse_model_filter_env(key: &str) -> Option<Vec<Regex>> {
-    std::env::var(key).ok().and_then(|value| {
-        let patterns: Vec<_> = value
-            .split(',')
-            .map(str::trim)
-            .filter(|pattern| !pattern.is_empty())
-            .filter_map(|pattern| Regex::new(pattern).ok())
-            .collect();
-        (!patterns.is_empty()).then_some(patterns)
-    })
+fn provider_env_key(id: &str) -> String {
+    id.to_ascii_uppercase().replace('-', "_")
 }
 
 fn parse_csv_list(value: &str) -> Vec<String> {
@@ -234,6 +270,14 @@ fn parse_csv_list(value: &str) -> Vec<String> {
         .filter(|entry| !entry.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn provider_action(path: &str) -> Option<ProviderAction> {
+    match path.trim_start_matches('/') {
+        "chat/completions" | "messages" => Some(ProviderAction::Chat),
+        "embeddings" => Some(ProviderAction::Embeddings),
+        _ => None,
+    }
 }
 
 fn parse_provider_models_env() -> HashMap<String, Vec<String>> {
@@ -256,6 +300,60 @@ fn parse_provider_models_env() -> HashMap<String, Vec<String>> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn static_provider_models(id: &str) -> &'static [&'static str] {
+    match id {
+        "openai" => &[
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4.1",
+            "gpt-4.1-mini",
+            "o3-mini",
+            "text-embedding-3-small",
+            "dall-e-3",
+        ],
+        "gemini" => &[
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-pro",
+        ],
+        "gemini_cli" => &["gemini_cli/gemini-2.5-pro", "gemini_cli/gemini-2.5-flash"],
+        "anthropic" => &[
+            "claude-opus-4-1-20250805",
+            "claude-sonnet-4-20250514",
+            "claude-3-7-sonnet-20250219",
+            "claude-3-5-haiku-20241022",
+        ],
+        "fireworks" => &[
+            "accounts/fireworks/models/llama-v3p1-405b-instruct",
+            "accounts/fireworks/models/llama-v3p1-70b-instruct",
+            "accounts/fireworks/models/deepseek-r1",
+        ],
+        "nvidia" => &[
+            "nvidia/llama-3.1-nemotron-70b-instruct",
+            "meta/llama-3.1-405b-instruct",
+        ],
+        "qwen" => &["qwen-plus", "qwen-max", "qwen-turbo", "qwq-plus"],
+        "qwen_code" => &["qwen_code/qwen3-coder-plus", "qwen3-coder-plus"],
+        "zai" => &["glm-4.5", "glm-4.5-air", "zai/glm-4.5"],
+        "iflow" => &["iflow/Qwen3-Coder", "kimi-k2", "Qwen3-Coder"],
+        "colin" => &["colin/claude-sonnet-4", "colin/claude-3-7-sonnet"],
+        "elysiver" => &["elysiver/claude-sonnet-4", "elysiver/gpt-4o"],
+        "chutes" => &["chutes/deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-R1"],
+        "nanogpt" => &["nanogpt/gpt-4o", "nano-gpt/claude-sonnet-4"],
+        "opencode" => &["opencode/zen", "zen/gpt-4o"],
+        "firmware" => &["firmware/gpt-4o", "fw/claude-sonnet-4"],
+        "antigravity" => &["antigravity/gemini-2.5-pro", "ag/gemini-2.5-flash"],
+        "openrouter" => &[
+            "openrouter/openai/gpt-4o",
+            "openrouter/anthropic/claude-sonnet-4",
+        ],
+        "xai" => &["grok-4", "grok-3", "xai/grok-3-mini"],
+        "kilocode" => &["kilocode/claude-sonnet-4", "kilocode/gpt-4o"],
+        _ => &[],
+    }
 }
 
 fn prefix_provider_for_model(model: &str) -> Option<&'static str> {
@@ -303,6 +401,7 @@ fn default_provider_definitions() -> Vec<ProviderDefinition> {
             AuthType::Bearer,
             &[
                 r"^(gpt|o1|o3|o4)([-/].*)?$",
+                r"^openai/.*",
                 r"^text-embedding-.*",
                 r"^dall-e-.*",
             ],
@@ -332,8 +431,8 @@ fn default_provider_definitions() -> Vec<ProviderDefinition> {
         provider(
             "anthropic",
             "https://api.anthropic.com/v1",
-            AuthType::ApiKey,
-            &[r"^claude[-/].*"],
+            AuthType::Bearer,
+            &[r"^claude[-/].*", r"^anthropic/.*"],
             60,
             &[("anthropic-version", "2023-06-01")],
         ),
@@ -547,6 +646,9 @@ fn provider_features(id: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn default_registry_resolves_provider_base_url() {
@@ -556,6 +658,16 @@ mod tests {
             registry.resolve_base_url("openai").as_deref(),
             Some("https://api.openai.com/v1")
         );
+    }
+
+    #[test]
+    fn default_registry_uses_bearer_auth_for_anthropic() {
+        let registry = ProviderRegistry::new();
+        let provider = registry
+            .get("anthropic")
+            .expect("anthropic provider exists");
+
+        assert_eq!(provider.auth_type, AuthType::Bearer);
     }
 
     #[test]
@@ -625,7 +737,38 @@ mod tests {
     }
 
     #[test]
+    fn gemini_endpoint_paths_include_model_action_suffixes() {
+        let registry = ProviderRegistry::new();
+
+        assert_eq!(
+            registry.resolve_endpoint_path(
+                "gemini",
+                "chat/completions",
+                &serde_json::json!({"model": "models/gemini-2.5-flash"})
+            ),
+            "models/gemini-2.5-flash:generateContent"
+        );
+        assert_eq!(
+            registry.resolve_endpoint_path(
+                "gemini",
+                "embeddings",
+                &serde_json::json!({"model": "models/gemini-embedding-001"})
+            ),
+            "models/gemini-embedding-001:embedContent"
+        );
+        assert_eq!(
+            registry.resolve_endpoint_path(
+                "openai",
+                "chat/completions",
+                &serde_json::json!({"model": "gpt-4o-mini"})
+            ),
+            "chat/completions"
+        );
+    }
+
+    #[test]
     fn resolve_provider_by_model_uses_env_overrides_before_prefix_fallback() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var(
                 "PROVIDER_MODELS",
@@ -657,6 +800,7 @@ mod tests {
 
     #[test]
     fn load_from_env_overrides_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("PROXY_OPENAI_URL", "https://override.example/v1");
             std::env::set_var("PROXY_OPENAI_AUTH", "bearer");
@@ -685,7 +829,69 @@ mod tests {
     }
 
     #[test]
+    fn load_from_env_uses_api_base_when_proxy_url_is_absent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("PROXY_DEEPSEEK_URL");
+            std::env::set_var("DEEPSEEK_API_BASE", "https://deepseek.example/v1");
+        }
+
+        let mut registry = ProviderRegistry::new();
+        registry.load_from_env();
+
+        let provider = registry.get("deepseek").expect("deepseek provider exists");
+        assert_eq!(provider.base_url, "https://deepseek.example/v1");
+        assert_eq!(provider.auth_type, AuthType::Bearer);
+
+        unsafe {
+            std::env::remove_var("DEEPSEEK_API_BASE");
+        }
+    }
+
+    #[test]
+    fn load_from_env_keeps_default_registry_auth_types() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("PROXY_GEMINI_URL", "https://gemini.override/v1beta");
+            std::env::set_var("PROXY_ANTHROPIC_URL", "https://anthropic.override/v1");
+            std::env::set_var("PROXY_OPENAI_URL", "https://openai.override/v1");
+        }
+
+        let mut registry = ProviderRegistry::new();
+        registry.load_from_env();
+
+        assert_eq!(
+            registry
+                .get("gemini")
+                .expect("gemini provider exists")
+                .auth_type,
+            AuthType::ApiKey
+        );
+        assert_eq!(
+            registry
+                .get("anthropic")
+                .expect("anthropic provider exists")
+                .auth_type,
+            AuthType::Bearer
+        );
+        assert_eq!(
+            registry
+                .get("openai")
+                .expect("openai provider exists")
+                .auth_type,
+            AuthType::Bearer
+        );
+
+        unsafe {
+            std::env::remove_var("PROXY_GEMINI_URL");
+            std::env::remove_var("PROXY_ANTHROPIC_URL");
+            std::env::remove_var("PROXY_OPENAI_URL");
+        }
+    }
+
+    #[test]
     fn model_filters_require_allowlist_match_before_denylist() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("MODEL_ALLOWLIST", "^gpt-4.*,^claude-.*");
             std::env::set_var("MODEL_DENYLIST", "gpt-4-vision.*,claude-2.*");

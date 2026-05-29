@@ -1,11 +1,15 @@
+use crate::compat::anthropic::{
+    anthropic_to_openai_chat_request, openai_chat_to_anthropic_response,
+};
 use crate::errors::AppError;
+use crate::routes::utils::normalize_model_in_body;
 use crate::state::AppState;
 use axum::body::Body;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::{Router, extract::State, response::Json, routing::post};
 use futures::StreamExt;
-use models::anthropic::{AnthropicCountTokensRequest, AnthropicMessagesRequest};
+use models::anthropic::AnthropicCountTokensRequest;
 use serde_json::Value;
 
 pub fn router() -> Router<AppState> {
@@ -16,12 +20,46 @@ pub fn router() -> Router<AppState> {
 
 async fn create_message(
     State(state): State<AppState>,
-    Json(req): Json<AnthropicMessagesRequest>,
+    Json(mut body): Json<Value>,
 ) -> Result<Response, AppError> {
-    let body = serde_json::to_value(&req)?;
+    let stream = body.get("stream").and_then(Value::as_bool) == Some(true);
+    let provider = resolve_anthropic_provider_for_body(&state, &body);
+    normalize_model_in_body(&mut body, &provider);
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
 
-    if req.stream == Some(true) {
-        let upstream = state.rotator.request("anthropic", "messages", body).await?;
+    let is_native_anthropic = provider == "anthropic";
+    let upstream_path = if is_native_anthropic {
+        "messages"
+    } else {
+        "chat/completions"
+    };
+    let upstream_body = if is_native_anthropic {
+        body
+    } else {
+        anthropic_to_openai_chat_request(&body)
+    };
+
+    if stream {
+        tracing::info!(
+            method = "POST",
+            provider = %provider,
+            model = %model,
+            upstream_path = upstream_path,
+            "forwarding anthropic message request"
+        );
+        let upstream = state
+            .rotator
+            .request(&provider, upstream_path, upstream_body)
+            .await?;
+        tracing::info!(
+            provider = %provider,
+            status = %upstream.status(),
+            "upstream anthropic message response"
+        );
         let status = upstream.status();
         let headers = upstream.headers().clone();
         let stream = upstream
@@ -34,11 +72,31 @@ async fn create_message(
         return Ok(builder.body(Body::from_stream(stream)).unwrap());
     }
 
-    let resp = state.rotator.request("anthropic", "messages", body).await?;
+    tracing::info!(
+        method = "POST",
+        provider = %provider,
+        model = %model,
+        upstream_path = upstream_path,
+        "forwarding anthropic message request"
+    );
+    let resp = state
+        .rotator
+        .request(&provider, upstream_path, upstream_body)
+        .await?;
+    tracing::info!(
+        provider = %provider,
+        status = %resp.status(),
+        "upstream anthropic message response"
+    );
     let data: Value = resp
         .json()
         .await
         .map_err(|e| rotator::RotatorError::Http(e.to_string()))?;
+    let data = if is_native_anthropic {
+        data
+    } else {
+        openai_chat_to_anthropic_response(&data, &model)
+    };
     Ok(Json(data).into_response())
 }
 
@@ -46,15 +104,47 @@ async fn count_tokens(
     State(state): State<AppState>,
     Json(req): Json<AnthropicCountTokensRequest>,
 ) -> Result<Json<Value>, AppError> {
-    let body = serde_json::to_value(&req)?;
+    let mut body = serde_json::to_value(&req)?;
+    let provider = resolve_anthropic_provider_for_body(&state, &body);
+    normalize_model_in_body(&mut body, &provider);
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
 
+    tracing::info!(
+        method = "POST",
+        provider = %provider,
+        model = %model,
+        upstream_path = "messages/count_tokens",
+        "forwarding anthropic count tokens request"
+    );
     let resp = state
         .rotator
-        .request("anthropic", "messages/count_tokens", body)
+        .request(&provider, "messages/count_tokens", body)
         .await?;
+    tracing::info!(
+        provider = %provider,
+        status = %resp.status(),
+        "upstream anthropic count tokens response"
+    );
     let data = resp
         .json()
         .await
         .map_err(|e| rotator::RotatorError::Http(e.to_string()))?;
     Ok(Json(data))
+}
+
+fn resolve_anthropic_provider_for_body(state: &AppState, body: &Value) -> String {
+    body.get("model")
+        .and_then(Value::as_str)
+        .and_then(|model| {
+            state
+                .registry
+                .resolve_provider_by_model(model)
+                .map(ToOwned::to_owned)
+                .or_else(|| state.registry.find_provider_for_model(model))
+        })
+        .unwrap_or_else(|| "anthropic".to_owned())
 }

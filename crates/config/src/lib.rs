@@ -2,7 +2,11 @@ pub mod proxy;
 
 pub use proxy::ProxyConfig;
 
-use std::{env, path::Path, str::FromStr};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -16,8 +20,10 @@ pub enum ConfigError {
 }
 
 pub fn load_from_env() -> Result<proxy::ProxyConfig, ConfigError> {
-    if Path::new(".env").exists() {
-        let _ = dotenvy::from_path(".env");
+    if let Some(path) = find_env_file()
+        && dotenvy::from_path(&path).is_ok()
+    {
+        tracing::info!(path = %path.display(), "loaded .env file");
     }
 
     let cfg = external_config::Config::builder()
@@ -51,6 +57,14 @@ pub fn load_from_env() -> Result<proxy::ProxyConfig, ConfigError> {
     apply_vec_env("CORS_ALLOWED_HEADERS", &mut config.cors_allowed_headers);
     apply_vec_env("CORS_ALLOWED_METHODS", &mut config.cors_allowed_methods);
     apply_env("REQUEST_TIMEOUT_SECS", &mut config.request_timeout_secs)?;
+    apply_env(
+        "TIMEOUT_READ_NON_STREAMING",
+        &mut config.timeout_read_non_streaming_secs,
+    )?;
+    apply_env(
+        "TIMEOUT_READ_STREAMING",
+        &mut config.timeout_read_streaming_secs,
+    )?;
     apply_env("MAX_BODY_BYTES", &mut config.max_body_bytes)?;
     apply_env("USAGE_PATH", &mut config.usage_path)?;
     apply_env(
@@ -71,6 +85,43 @@ pub fn load_from_env() -> Result<proxy::ProxyConfig, ConfigError> {
     apply_optional_string_env("HTTP_DNS_RESOLVER", &mut config.http_dns_resolver);
 
     Ok(config)
+}
+
+pub fn find_env_file() -> Option<PathBuf> {
+    env_file_candidates().into_iter().find(|path| path.exists())
+}
+
+fn env_file_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    candidates.push(PathBuf::from(".env"));
+
+    if let Ok(exe_path) = env::current_exe()
+        && let Some(exe_dir) = exe_path.parent()
+    {
+        candidates.push(exe_dir.join(".env"));
+    }
+
+    if let Ok(current_dir) = env::current_dir()
+        && let Some(workspace_root) = find_workspace_root(&current_dir)
+    {
+        candidates.push(workspace_root.join(".env"));
+    }
+    if let Ok(exe_path) = env::current_exe()
+        && let Some(exe_dir) = exe_path.parent()
+        && let Some(workspace_root) = find_workspace_root(exe_dir)
+    {
+        candidates.push(workspace_root.join(".env"));
+    }
+
+    candidates
+}
+
+fn find_workspace_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .filter(|dir| dir.join("Cargo.toml").exists())
+        .last()
+        .map(Path::to_path_buf)
 }
 
 fn trim_quotes(value: &str) -> &str {
@@ -130,6 +181,9 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var("ADMIN_TOKEN");
+            std::env::remove_var("PROXY__REQUEST_TIMEOUT_SECS");
+            std::env::remove_var("TIMEOUT_READ_NON_STREAMING");
+            std::env::remove_var("TIMEOUT_READ_STREAMING");
             std::env::set_var("PROXY__ADMIN_TOKEN", "test");
         }
 
@@ -139,6 +193,26 @@ mod tests {
 
         unsafe {
             std::env::remove_var("PROXY__ADMIN_TOKEN");
+        }
+    }
+
+    #[test]
+    fn load_from_env_reads_python_timeout_aliases() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("PROXY__REQUEST_TIMEOUT_SECS");
+            std::env::set_var("TIMEOUT_READ_NON_STREAMING", "45");
+            std::env::set_var("TIMEOUT_READ_STREAMING", "300");
+        }
+
+        let config = load_from_env().unwrap();
+
+        assert_eq!(config.timeout_read_non_streaming_secs, 45);
+        assert_eq!(config.timeout_read_streaming_secs, 300);
+
+        unsafe {
+            std::env::remove_var("TIMEOUT_READ_NON_STREAMING");
+            std::env::remove_var("TIMEOUT_READ_STREAMING");
         }
     }
 }
