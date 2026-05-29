@@ -130,9 +130,9 @@ pub struct ProxyConfig {
     pub cors_allowed_methods: Vec<String>,
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
-    #[serde(default = "default_request_timeout_secs")]
+    #[serde(default = "default_timeout_read_non_streaming_secs")]
     pub timeout_read_non_streaming_secs: u64,
-    #[serde(default = "default_request_timeout_secs")]
+    #[serde(default = "default_timeout_read_streaming_secs")]
     pub timeout_read_streaming_secs: u64,
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
@@ -181,8 +181,8 @@ impl Default for ProxyConfig {
             cors_allowed_headers: default_cors_allowed_headers(),
             cors_allowed_methods: default_cors_allowed_methods(),
             request_timeout_secs: default_request_timeout_secs(),
-            timeout_read_non_streaming_secs: default_request_timeout_secs(),
-            timeout_read_streaming_secs: default_request_timeout_secs(),
+            timeout_read_non_streaming_secs: default_timeout_read_non_streaming_secs(),
+            timeout_read_streaming_secs: default_timeout_read_streaming_secs(),
             max_body_bytes: default_max_body_bytes(),
             usage_path: default_usage_path(),
             usage_flush_interval_secs: default_usage_flush_interval_secs(),
@@ -250,7 +250,13 @@ fn default_cors_allowed_methods() -> Vec<String> {
     Vec::new()
 }
 fn default_request_timeout_secs() -> u64 {
-    30
+    600
+}
+fn default_timeout_read_non_streaming_secs() -> u64 {
+    120
+}
+fn default_timeout_read_streaming_secs() -> u64 {
+    300
 }
 fn default_max_body_bytes() -> usize {
     10 * 1024 * 1024
@@ -303,9 +309,9 @@ mod tests {
         assert!(config.cors_allowed_origins.is_empty());
         assert!(config.cors_allowed_headers.is_empty());
         assert!(config.cors_allowed_methods.is_empty());
-        assert_eq!(config.request_timeout_secs, 30);
-        assert_eq!(config.timeout_read_non_streaming_secs, 30);
-        assert_eq!(config.timeout_read_streaming_secs, 30);
+        assert_eq!(config.request_timeout_secs, 600);
+        assert_eq!(config.timeout_read_non_streaming_secs, 120);
+        assert_eq!(config.timeout_read_streaming_secs, 300);
         assert_eq!(config.max_body_bytes, 10 * 1024 * 1024);
         assert_eq!(config.usage_path, "usage.json");
         assert_eq!(config.usage_flush_interval_secs, 60);

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +127,9 @@ pub struct AnthropicContentBlock {
     #[serde(rename = "type")]
     pub block_type: String,
     pub text: Option<String>,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub input: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -133,6 +137,8 @@ pub struct AnthropicContentBlock {
 pub enum AnthropicContentDelta {
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
+    #[serde(rename = "input_json_delta")]
+    InputJsonDelta { partial_json: String },
     #[serde(other)]
     Other,
 }
@@ -195,6 +201,9 @@ pub fn anthropic_content_block_start_event(index: u64, text: Option<&str>) -> An
         content_block: AnthropicContentBlock {
             block_type: "text".to_owned(),
             text: text.map(str::to_owned),
+            id: None,
+            name: None,
+            input: None,
         },
     }
 }
@@ -307,6 +316,49 @@ pub fn openai_message_delta_chunk(model: &str, stop_reason: Option<&str>) -> Ope
     )
 }
 
+pub fn openai_tool_call_start_chunk(
+    model: &str,
+    index: u64,
+    id: Option<&str>,
+    name: Option<&str>,
+    arguments: String,
+) -> OpenAiStreamChunk {
+    openai_stream_chunk(
+        None,
+        model,
+        serde_json::json!({
+            "tool_calls": [{
+                "index": index,
+                "id": id.unwrap_or_default(),
+                "type": "function",
+                "function": {
+                    "name": name.unwrap_or_default(),
+                    "arguments": arguments,
+                }
+            }]
+        }),
+        Value::Null,
+    )
+}
+
+pub fn openai_tool_call_delta_chunk(
+    model: &str,
+    index: u64,
+    arguments: String,
+) -> OpenAiStreamChunk {
+    openai_stream_chunk(
+        None,
+        model,
+        serde_json::json!({
+            "tool_calls": [{
+                "index": index,
+                "function": {"arguments": arguments}
+            }]
+        }),
+        Value::Null,
+    )
+}
+
 pub fn openai_sse_event(chunk: &OpenAiStreamChunk) -> String {
     format!(
         "data: {}\n\n",
@@ -316,6 +368,176 @@ pub fn openai_sse_event(chunk: &OpenAiStreamChunk) -> String {
 
 pub fn openai_done_event() -> String {
     "data: [DONE]\n\n".to_owned()
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenAiToAnthropicStreamTranslator {
+    model: String,
+    current_id: Option<String>,
+    started: bool,
+    stopped: bool,
+    next_content_index: u64,
+    text_index: Option<u64>,
+    tool_indices: HashMap<u64, u64>,
+    open_blocks: HashSet<u64>,
+}
+
+impl OpenAiToAnthropicStreamTranslator {
+    pub fn new(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            current_id: None,
+            started: false,
+            stopped: false,
+            next_content_index: 0,
+            text_index: None,
+            tool_indices: HashMap::new(),
+            open_blocks: HashSet::new(),
+        }
+    }
+
+    pub fn translate_sse_record_to_sse(&mut self, record: &SseRecord) -> Vec<String> {
+        if record.data == "[DONE]" {
+            return self.stop_events();
+        }
+
+        let Ok(value) = serde_json::from_str::<Value>(&record.data) else {
+            return Vec::new();
+        };
+        self.translate_chunk_to_sse(&value)
+    }
+
+    fn translate_chunk_to_sse(&mut self, chunk: &Value) -> Vec<String> {
+        let mut events = Vec::new();
+        if !self.started {
+            self.started = true;
+            self.current_id = chunk.get("id").and_then(Value::as_str).map(str::to_owned);
+            events.push(anthropic_sse_event(&anthropic_message_start_event(
+                self.current_id.as_deref(),
+                Some(&self.model),
+                None,
+            )));
+        }
+
+        let delta = chunk.pointer("/choices/0/delta").unwrap_or(&Value::Null);
+        if let Some(text) = delta.get("content").and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            let index = self.ensure_text_block(&mut events);
+            events.push(anthropic_sse_event(&anthropic_text_delta_event(
+                Some(index),
+                text,
+            )));
+        }
+
+        if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            for tool_call in tool_calls {
+                self.translate_tool_call_delta(tool_call, &mut events);
+            }
+        }
+
+        if let Some(finish_reason) = chunk
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+        {
+            events.extend(self.finish_events(finish_reason));
+        }
+
+        events
+    }
+
+    fn ensure_text_block(&mut self, events: &mut Vec<String>) -> u64 {
+        if let Some(index) = self.text_index {
+            return index;
+        }
+        let index = self.next_index();
+        self.text_index = Some(index);
+        self.open_blocks.insert(index);
+        events.push(anthropic_sse_event(&anthropic_content_block_start_event(
+            index, None,
+        )));
+        index
+    }
+
+    fn translate_tool_call_delta(&mut self, tool_call: &Value, events: &mut Vec<String>) {
+        let openai_index = tool_call.get("index").and_then(Value::as_u64).unwrap_or(0);
+        let index = if let Some(index) = self.tool_indices.get(&openai_index).copied() {
+            index
+        } else {
+            let index = self.next_index();
+            self.tool_indices.insert(openai_index, index);
+            self.open_blocks.insert(index);
+            events.push(anthropic_sse_event(&AnthropicSseEvent::ContentBlockStart {
+                index,
+                content_block: AnthropicContentBlock {
+                    block_type: "tool_use".to_owned(),
+                    text: None,
+                    id: tool_call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    name: tool_call
+                        .pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    input: Some(serde_json::json!({})),
+                },
+            }));
+            index
+        };
+
+        if let Some(arguments) = tool_call
+            .pointer("/function/arguments")
+            .and_then(Value::as_str)
+            && !arguments.is_empty()
+        {
+            events.push(anthropic_sse_event(&AnthropicSseEvent::ContentBlockDelta {
+                index: Some(index),
+                delta: AnthropicContentDelta::InputJsonDelta {
+                    partial_json: arguments.to_owned(),
+                },
+            }));
+        }
+    }
+
+    fn finish_events(&mut self, finish_reason: &str) -> Vec<String> {
+        let mut events = Vec::new();
+        let mut open_blocks = self.open_blocks.iter().copied().collect::<Vec<_>>();
+        open_blocks.sort_unstable();
+        for index in open_blocks {
+            events.push(anthropic_sse_event(&anthropic_content_block_stop_event(
+                index,
+            )));
+        }
+        self.open_blocks.clear();
+        events.push(anthropic_sse_event(&anthropic_message_delta_event(Some(
+            openai_finish_reason_to_anthropic(finish_reason),
+        ))));
+        events
+    }
+
+    fn stop_events(&mut self) -> Vec<String> {
+        if self.stopped {
+            return Vec::new();
+        }
+        self.stopped = true;
+        vec![anthropic_sse_event(&anthropic_message_stop_event())]
+    }
+
+    fn next_index(&mut self) -> u64 {
+        let index = self.next_content_index;
+        self.next_content_index += 1;
+        index
+    }
+}
+
+fn openai_finish_reason_to_anthropic(reason: &str) -> &str {
+    match reason {
+        "length" => "max_tokens",
+        "tool_calls" => "tool_use",
+        "stop" => "end_turn",
+        other => other,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -400,15 +622,37 @@ impl AnthropicStreamTranslator {
                     self.model(),
                 )]
             }
-            AnthropicSseEvent::ContentBlockStart { content_block, .. } => {
-                content_block.text.map_or_else(Vec::new, |text| {
+            AnthropicSseEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => match content_block.block_type.as_str() {
+                "text" => content_block.text.map_or_else(Vec::new, |text| {
                     vec![openai_text_delta_chunk(self.model(), &text)]
-                })
-            }
+                }),
+                "tool_use" => vec![openai_tool_call_start_chunk(
+                    self.model(),
+                    index,
+                    content_block.id.as_deref(),
+                    content_block.name.as_deref(),
+                    content_block
+                        .input
+                        .map(|input| input.to_string())
+                        .unwrap_or_default(),
+                )],
+                _ => Vec::new(),
+            },
             AnthropicSseEvent::ContentBlockDelta {
                 delta: AnthropicContentDelta::TextDelta { text },
                 ..
             } => vec![openai_text_delta_chunk(self.model(), &text)],
+            AnthropicSseEvent::ContentBlockDelta {
+                index,
+                delta: AnthropicContentDelta::InputJsonDelta { partial_json },
+            } => vec![openai_tool_call_delta_chunk(
+                self.model(),
+                index.unwrap_or(0),
+                partial_json,
+            )],
             AnthropicSseEvent::ContentBlockDelta {
                 delta: AnthropicContentDelta::Other,
                 ..

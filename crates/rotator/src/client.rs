@@ -144,8 +144,11 @@ impl RotatorClient {
             match result {
                 Ok(resp) if resp.status().is_success() => {
                     self.circuit_breakers.record_success(provider);
+                    if stream {
+                        return Ok(resp);
+                    }
                     return self
-                        .record_usage_from_response(provider, permit.key(), resp, stream)
+                        .record_usage_from_response(provider, permit.key(), resp)
                         .await;
                 }
                 Ok(resp) if resp.status().as_u16() == 429 => {
@@ -340,7 +343,7 @@ impl RotatorClient {
                 Ok(resp) if resp.status().is_success() => {
                     self.circuit_breakers.record_success(provider);
                     return self
-                        .record_usage_from_response(provider, permit.key(), resp, false)
+                        .record_usage_from_response(provider, permit.key(), resp)
                         .await;
                 }
                 Ok(resp) if resp.status().as_u16() == 429 => {
@@ -607,7 +610,6 @@ impl RotatorClient {
         provider: &str,
         key: &str,
         resp: reqwest::Response,
-        stream: bool,
     ) -> Result<reqwest::Response> {
         let Some(usage_manager) = &self.usage_manager else {
             return Ok(resp);
@@ -621,23 +623,7 @@ impl RotatorClient {
             .await
             .map_err(|e| RotatorError::Http(e.to_string()))?;
 
-        let usage_json = if stream {
-            let text = String::from_utf8_lossy(&bytes);
-            let mut usage_json = None;
-            for line in text.lines() {
-                let Some(data) = line.strip_prefix("data: ") else {
-                    continue;
-                };
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data)
-                    && json.get("usage").is_some()
-                {
-                    usage_json = Some(json);
-                }
-            }
-            usage_json
-        } else {
-            serde_json::from_slice::<serde_json::Value>(&bytes).ok()
-        };
+        let usage_json = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
 
         if let Some(json) = usage_json {
             let (prompt, completion) = extract_usage(&json);
@@ -1043,18 +1029,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_records_streaming_usage_after_success() {
+    async fn request_returns_streaming_response_without_buffering_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 1024];
+            let _ = socket.read(&mut buffer).await;
+            let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n";
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket
+                .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            socket
+                .write_all(b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n")
+                .await
+                .unwrap();
+        });
+
+        let registry = Arc::new(ProviderRegistry::default());
+        registry.register(ProviderDefinition {
+            id: "test".to_string(),
+            display_name: "test".to_string(),
+            base_url: format!("http://{addr}/v1"),
+            auth_type: AuthType::ApiKey,
+            model_patterns: Vec::new(),
+            endpoints: vec!["/chat/completions".to_string()],
+            features: vec!["chat".to_string()],
+            model_count: 1,
+            timeout_secs: 60,
+            default_headers: HashMap::new(),
+            token_endpoint: None,
+            client_id: None,
+            client_secret: None,
+        });
         let usage_manager = Arc::new(crate::UsageManager::with_config(
             std::env::temp_dir().join("rotator-openai-streaming-usage-test.json"),
             Duration::from_secs(60),
             100,
         ));
-        let (registry, _) = test_provider_with_body(
-            vec![200],
-            "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"id\":\"chatcmpl-1\",\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n"
-                .to_string(),
-        )
-        .await;
         let credentials = CredentialManager::new();
         credentials.register_keys("test".to_string(), vec!["key-1".to_string()], 1);
         let client = RotatorClient::new(
@@ -1068,19 +1083,20 @@ mod tests {
             0,
         );
 
-        let response = client
-            .request(
+        let response = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.request(
                 "test",
                 "chat/completions",
                 serde_json::json!({"stream": true}),
-            )
-            .await
-            .unwrap();
+            ),
+        )
+        .await
+        .expect("streaming response should return before upstream body completes")
+        .unwrap();
 
         assert_eq!(response.status(), 200);
-        let usage = usage_manager.get_usage("test", "key-1").unwrap();
-        assert_eq!(usage.prompt_tokens, 10);
-        assert_eq!(usage.completion_tokens, 5);
+        assert!(usage_manager.get_usage("test", "key-1").is_none());
         usage_manager.shutdown().await.unwrap();
     }
 

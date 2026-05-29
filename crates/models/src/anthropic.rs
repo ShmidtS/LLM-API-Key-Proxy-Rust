@@ -1,8 +1,15 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AnthropicCacheControl {
+    pub r#type: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnthropicTextBlock {
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<AnthropicCacheControl>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -15,6 +22,15 @@ pub struct AnthropicImageSource {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnthropicImageBlock {
     pub source: AnthropicImageSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<AnthropicCacheControl>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AnthropicDocumentBlock {
+    pub source: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<AnthropicCacheControl>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -22,12 +38,16 @@ pub struct AnthropicToolUseBlock {
     pub id: String,
     pub name: String,
     pub input: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<AnthropicCacheControl>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnthropicToolResultBlock {
     pub tool_use_id: String,
     pub content: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<AnthropicCacheControl>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -37,6 +57,8 @@ pub enum AnthropicContentBlock {
     Text(AnthropicTextBlock),
     #[serde(rename = "image")]
     Image(AnthropicImageBlock),
+    #[serde(rename = "document")]
+    Document(AnthropicDocumentBlock),
     #[serde(rename = "tool_use")]
     ToolUse(AnthropicToolUseBlock),
     #[serde(rename = "tool_result")]

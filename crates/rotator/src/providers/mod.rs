@@ -73,11 +73,32 @@ pub(crate) async fn list_data_models(
 }
 
 pub fn transform_request_for_provider(provider: &str, body: &mut serde_json::Value) {
+    sanitize_gpt5_request(body);
+
     match provider {
         "anthropic" => anthropic::AnthropicProvider::new().transform_request(body),
         "gemini" => gemini::GeminiProvider::new().transform_request(body),
         "nvidia" => nvidia::NvidiaProvider::new().transform_request(body),
         _ => {}
+    }
+}
+
+fn sanitize_gpt5_request(body: &mut serde_json::Value) {
+    let is_gpt5 = body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|model| model.starts_with("gpt-5"));
+    if !is_gpt5 {
+        return;
+    }
+
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+
+    object.remove("temperature");
+    if let Some(max_tokens) = object.remove("max_tokens") {
+        object.insert("max_completion_tokens".to_owned(), max_tokens);
     }
 }
 
@@ -260,5 +281,20 @@ mod tests {
         let provider = manager.get("test").expect("provider registered");
         assert_eq!(provider.id(), "test");
         assert_eq!(provider.base_url(), "https://test.example/v1");
+    }
+
+    #[test]
+    fn gpt5_transform_removes_temperature_and_renames_max_tokens() {
+        let mut body = serde_json::json!({
+            "model": "gpt-5.5",
+            "temperature": 0.2,
+            "max_tokens": 128
+        });
+
+        transform_request_for_provider("elysiver", &mut body);
+
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["max_completion_tokens"], 128);
     }
 }

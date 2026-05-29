@@ -208,6 +208,10 @@ impl ProviderRegistry {
     }
 
     pub fn resolve_endpoint_path(&self, provider: &str, path: &str, body: &Value) -> String {
+        if matches!(provider, "elysiver" | "colin") && path.trim_start_matches('/') == "chat/completions" {
+            return "responses".to_owned();
+        }
+
         match (provider, provider_action(path)) {
             ("gemini", Some(ProviderAction::Chat)) => body
                 .get("model")
@@ -340,7 +344,7 @@ fn static_provider_models(id: &str) -> &'static [&'static str] {
         "zai" => &["glm-4.5", "glm-4.5-air", "zai/glm-4.5"],
         "iflow" => &["iflow/Qwen3-Coder", "kimi-k2", "Qwen3-Coder"],
         "colin" => &["colin/claude-sonnet-4", "colin/claude-3-7-sonnet"],
-        "elysiver" => &["elysiver/claude-sonnet-4", "elysiver/gpt-4o"],
+        "elysiver" => &["elysiver/claude-sonnet-4", "elysiver/gpt-4o", "gpt-5.5"],
         "chutes" => &["chutes/deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-R1"],
         "nanogpt" => &["nanogpt/gpt-4o", "nano-gpt/claude-sonnet-4"],
         "opencode" => &["opencode/zen", "zen/gpt-4o"],
@@ -358,6 +362,7 @@ fn static_provider_models(id: &str) -> &'static [&'static str] {
 
 fn prefix_provider_for_model(model: &str) -> Option<&'static str> {
     [
+        ("gpt-5", "elysiver"),
         ("gpt-", "openai"),
         ("o1-", "openai"),
         ("o3-", "openai"),
@@ -502,7 +507,7 @@ fn default_provider_definitions() -> Vec<ProviderDefinition> {
             "elysiver",
             "https://elysiver.h-e.top/v1",
             AuthType::Bearer,
-            &[r"^elysiver/.*", r"^elysiver[-/].*"],
+            &[r"^elysiver/.*", r"^elysiver[-/].*", r"^gpt-5(?:[./-].*)?$"],
             60,
             &[],
         ),
@@ -734,6 +739,24 @@ mod tests {
                 .as_deref(),
             Some("anthropic")
         );
+        assert_eq!(
+            registry.find_provider_for_model("gpt-5.5").as_deref(),
+            Some("elysiver")
+        );
+    }
+
+    #[test]
+    fn elysiver_static_models_include_default_gpt5() {
+        let registry = ProviderRegistry::new();
+
+        assert!(registry.get_static_models("elysiver").contains(&"gpt-5.5".to_owned()));
+    }
+
+    #[test]
+    fn gpt5_prefix_resolves_to_elysiver_before_openai() {
+        let registry = ProviderRegistry::new();
+
+        assert_eq!(registry.resolve_provider_by_model("gpt-5.5"), Some("elysiver"));
     }
 
     #[test]
@@ -764,6 +787,22 @@ mod tests {
             ),
             "chat/completions"
         );
+    }
+
+    #[test]
+    fn elysiver_and_colin_chat_requests_use_responses_endpoint() {
+        let registry = ProviderRegistry::new();
+
+        for provider in ["elysiver", "colin"] {
+            assert_eq!(
+                registry.resolve_endpoint_path(
+                    provider,
+                    "chat/completions",
+                    &serde_json::json!({"model": "gpt-5.5"})
+                ),
+                "responses"
+            );
+        }
     }
 
     #[test]

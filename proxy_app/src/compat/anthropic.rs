@@ -30,13 +30,17 @@ pub fn anthropic_to_openai_chat_request(body: &Value) -> Value {
         output["tool_choice"] = anthropic_tool_choice_to_openai_tool_choice(tool_choice);
     }
     if body.pointer("/thinking/type").and_then(Value::as_str) == Some("enabled")
-        && body
+        && let Some(budget) = body
             .pointer("/thinking/budget_tokens")
             .and_then(Value::as_u64)
-            .unwrap_or(0)
-            > 0
+        && budget > 0
     {
-        output["reasoning_effort"] = Value::String("high".to_owned());
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        output["reasoning_effort"] =
+            Value::String(budget_to_reasoning_effort(budget, model).to_owned());
     }
 
     output
@@ -365,30 +369,43 @@ fn anthropic_blocks_to_openai_messages(role: &str, blocks: &[Value]) -> Vec<Valu
         return vec![tool_result];
     }
 
-    let tool_calls = anthropic_tool_use_calls(blocks);
-    if !tool_calls.is_empty() {
-        let mut message = json!({"role": "assistant", "content": Value::Null});
-        message["tool_calls"] = Value::Array(tool_calls);
-        return vec![message];
-    }
-
     let parts = blocks
         .iter()
         .filter_map(anthropic_content_block_to_openai_part)
         .collect::<Vec<_>>();
+    let tool_calls = anthropic_tool_use_calls(blocks);
+    if !tool_calls.is_empty() {
+        let content = if parts.is_empty() {
+            Value::Null
+        } else {
+            openai_content_from_parts(parts)
+        };
+        let mut message = json!({"role": "assistant", "content": content});
+        message["tool_calls"] = Value::Array(tool_calls);
+        return vec![message];
+    }
+
+    vec![json!({"role": role, "content": openai_content_from_parts(parts)})]
+}
+
+fn openai_content_from_parts(parts: Vec<Value>) -> Value {
+    if parts.is_empty() {
+        return Value::Null;
+    }
 
     if parts
         .iter()
         .all(|part| part.get("type").and_then(Value::as_str) == Some("text"))
     {
-        let text = parts
-            .iter()
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join(" ");
-        vec![json!({"role": role, "content": text})]
+        Value::String(
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
     } else {
-        vec![json!({"role": role, "content": parts})]
+        Value::Array(parts)
     }
 }
 
@@ -659,6 +676,9 @@ fn sanitize_thinking_block(block: Value) -> Value {
         && !signature.is_empty()
     {
         sanitized["signature"] = Value::String(signature.to_owned());
+    }
+    if let Some(cache_control) = block.get("cache_control") {
+        sanitized["cache_control"] = cache_control.clone();
     }
     sanitized
 }
@@ -1017,7 +1037,7 @@ mod tests {
         let content = output["messages"][0]["content"].as_array().unwrap();
 
         assert_eq!(content[0]["type"], "thinking");
-        assert_eq!(content[0].get("cache_control"), None);
+        assert_eq!(content[0]["cache_control"], json!({}));
         assert_eq!(content[1]["type"], "text");
         assert_eq!(content[2]["type"], "tool_use");
     }
@@ -1097,7 +1117,7 @@ mod tests {
             json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}})
         );
         assert_eq!(output["stop"], json!(["END"]));
-        assert_eq!(output["reasoning_effort"], "high");
+        assert_eq!(output["reasoning_effort"], "low");
         assert_eq!(output.get("metadata"), None);
     }
 

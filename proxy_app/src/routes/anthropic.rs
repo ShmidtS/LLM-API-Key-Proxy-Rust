@@ -1,6 +1,7 @@
 use crate::compat::anthropic::{
     anthropic_to_openai_chat_request, openai_chat_to_anthropic_response,
 };
+use crate::compat::anthropic_streaming::{ChunkBatcher, OpenAiToAnthropicStreamTranslator};
 use crate::errors::AppError;
 use crate::routes::utils::normalize_model_in_body;
 use crate::state::AppState;
@@ -62,9 +63,24 @@ async fn create_message(
         );
         let status = upstream.status();
         let headers = upstream.headers().clone();
-        let stream = upstream
-            .bytes_stream()
-            .map(|result| result.map_err(std::io::Error::other));
+        let mut batcher = ChunkBatcher::new();
+        let mut translator = OpenAiToAnthropicStreamTranslator::new(model.clone());
+        let stream = upstream.bytes_stream().map(move |result| {
+            result
+                .map(|bytes| {
+                    if is_native_anthropic {
+                        bytes
+                    } else {
+                        let output = batcher
+                            .push(bytes)
+                            .iter()
+                            .flat_map(|record| translator.translate_sse_record_to_sse(record))
+                            .collect::<String>();
+                        axum::body::Bytes::from(output)
+                    }
+                })
+                .map_err(std::io::Error::other)
+        });
         let mut builder = Response::builder().status(status);
         if let Some(ct) = headers.get(header::CONTENT_TYPE) {
             builder = builder.header(header::CONTENT_TYPE, ct);

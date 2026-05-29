@@ -17,14 +17,11 @@ use futures::StreamExt;
 use guardrails::{GuardrailDecision, RouteKind};
 use models::chat::ChatCompletionRequest;
 use serde_json::Value;
-use tokio::time::{Duration, timeout};
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
 }
 
-const CHAT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(15);
-const CHAT_COMPLETION_STREAM_TIMEOUT: Duration = Duration::from_secs(25);
 const MAX_GUARDRAIL_RETRY_ATTEMPTS: u32 = 1;
 const MAX_GUARDRAIL_UPSTREAM_ATTEMPTS: usize = 4;
 
@@ -84,7 +81,6 @@ async fn chat_completions(
             upstream_path,
             upstream_body,
             &req.model,
-            CHAT_COMPLETION_STREAM_TIMEOUT,
         )
         .await?;
         let status = upstream.status();
@@ -125,7 +121,6 @@ async fn chat_completions(
             upstream_path,
             upstream_body,
             &req.model,
-            CHAT_COMPLETION_TIMEOUT,
         )
         .await?;
         let mut response = if provider == "anthropic" {
@@ -157,7 +152,6 @@ async fn chat_completions(
             upstream_path,
             upstream_body,
             &req.model,
-            CHAT_COMPLETION_TIMEOUT,
         )
         .await?;
         let mut response = if provider == "anthropic" {
@@ -209,7 +203,6 @@ async fn chat_completions(
             upstream_path,
             attempt_upstream_body,
             &req.model,
-            CHAT_COMPLETION_TIMEOUT,
         )
         .await?;
         let (status, headers, response_json) =
@@ -295,39 +288,25 @@ async fn request_chat_upstream(
     upstream_path: &str,
     upstream_body: Value,
     model: &str,
-    timeout_duration: Duration,
 ) -> Result<reqwest::Response, AppError> {
     tracing::info!(
         method = "POST",
         provider = %provider,
         model = %model,
         upstream_path = %upstream_path,
-        timeout_secs = timeout_duration.as_secs(),
         "forwarding chat completion request"
     );
 
-    match timeout(
-        timeout_duration,
-        state
-            .rotator
-            .request(provider, upstream_path, upstream_body),
-    )
-    .await
-    {
-        Ok(Ok(response)) => {
-            tracing::info!(
-                provider = %provider,
-                status = %response.status(),
-                "upstream chat completion response"
-            );
-            Ok(response)
-        }
-        Ok(Err(error)) => Err(error.into()),
-        Err(_) => Err(AppError::UpstreamTimeout(format!(
-            "Upstream provider {provider} timed out after {} seconds",
-            timeout_duration.as_secs()
-        ))),
-    }
+    let response = state
+        .rotator
+        .request(provider, upstream_path, upstream_body)
+        .await?;
+    tracing::info!(
+        provider = %provider,
+        status = %response.status(),
+        "upstream chat completion response"
+    );
+    Ok(response)
 }
 
 fn apply_temperature_override(body: &mut Value, override_temperature_zero: Option<&str>) {

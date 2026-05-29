@@ -302,7 +302,7 @@ mod anthropic_compat {
         assert_eq!(content.len(), 3);
         assert_eq!(
             content[0],
-            json!({"type": "thinking", "thinking": "reason", "signature": "sig"})
+            json!({"type": "thinking", "thinking": "reason", "signature": "sig", "cache_control": {"type": "ephemeral"}})
         );
         assert_eq!(content[1], json!({"type": "text", "text": "answer"}));
         assert_eq!(content[2]["type"], "tool_use");
