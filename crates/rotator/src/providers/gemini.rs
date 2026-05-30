@@ -39,10 +39,13 @@ impl Provider for GeminiProvider {
     }
 
     fn transform_request(&self, body: &mut serde_json::Value) {
-        if let Some(model) = body.get("model").and_then(|value| value.as_str())
-            && !model.starts_with("models/")
-        {
-            body["model"] = serde_json::Value::String(format!("models/{model}"));
+        if let Some(model) = body.get("model").and_then(|value| value.as_str()) {
+            let model = model.strip_prefix("gemini/").unwrap_or(model);
+            if !model.starts_with("models/") {
+                body["model"] = serde_json::Value::String(format!("models/{model}"));
+            } else {
+                body["model"] = serde_json::Value::String(model.to_owned());
+            }
         }
     }
 
