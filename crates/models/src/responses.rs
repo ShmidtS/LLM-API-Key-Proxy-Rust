@@ -5,6 +5,10 @@ fn default_response_object() -> String {
     "response".to_string()
 }
 
+fn default_input_message_type() -> String {
+    "message".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CreateResponseRequest {
     pub model: String,
@@ -44,6 +48,8 @@ pub enum ResponseInput {
 #[serde(untagged)]
 pub enum ResponseInputItem {
     Message {
+        #[serde(rename = "type", default = "default_input_message_type")]
+        type_: String,
         role: String,
         content: ResponseInputContent,
     },

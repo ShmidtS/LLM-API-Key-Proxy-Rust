@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
-use models::chat::{ChatCompletionRequest, ChatMessage, ChatMessageContent};
+use models::chat::{ChatCompletionRequest, ChatMessage, ChatMessageContent, ToolChoice};
 use models::responses::{
-    CreateResponseRequest, ResponseInput, ResponseTextConfig, ResponseTool, ResponseToolChoice,
+    CreateResponseRequest, ResponseInput, ResponseInputContent, ResponseInputItem,
+    ResponseNamedToolChoice, ResponseNamedToolFunction, ResponseTextConfig, ResponseTool,
+    ResponseToolChoice,
 };
 use serde_json::Value;
 
@@ -48,6 +50,132 @@ pub struct ResponsesRequestContext {
     pub previous_response_id: Option<String>,
     pub metadata: Option<Value>,
     pub stream: bool,
+}
+
+pub fn chat_request_to_responses_request(
+    chat_req: &ChatCompletionRequest,
+) -> std::result::Result<CreateResponseRequest, String> {
+    let mut input = Vec::new();
+    let mut instructions = Vec::new();
+
+    for message in &chat_req.messages {
+        let content = message
+            .content
+            .as_ref()
+            .map(chat_message_content_to_text)
+            .transpose()?;
+
+        match message.role.as_str() {
+            "system" => {
+                if let Some(content) = content
+                    && !content.is_empty()
+                {
+                    instructions.push(content);
+                }
+            }
+            "user" => input.push(ResponseInputItem::Message {
+                type_: "message".to_owned(),
+                role: "user".to_owned(),
+                content: ResponseInputContent::Text(content.unwrap_or_default()),
+            }),
+            "assistant" => {
+                let tool_calls = message.tool_calls.as_deref().unwrap_or_default();
+                if tool_calls.is_empty() {
+                    input.push(ResponseInputItem::Message {
+                        type_: "message".to_owned(),
+                        role: "assistant".to_owned(),
+                        content: ResponseInputContent::Text(content.unwrap_or_default()),
+                    });
+                    continue;
+                }
+                if let Some(content) = content
+                    && !content.is_empty()
+                {
+                    input.push(ResponseInputItem::Message {
+                        type_: "message".to_owned(),
+                        role: "assistant".to_owned(),
+                        content: ResponseInputContent::Text(content),
+                    });
+                }
+                for tool_call in tool_calls {
+                    input.push(ResponseInputItem::FunctionCall {
+                        id: tool_call.id.clone(),
+                        call_id: tool_call.id.clone(),
+                        name: tool_call.function.name.clone(),
+                        arguments: tool_call.function.arguments.clone(),
+                        type_: "function_call".to_owned(),
+                    });
+                }
+            }
+            "tool" => input.push(ResponseInputItem::FunctionCallOutput {
+                call_id: message.tool_call_id.clone().unwrap_or_default(),
+                output: content.unwrap_or_default(),
+                type_: "function_call_output".to_owned(),
+            }),
+            _ => {}
+        }
+    }
+
+    Ok(CreateResponseRequest {
+        model: chat_req.model.clone(),
+        input: ResponseInput::Items(input),
+        instructions: (!instructions.is_empty()).then(|| instructions.join("\n")),
+        max_output_tokens: chat_req.max_tokens,
+        temperature: chat_req.temperature,
+        top_p: chat_req.top_p,
+        tools: chat_req.tools.as_ref().map(|tools| {
+            tools
+                .iter()
+                .map(|tool| ResponseTool {
+                    type_: "function".to_owned(),
+                    function: Some(tool.function.clone()),
+                    web_search: None,
+                })
+                .collect()
+        }),
+        tool_choice: chat_req
+            .tool_choice
+            .as_ref()
+            .and_then(chat_tool_choice_to_response_tool_choice),
+        stream: chat_req.stream,
+        text: None,
+        truncation: None,
+        previous_response_id: None,
+        metadata: None,
+    })
+}
+
+fn chat_message_content_to_text(
+    content: &ChatMessageContent,
+) -> std::result::Result<String, String> {
+    match content {
+        ChatMessageContent::Text(text) => Ok(text.clone()),
+        ChatMessageContent::Blocks(blocks) => {
+            serde_json::to_string(blocks).map_err(|err| err.to_string())
+        }
+    }
+}
+
+fn chat_tool_choice_to_response_tool_choice(
+    tool_choice: &ToolChoice,
+) -> Option<ResponseToolChoice> {
+    match tool_choice {
+        ToolChoice::String(value) => match value.as_str() {
+            "auto" => Some(ResponseToolChoice::Auto),
+            "none" => Some(ResponseToolChoice::None_),
+            "required" => Some(ResponseToolChoice::Required),
+            _ => None,
+        },
+        ToolChoice::Object { r#type, function } if r#type == "function" => {
+            Some(ResponseToolChoice::Named(ResponseNamedToolChoice {
+                type_: "function".to_owned(),
+                function: ResponseNamedToolFunction {
+                    name: function.name.clone(),
+                },
+            }))
+        }
+        ToolChoice::Object { .. } => None,
+    }
 }
 
 pub fn responses_request_to_native_request(
@@ -102,7 +230,8 @@ pub fn responses_request_to_chat_request(
         .map(response_tool_choice_to_chat_tool_choice)
         .transpose()?;
     let mut extra = HashMap::new();
-    let response_format = response_text_config_to_chat_response_format(req.text.as_ref(), &mut extra);
+    let response_format =
+        response_text_config_to_chat_response_format(req.text.as_ref(), &mut extra);
 
     Ok(TranslatedResponsesRequest {
         endpoint: ResponsesEndpoint::ChatCompletionsEmulation,
@@ -159,4 +288,3 @@ pub fn response_input_to_messages(
 
     Ok(messages)
 }
-

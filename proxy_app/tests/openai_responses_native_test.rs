@@ -53,7 +53,10 @@ fn test_state(base_url: String) -> AppState {
         display_name: "openai".to_owned(),
         base_url,
         auth_type: AuthType::ApiKey,
-        model_patterns: vec![r"^(openai/)?gpt[-/].*".to_owned(), r"^(openai/)?o4.*".to_owned()],
+        model_patterns: vec![
+            r"^(openai/)?gpt[-/].*".to_owned(),
+            r"^(openai/)?o4.*".to_owned(),
+        ],
         endpoints: vec!["/chat/completions".to_owned(), "/responses".to_owned()],
         features: vec!["chat".to_owned(), "responses".to_owned()],
         model_count: 2,
@@ -149,7 +152,16 @@ async fn chat_openai_prefixed_gpt5_routes_to_responses_with_input() {
         "/v1/chat/completions",
         json!({
             "model": "openai/gpt-5.5",
-            "messages": [{"role": "user", "content": "hello"}]
+            "messages": [
+                {"role": "system", "content": "You are concise."},
+                {"role": "user", "content": "hello"}
+            ],
+            "stream": false,
+            "stop": ["done"],
+            "presence_penalty": 0.1,
+            "frequency_penalty": 0.2,
+            "user": "test-user",
+            "response_format": {"type": "json_object"}
         }),
     )
     .await;
@@ -158,8 +170,18 @@ async fn chat_openai_prefixed_gpt5_routes_to_responses_with_input() {
     let (path, upstream_json) = captured_path_and_body(&captured_request);
     assert_eq!(path, "/v1/responses");
     assert_eq!(upstream_json["model"], "gpt-5.5");
+    assert_eq!(upstream_json["instructions"], "You are concise.");
+    assert_eq!(
+        upstream_json["input"],
+        json!([{ "type": "message", "role": "user", "content": "hello" }])
+    );
+    assert_eq!(upstream_json["stream"], false);
     assert!(upstream_json.get("messages").is_none());
-    assert!(upstream_json.get("input").is_some());
+    assert!(upstream_json.get("stop").is_none());
+    assert!(upstream_json.get("presence_penalty").is_none());
+    assert!(upstream_json.get("frequency_penalty").is_none());
+    assert!(upstream_json.get("user").is_none());
+    assert!(upstream_json.get("response_format").is_none());
 }
 
 #[tokio::test]
@@ -193,6 +215,73 @@ async fn chat_openai_bare_gpt5_routes_to_responses_with_input() {
 }
 
 #[tokio::test]
+async fn chat_openai_gpt5_converts_tool_calls_and_outputs() {
+    let captured_request = Arc::new(Mutex::new(String::new()));
+    let state = test_state(
+        upstream_server(
+            captured_request.clone(),
+            "text/event-stream",
+            responses_sse_body(),
+        )
+        .await,
+    );
+
+    let response = post_json(
+        state,
+        "/v1/chat/completions",
+        json!({
+            "model": "openai/gpt-5.5",
+            "messages": [
+                {"role": "user", "content": "weather"},
+                {
+                    "role": "assistant",
+                    "content": "checking",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {"type": "object"}
+                }
+            }],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {}}
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let (path, upstream_json) = captured_path_and_body(&captured_request);
+    assert_eq!(path, "/v1/responses");
+    assert_eq!(
+        upstream_json["input"],
+        json!([
+            {"type": "message", "role": "user", "content": "weather"},
+            {"type": "message", "role": "assistant", "content": "checking"},
+            {"type": "function_call", "id": "call_1", "call_id": "call_1", "name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "sunny"}
+        ])
+    );
+    assert_eq!(upstream_json["tools"][0]["type"], "function");
+    assert_eq!(upstream_json["tools"][0]["function"]["name"], "get_weather");
+    assert_eq!(upstream_json["tool_choice"]["type"], "function");
+    assert_eq!(
+        upstream_json["tool_choice"]["function"]["name"],
+        "get_weather"
+    );
+}
+
+#[tokio::test]
 async fn responses_openai_prefixed_gpt5_forwards_native_body() {
     let captured_request = Arc::new(Mutex::new(String::new()));
     let native_response = json!({
@@ -204,7 +293,12 @@ async fn responses_openai_prefixed_gpt5_forwards_native_body() {
     })
     .to_string();
     let state = test_state(
-        upstream_server(captured_request.clone(), "application/json", native_response).await,
+        upstream_server(
+            captured_request.clone(),
+            "application/json",
+            native_response,
+        )
+        .await,
     );
 
     let response = post_json(
@@ -233,7 +327,12 @@ async fn responses_openai_prefixed_gpt5_forwards_native_body() {
 async fn responses_openai_gpt4o_uses_chat_emulation() {
     let captured_request = Arc::new(Mutex::new(String::new()));
     let state = test_state(
-        upstream_server(captured_request.clone(), "application/json", chat_completion_body()).await,
+        upstream_server(
+            captured_request.clone(),
+            "application/json",
+            chat_completion_body(),
+        )
+        .await,
     );
 
     let response = post_json(
@@ -258,7 +357,12 @@ async fn responses_openai_gpt4o_uses_chat_emulation() {
 async fn chat_openai_gpt4o_uses_chat_completions_with_messages() {
     let captured_request = Arc::new(Mutex::new(String::new()));
     let state = test_state(
-        upstream_server(captured_request.clone(), "application/json", chat_completion_body()).await,
+        upstream_server(
+            captured_request.clone(),
+            "application/json",
+            chat_completion_body(),
+        )
+        .await,
     );
 
     let response = post_json(

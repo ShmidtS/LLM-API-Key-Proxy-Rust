@@ -1,5 +1,6 @@
 use crate::credentials::CredentialManager;
 use crate::error::{Result, RotatorError};
+use crate::openai_responses::chat_request_to_responses_request;
 use crate::provider_registry::ProviderRegistry;
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -80,7 +81,7 @@ pub fn transform_request_for_provider(provider: &str, body: &mut serde_json::Val
             transform_responses_compat_request(provider, body);
         }
         "openai" if is_openai_responses_model(body) && body.get("messages").is_some() => {
-            transform_responses_compat_request(provider, body);
+            transform_openai_responses_request(body);
         }
         _ => {
             sanitize_gpt5_request(body);
@@ -145,7 +146,24 @@ fn transform_responses_compat_request(provider: &str, body: &mut serde_json::Val
     if let Some(max_completion_tokens) = object.remove("max_completion_tokens") {
         object.insert("max_output_tokens".to_owned(), max_completion_tokens);
     }
-    object.insert("stream".to_owned(), serde_json::Value::Bool(true));
+}
+
+fn transform_openai_responses_request(body: &mut serde_json::Value) {
+    let Ok(mut chat_req) =
+        serde_json::from_value::<models::chat::ChatCompletionRequest>(body.clone())
+    else {
+        return;
+    };
+    if let Some(stripped) = chat_req.model.strip_prefix("openai/") {
+        chat_req.model = stripped.to_owned();
+    }
+    let Ok(responses_req) = chat_request_to_responses_request(&chat_req) else {
+        return;
+    };
+    let Ok(value) = serde_json::to_value(responses_req) else {
+        return;
+    };
+    *body = value;
 }
 
 fn message_content_to_text(content: &serde_json::Value) -> String {
@@ -368,14 +386,17 @@ mod tests {
 
         assert_eq!(body["model"], "gpt-5.5");
         assert!(body.get("messages").is_none());
-        assert_eq!(body["input"], serde_json::json!([{"role": "user", "content": "hello"}]));
+        assert_eq!(
+            body["input"],
+            serde_json::json!([{"role": "user", "content": "hello", "type": "message"}])
+        );
         assert_eq!(body["max_output_tokens"], 128);
         assert!(body.get("max_tokens").is_none());
-        assert_eq!(body["stream"], true);
+        assert_eq!(body["stream"], false);
     }
 
     #[test]
-    fn elysiver_transform_uses_responses_api_body_and_forces_streaming() {
+    fn elysiver_transform_uses_responses_api_body_and_preserves_streaming() {
         let mut body = serde_json::json!({
             "model": "elysiver/gpt-5.5",
             "messages": [
@@ -401,6 +422,6 @@ mod tests {
         );
         assert_eq!(body["max_output_tokens"], 128);
         assert!(body.get("max_tokens").is_none());
-        assert_eq!(body["stream"], true);
+        assert_eq!(body["stream"], false);
     }
 }

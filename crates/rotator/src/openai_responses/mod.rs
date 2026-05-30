@@ -14,6 +14,6 @@ pub use id::{Clock, ResponseIdFactory, SystemClock};
 pub use native::{DefaultResponsesCapabilityResolver, ResponsesCapabilityResolver};
 pub use request::{
     NativeResponsesRequest, ResponsesEndpoint, ResponsesRequestContext, TranslatedResponsesRequest,
-    responses_request_to_native_request,
+    chat_request_to_responses_request, responses_request_to_native_request,
 };
 pub use stream::ResponsesStreamTranslator;

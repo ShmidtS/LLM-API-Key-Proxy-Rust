@@ -10,7 +10,7 @@ pub fn response_input_item_to_chat_message(
     item: ResponseInputItem,
 ) -> Result<models::chat::ChatMessage> {
     Ok(match item {
-        ResponseInputItem::Message { role, content } => models::chat::ChatMessage {
+        ResponseInputItem::Message { role, content, .. } => models::chat::ChatMessage {
             role,
             content: Some(response_input_content_to_chat_content(content)),
             tool_calls: None,
@@ -90,7 +90,9 @@ pub fn response_output_content_to_input_part(
 ) -> Option<ResponseContentPart> {
     match content {
         ResponseOutputContent::Text { text } => Some(ResponseContentPart::Text { text }),
-        ResponseOutputContent::Refusal { refusal } => Some(ResponseContentPart::Text { text: refusal }),
+        ResponseOutputContent::Refusal { refusal } => {
+            Some(ResponseContentPart::Text { text: refusal })
+        }
         ResponseOutputContent::Thinking { thinking, .. } => {
             Some(ResponseContentPart::Text { text: thinking })
         }
