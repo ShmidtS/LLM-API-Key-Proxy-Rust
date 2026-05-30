@@ -79,7 +79,7 @@ fn test_state(provider: &str, base_url: String) -> AppState {
 }
 
 #[tokio::test]
-async fn chat_completions_preserves_openai_provider_prefix_before_upstream() {
+async fn chat_completions_strips_openai_responses_model_prefix_before_upstream() {
     let captured_request = Arc::new(Mutex::new(String::new()));
     let upstream_body = json!({
         "id": "chatcmpl_test",
@@ -121,7 +121,7 @@ async fn chat_completions_preserves_openai_provider_prefix_before_upstream() {
     let raw_request = captured_request.lock().unwrap().clone();
     let (_, body) = raw_request.split_once("\r\n\r\n").unwrap();
     let upstream_json: Value = serde_json::from_str(body).unwrap();
-    assert_eq!(upstream_json["model"], "openai/gpt-5.5");
+    assert_eq!(upstream_json["model"], "gpt-5.5");
 }
 
 #[tokio::test]

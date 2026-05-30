@@ -38,7 +38,11 @@ async fn chat_completions(
         .into_response());
     }
 
-    let provider = resolve_provider_for_model(&state, &req.model);
+    let provider = if is_openai_responses_model(&req.model) {
+        "openai".to_owned()
+    } else {
+        resolve_provider_for_model(&state, &req.model)
+    };
     let is_anthropic = provider == "anthropic";
     let is_responses_compat = matches!(provider.as_str(), "elysiver" | "colin")
         || (provider == "openai" && is_openai_responses_model(&req.model));

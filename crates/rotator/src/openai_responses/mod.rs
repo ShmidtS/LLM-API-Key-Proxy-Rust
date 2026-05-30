@@ -12,5 +12,8 @@ pub use bridge::ResponsesBridge;
 pub use error::{ResponsesBridgeError, Result};
 pub use id::{Clock, ResponseIdFactory, SystemClock};
 pub use native::{DefaultResponsesCapabilityResolver, ResponsesCapabilityResolver};
-pub use request::{ResponsesEndpoint, ResponsesRequestContext, TranslatedResponsesRequest};
+pub use request::{
+    NativeResponsesRequest, ResponsesEndpoint, ResponsesRequestContext, TranslatedResponsesRequest,
+    responses_request_to_native_request,
+};
 pub use stream::ResponsesStreamTranslator;

@@ -79,6 +79,9 @@ pub fn transform_request_for_provider(provider: &str, body: &mut serde_json::Val
         "elysiver" | "colin" => {
             transform_responses_compat_request(provider, body);
         }
+        "openai" if is_openai_responses_model(body) && body.get("messages").is_some() => {
+            transform_responses_compat_request(provider, body);
+        }
         _ => {
             sanitize_gpt5_request(body);
             match provider {
@@ -89,6 +92,13 @@ pub fn transform_request_for_provider(provider: &str, body: &mut serde_json::Val
             }
         }
     }
+}
+
+fn is_openai_responses_model(body: &serde_json::Value) -> bool {
+    body.get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(|model| model.strip_prefix("openai/").unwrap_or(model))
+        .is_some_and(|model| model.starts_with("gpt-5") || model.starts_with("o4"))
 }
 
 fn transform_responses_compat_request(provider: &str, body: &mut serde_json::Value) {
@@ -346,18 +356,22 @@ mod tests {
     }
 
     #[test]
-    fn gpt5_transform_removes_temperature_and_renames_max_tokens() {
+    fn gpt5_transform_uses_responses_api_body() {
         let mut body = serde_json::json!({
-            "model": "gpt-5.5",
-            "temperature": 0.2,
-            "max_tokens": 128
+            "model": "openai/gpt-5.5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 128,
+            "stream": false
         });
 
         transform_request_for_provider("openai", &mut body);
 
-        assert!(body.get("temperature").is_none());
+        assert_eq!(body["model"], "gpt-5.5");
+        assert!(body.get("messages").is_none());
+        assert_eq!(body["input"], serde_json::json!([{"role": "user", "content": "hello"}]));
+        assert_eq!(body["max_output_tokens"], 128);
         assert!(body.get("max_tokens").is_none());
-        assert_eq!(body["max_completion_tokens"], 128);
+        assert_eq!(body["stream"], true);
     }
 
     #[test]

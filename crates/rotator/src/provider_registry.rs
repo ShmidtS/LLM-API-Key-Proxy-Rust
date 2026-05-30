@@ -713,7 +713,13 @@ fn provider_display_name(id: &str) -> String {
 
 fn provider_endpoints(id: &str) -> Vec<String> {
     let endpoints = match id {
-        "openai" => ["/chat/completions", "/embeddings", "/images/generations"].as_slice(),
+        "openai" => [
+            "/chat/completions",
+            "/responses",
+            "/embeddings",
+            "/images/generations",
+        ]
+        .as_slice(),
         _ => ["/chat/completions"].as_slice(),
     };
 

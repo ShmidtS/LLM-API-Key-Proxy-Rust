@@ -262,7 +262,7 @@ async fn admin_stats_returns_provider_key_and_request_counts() {
     assert_eq!(openai["display_name"], "OpenAI");
     assert_eq!(
         openai["endpoints"],
-        serde_json::json!(["/chat/completions", "/embeddings", "/images/generations"])
+        serde_json::json!(["/chat/completions", "/responses", "/embeddings", "/images/generations"])
     );
     assert_eq!(
         openai["features"],

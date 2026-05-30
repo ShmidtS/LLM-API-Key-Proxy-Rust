@@ -38,8 +38,8 @@ pub use model_filter::{ModelFilterEngine, ModelFilterRule, ModelFilterStatus};
 pub use model_info::{ModelInfoService, ModelMetadata};
 pub use model_parser::{parse_model_ids, parse_model_ids_body, parse_model_ids_response};
 pub use openai_responses::{
-    ResponsesBridge, ResponsesBridgeError, ResponsesEndpoint, ResponsesRequestContext,
-    TranslatedResponsesRequest,
+    NativeResponsesRequest, ResponsesBridge, ResponsesBridgeError, ResponsesEndpoint,
+    ResponsesRequestContext, TranslatedResponsesRequest, responses_request_to_native_request,
 };
 pub use provider_normalization::{
     NormalizedModelRef, ProviderAlias, normalize_model_ref, normalize_provider_id, public_model_id,

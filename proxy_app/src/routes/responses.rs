@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, routing::get, routing::post};
 use models::chat::ChatCompletionResponse;
 use models::responses::CreateResponseRequest;
-use rotator::{ResponsesBridge, ResponsesBridgeError};
+use rotator::{ResponsesBridge, ResponsesBridgeError, responses_request_to_native_request};
 use std::collections::HashMap;
 
 pub fn router() -> Router<AppState> {
@@ -46,6 +46,33 @@ async fn create_response(
             Json(serde_json::json!({"error": "Model not allowed"})),
         )
             .into_response());
+    }
+
+    let provider = if is_openai_responses_model(&original_request.model) {
+        "openai".to_owned()
+    } else {
+        resolve_provider_for_model(&state, &original_request.model)
+    };
+    if provider == "openai" && is_openai_responses_model(&original_request.model) {
+        let native_request = responses_request_to_native_request(&original_request)
+            .map_err(responses_bridge_error_to_app_error)?;
+        tracing::info!(
+            method = "POST",
+            provider = %provider,
+            model = %original_request.model,
+            upstream_path = %native_request.upstream_path,
+            "forwarding responses request"
+        );
+        let upstream = state
+            .rotator
+            .request(&provider, &native_request.upstream_path, native_request.body)
+            .await?;
+        tracing::info!(
+            provider = %provider,
+            status = %upstream.status(),
+            "upstream responses response"
+        );
+        return upstream_response(upstream).await;
     }
 
     let bridge = ResponsesBridge::default();
@@ -99,6 +126,11 @@ async fn create_response(
         Json(response),
     )
         .into_response())
+}
+
+fn is_openai_responses_model(model: &str) -> bool {
+    let bare = model.strip_prefix("openai/").unwrap_or(model);
+    bare.starts_with("gpt-5") || bare.starts_with("o4")
 }
 
 fn responses_bridge_error_to_app_error(error: ResponsesBridgeError) -> AppError {

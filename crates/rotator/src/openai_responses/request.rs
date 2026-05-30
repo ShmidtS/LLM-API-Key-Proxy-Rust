@@ -28,6 +28,13 @@ pub struct TranslatedResponsesRequest {
 }
 
 #[derive(Debug, Clone)]
+pub struct NativeResponsesRequest {
+    pub endpoint: ResponsesEndpoint,
+    pub upstream_path: String,
+    pub body: Value,
+}
+
+#[derive(Debug, Clone)]
 pub struct ResponsesRequestContext {
     pub original_model: String,
     pub instructions: Option<String>,
@@ -41,6 +48,22 @@ pub struct ResponsesRequestContext {
     pub previous_response_id: Option<String>,
     pub metadata: Option<Value>,
     pub stream: bool,
+}
+
+pub fn responses_request_to_native_request(
+    req: &CreateResponseRequest,
+) -> Result<NativeResponsesRequest> {
+    let mut body = serde_json::to_value(req)?;
+    if let Some(model) = body.get("model").and_then(Value::as_str)
+        && let Some(stripped) = model.strip_prefix("openai/")
+    {
+        body["model"] = Value::String(stripped.to_owned());
+    }
+    Ok(NativeResponsesRequest {
+        endpoint: ResponsesEndpoint::NativeResponses,
+        upstream_path: "responses".to_owned(),
+        body,
+    })
 }
 
 pub fn responses_request_to_chat_request(

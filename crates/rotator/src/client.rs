@@ -598,14 +598,20 @@ impl RotatorClient {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        sanitize_request(
-            &SanitizerContext {
-                provider_id: provider.to_owned(),
-                model,
-                endpoint: path.trim_start_matches('/').to_owned(),
-            },
-            body,
-        );
+        let endpoint = path.trim_start_matches('/');
+        if !(provider == "openai" && endpoint == "responses") {
+            sanitize_request(
+                &SanitizerContext {
+                    provider_id: provider.to_owned(),
+                    model,
+                    endpoint: endpoint.to_owned(),
+                },
+                body,
+            );
+        }
+        if provider == "openai" && endpoint == "responses" && body.get("messages").is_none() {
+            return;
+        }
         transform_request_for_provider(provider, body);
     }
 
