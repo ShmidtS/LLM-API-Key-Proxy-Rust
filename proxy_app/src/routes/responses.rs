@@ -65,7 +65,11 @@ async fn create_response(
         );
         let upstream = state
             .rotator
-            .request(&provider, &native_request.upstream_path, native_request.body)
+            .request(
+                &provider,
+                &native_request.upstream_path,
+                native_request.body,
+            )
             .await?;
         tracing::info!(
             provider = %provider,

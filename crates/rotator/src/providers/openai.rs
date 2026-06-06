@@ -2,9 +2,17 @@ use super::Provider;
 use crate::error::Result;
 use async_trait::async_trait;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct OpenAiProvider {
     base_url: String,
+}
+
+impl Default for OpenAiProvider {
+    fn default() -> Self {
+        Self {
+            base_url: "https://api.openai.com/v1".to_owned(),
+        }
+    }
 }
 
 impl OpenAiProvider {
@@ -90,5 +98,11 @@ mod tests {
             vec![("authorization".to_owned(), "Bearer test-key".to_owned())]
         );
         assert!(provider.supports_streaming());
+    }
+
+    #[test]
+    fn default_base_url_is_openai_api() {
+        let provider = OpenAiProvider::default();
+        assert_eq!(provider.base_url(), "https://api.openai.com/v1");
     }
 }

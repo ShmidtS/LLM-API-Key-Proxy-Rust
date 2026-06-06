@@ -44,6 +44,7 @@ fn runtime_route_supports_env_defined_unknown_providers() {
         base_url: "https://custom.example/root".to_owned(),
         auth_type: AuthType::Bearer,
         model_patterns: vec![],
+        compiled_patterns: vec![],
         endpoints: vec!["/chat/completions".to_owned()],
         features: vec!["chat".to_owned()],
         model_count: 0,

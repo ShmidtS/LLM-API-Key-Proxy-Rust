@@ -78,6 +78,14 @@ impl GuardrailsAdapter {
         self.engine.evaluate(request, response_json)
     }
 
+    pub async fn evaluate_streaming(
+        &self,
+        request: &GuardrailRequest,
+        frames: Vec<Value>,
+    ) -> Result<GuardrailDecision, GuardrailError> {
+        self.engine.evaluate_stream(request, frames)
+    }
+
     pub fn preprocess_request(
         &self,
         request: &GuardrailRequest,
@@ -91,7 +99,7 @@ pub fn build_guardrail_request(
     provider: String,
     upstream_path: String,
     model: String,
-    body: Value,
+    body: Arc<Value>,
     stream: bool,
 ) -> GuardrailRequest {
     GuardrailRequest {
@@ -204,12 +212,14 @@ pub fn guardrails_config_from_proxy(config: &GuardrailsProxyConfig) -> Guardrail
     };
     GuardrailsConfig {
         enabled: config.enabled,
-        max_semantic_retries: config.max_guardrail_retries.min(1) as u32,
+        max_semantic_retries: config.max_guardrail_retries as u32,
         chat_completions: route_config_from_proxy(&config.chat, config),
         anthropic_messages: route_config_from_proxy(&config.anthropic, config),
         responses: route_config_from_proxy(&config.responses, config),
         max_rescue_attempts: config.max_rescue_attempts as u32,
-        max_guardrail_retries: config.max_guardrail_retries.min(1) as u32,
+        max_guardrail_retries: config.max_guardrail_retries as u32,
+        max_tool_errors: 2,
+        max_tool_resolution_errors: 2,
         context: context_compaction.clone(),
         context_compaction,
         vram: guardrails::VramConfig::default(),

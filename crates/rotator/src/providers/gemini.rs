@@ -1,5 +1,6 @@
 use super::Provider;
 use crate::error::Result;
+use crate::providers::gemini_tool_handler;
 use crate::providers::openai::OpenAiProvider;
 use async_trait::async_trait;
 
@@ -17,6 +18,14 @@ impl GeminiProvider {
         Self {
             inner: OpenAiProvider::new(base_url),
         }
+    }
+
+    /// Group Gemini-format tool responses with their matching function calls.
+    pub fn group_tool_responses(
+        &self,
+        contents: Vec<serde_json::Value>,
+    ) -> Vec<serde_json::Value> {
+        gemini_tool_handler::group_tool_responses(&contents)
     }
 }
 
@@ -47,6 +56,26 @@ impl Provider for GeminiProvider {
                 body["model"] = serde_json::Value::String(model.to_owned());
             }
         }
+
+        if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
+            let tool_defs: Vec<models::chat::ToolDefinition> = tools
+                .iter()
+                .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                .collect();
+            if !tool_defs.is_empty() {
+                let gemini_tools = gemini_tool_handler::transform_tools_to_gemini(&tool_defs);
+                if let Ok(val) = serde_json::to_value(gemini_tools) {
+                    body["tools"] = val;
+                }
+            }
+        }
+
+        if let Some(tool_choice) = body.get("tool_choice")
+            && let Ok(tc) = serde_json::from_value::<models::chat::ToolChoice>(tool_choice.clone())
+                && let Some(config) = gemini_tool_handler::transform_tool_choice_to_gemini(&tc)
+                    && let Ok(val) = serde_json::to_value(config) {
+                        body["toolConfig"] = val;
+                    }
     }
 
     async fn request(

@@ -90,6 +90,7 @@ async fn test_provider(responses: Vec<MockResponse>) -> TestServer {
         base_url: format!("http://{addr}/v1"),
         auth_type: AuthType::ApiKey,
         model_patterns: Vec::new(),
+        compiled_patterns: Vec::new(),
         endpoints: vec!["/chat/completions".to_string()],
         features: vec!["chat".to_string()],
         model_count: 1,
@@ -278,4 +279,115 @@ async fn aborts_server_error_after_max_retries() {
         assert_eq!(response.status(), 503);
     }
     assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn rotates_key_on_401_auth_error() {
+    let server = test_provider(vec![MockResponse::new(401), MockResponse::new(200)]).await;
+    let cooldown = Arc::new(CooldownManager::new());
+    let client = test_client(
+        Arc::clone(&server.registry),
+        Arc::clone(&cooldown),
+        vec!["key-1", "key-2"],
+        1,
+    );
+
+    let response = send_request(&client).await.unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    let keys_seen = server.keys_seen.lock().await;
+    assert_eq!(keys_seen.len(), 2);
+    assert_ne!(keys_seen[0], keys_seen[1]);
+    assert!(!cooldown.is_available("test", "key-1"));
+}
+
+#[tokio::test]
+async fn auth_error_exhausts_keys_then_stops_retrying() {
+    let server = test_provider(vec![MockResponse::new(403)]).await;
+    let client = test_client(
+        Arc::clone(&server.registry),
+        Arc::new(CooldownManager::new()),
+        vec!["key-1"],
+        1,
+    );
+
+    // 403 → ротация ключа с cooldown текущего; единственный ключ уходит в cooldown,
+    // следующая попытка не находит доступных ключей → NoCredentials (не бесконечный цикл).
+    let result = send_request(&client).await;
+
+    assert!(
+        matches!(result, Err(RotatorError::NoCredentials(ref provider)) if provider == "test"),
+        "expected NoCredentials after auth rotation exhausted, got {result:?}"
+    );
+    // Первый запрос получил 403, второй прерван отсутствием доступных ключей.
+    assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn returns_403_to_client_when_no_other_key_and_no_cooldown_room() {
+    // Два ключа: первый 403 → ротация → второй тоже 403 → попытки исчерпаны,
+    // исходный 403 возвращается клиенту (а не теряется).
+    let server = test_provider(vec![MockResponse::new(403), MockResponse::new(403)]).await;
+    let client = test_client(
+        Arc::clone(&server.registry),
+        Arc::new(CooldownManager::new()),
+        vec!["key-1", "key-2"],
+        1,
+    );
+
+    let result = send_request(&client).await;
+
+    match result {
+        Ok(response) => assert_eq!(response.status(), 403),
+        Err(RotatorError::NoCredentials(provider)) => assert_eq!(provider, "test"),
+        other => panic!("unexpected result: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rotates_key_on_garbage_response() {
+    let server = test_provider(vec![
+        MockResponse::new(200).with_body("hello hello hello hello world"),
+        MockResponse::new(200).with_body(r#"{"choices":[{"message":{"content":"ok"}}]}"#),
+    ])
+    .await;
+    let client = test_client(
+        Arc::clone(&server.registry),
+        Arc::new(CooldownManager::new()),
+        vec!["key-1", "key-2"],
+        1,
+    );
+
+    let response = send_request(&client).await.unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    let keys_seen = server.keys_seen.lock().await;
+    assert_eq!(keys_seen.len(), 2);
+    assert_ne!(keys_seen[0], keys_seen[1]);
+}
+
+#[tokio::test]
+async fn garbage_response_exhausts_keys_then_returns_original() {
+    let server = test_provider(vec![
+        MockResponse::new(200).with_body("hello hello hello hello world"),
+        MockResponse::new(200).with_body("hello hello hello hello again"),
+    ])
+    .await;
+    let client = test_client(
+        Arc::clone(&server.registry),
+        Arc::new(CooldownManager::new()),
+        vec!["key-1", "key-2"],
+        1,
+    );
+
+    let response = send_request(&client).await.unwrap();
+
+    // Оба ключа вернули garbage, попытки исчерпаны, возвращаем последний ответ.
+    assert_eq!(response.status(), 200);
+    assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    let keys_seen = server.keys_seen.lock().await;
+    assert_eq!(keys_seen.len(), 2);
+    assert_ne!(keys_seen[0], keys_seen[1]);
 }

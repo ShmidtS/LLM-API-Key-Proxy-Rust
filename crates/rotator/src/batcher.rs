@@ -342,6 +342,7 @@ mod tests {
             base_url,
             auth_type,
             model_patterns: vec![model_pattern.to_owned()],
+            compiled_patterns: vec![],
             endpoints,
             features: vec!["embeddings".to_owned()],
             model_count: 1,

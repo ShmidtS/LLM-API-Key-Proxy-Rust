@@ -6,14 +6,20 @@ const MAX_TOOL_CALLS_TO_REPAIR: usize = 16;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
 
 pub trait ToolCallRescuer: Send + Sync {
-    fn rescue(&self, response: &GuardrailResponse) -> Result<Option<RescueCandidate>, GuardrailError>;
+    fn rescue(
+        &self,
+        response: &GuardrailResponse,
+    ) -> Result<Option<RescueCandidate>, GuardrailError>;
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct DefaultToolCallRescuer;
 
 impl ToolCallRescuer for DefaultToolCallRescuer {
-    fn rescue(&self, response: &GuardrailResponse) -> Result<Option<RescueCandidate>, GuardrailError> {
+    fn rescue(
+        &self,
+        response: &GuardrailResponse,
+    ) -> Result<Option<RescueCandidate>, GuardrailError> {
         let mut body = response.body.clone();
         let mut repaired_fields = Vec::new();
         let mut remaining_issues = Vec::new();

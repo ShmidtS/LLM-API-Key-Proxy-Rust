@@ -16,6 +16,20 @@ pub enum GuardrailError {
     Serialization(#[from] serde_json::Error),
     #[error("maximum guardrail retries exceeded: {attempts}")]
     MaxRetriesExceeded { attempts: u32 },
+    #[error(
+        "step enforcement failed: terminal tool `{terminal_tool}` called before required steps completed; pending: {pending:?}"
+    )]
+    StepEnforcement {
+        terminal_tool: String,
+        pending: Vec<String>,
+    },
+    #[error(
+        "tool execution budget exhausted: {consecutive_tool_errors} tool errors, {consecutive_resolution_errors} resolution errors"
+    )]
+    ToolExecutionBudgetExhausted {
+        consecutive_tool_errors: u32,
+        consecutive_resolution_errors: u32,
+    },
 }
 
 #[cfg(test)]

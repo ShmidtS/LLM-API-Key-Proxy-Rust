@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use crate::compaction::DefaultContextCompactor;
 use crate::config::GuardrailsConfig;
 use crate::context::GuardrailContext;
@@ -6,15 +5,17 @@ use crate::error::GuardrailError;
 use crate::nudge::{DefaultRetryNudger, RetryNudger};
 use crate::pipeline::GuardrailPipeline;
 use crate::recovery::{DefaultErrorRecovery, ErrorRecovery, RecoveryAction};
-use crate::streaming::{NoOpStreamValidator, StreamValidator};
+use crate::streaming::{BufferingStreamValidator, StreamValidator};
 use crate::tool_rescue::{DefaultToolCallRescuer, ToolCallRescuer};
 use crate::types::{
     CompactionResult, GuardrailDecision, GuardrailMode, GuardrailRequest, GuardrailResponse,
     GuardrailTrace, SchemaHint, UpstreamErrorSummary, ValidationOptions, ValidationReport,
 };
-use crate::validation::{DefaultResponseValidator, ResponseValidator};
+use crate::validation::{DefaultResponseValidator, ResponseValidator, extract_allowed_tools};
+use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 pub struct GuardrailsEngine {
@@ -25,6 +26,7 @@ pub struct GuardrailsEngine {
     recovery: Box<dyn ErrorRecovery>,
     compactor: Box<DefaultContextCompactor>,
     stream_validator: Box<dyn StreamValidator>,
+    step_tracker: std::sync::Mutex<crate::prerequisites::StepTracker>,
 }
 
 impl std::fmt::Debug for GuardrailsEngine {
@@ -44,7 +46,8 @@ impl GuardrailsEngine {
             nudger: Box::new(DefaultRetryNudger),
             recovery: Box::new(DefaultErrorRecovery),
             compactor: Box::new(DefaultContextCompactor),
-            stream_validator: Box::new(NoOpStreamValidator),
+            stream_validator: Box::new(BufferingStreamValidator::default()),
+            step_tracker: std::sync::Mutex::new(crate::prerequisites::StepTracker::new()),
         }
     }
 
@@ -65,6 +68,7 @@ impl GuardrailsEngine {
             recovery,
             compactor,
             stream_validator,
+            step_tracker: std::sync::Mutex::new(crate::prerequisites::StepTracker::new()),
         }
     }
 
@@ -88,12 +92,43 @@ impl GuardrailsEngine {
     pub fn evaluate_response(
         &self,
         request: &GuardrailRequest,
-        response: GuardrailResponse,
+        mut response: GuardrailResponse,
     ) -> Result<GuardrailDecision, GuardrailError> {
         let route_config = self.config.route_config(&request.route);
         let trace = GuardrailTrace::default();
+        // Синтетический respond-tool превращается в обычный текстовый ответ до любой
+        // валидации, чтобы он не утёк клиенту и не считался невалидным tool_call.
+        // Чистый respond-ответ — это conversational-ответ Forge: он принимается как
+        // финальный текст и не подчиняется JSON-mode/schema валидации.
+        if crate::respond::strip_respond_tool_calls(&mut response.body) {
+            return Ok(GuardrailDecision::Accept { response, trace });
+        }
         if route_config.mode == GuardrailMode::Off {
             return Ok(GuardrailDecision::Accept { response, trace });
+        }
+
+        // Terminal tool enforcement: блокировать вызов terminal-tool до выполнения
+        // required_steps (паритет с Forge StepEnforcer::check).
+        if let Some(policy) = &request.step_policy {
+            let mut tracker = self.step_tracker.lock().unwrap();
+            tracker.set_required_steps(policy.required_steps.clone());
+            let tool_names = crate::steps::extract_tool_names_from_response(&response);
+            for name in &tool_names {
+                tracker.record(name, Value::Null);
+            }
+            if let Some(msg) = crate::steps::check_premature_terminal(&response, policy, &tracker)
+                && route_config.mode == GuardrailMode::Enforce
+            {
+                let mut trace = GuardrailTrace::default();
+                trace
+                    .actions_taken
+                    .push("step_enforcement_error".to_owned());
+                return Ok(GuardrailDecision::Retry {
+                    request: request.clone(),
+                    reason: msg,
+                    trace,
+                });
+            }
         }
 
         let options = ValidationOptions {
@@ -101,6 +136,7 @@ impl GuardrailsEngine {
             validate_json_mode: route_config.validate_json_mode,
             validate_schema: route_config.validate_schema,
             validate_steps: route_config.validate_steps,
+            allowed_tools: extract_allowed_tools(&request.body),
         };
         let report = self.validator.validate(request, &response, &options)?;
         if report.ok || route_config.mode == GuardrailMode::Observe {
@@ -128,7 +164,10 @@ impl GuardrailsEngine {
             debug!(issues = ?candidate.remaining_issues, "guardrail tool rescue skipped");
         }
 
-        if route_config.retry_with_nudge && self.config.max_guardrail_retries > 0 {
+        if route_config.retry_with_nudge
+            && self.config.max_guardrail_retries > 0
+            && request.attempt.semantic_retry_index < self.config.max_guardrail_retries
+        {
             let request = self.nudger.nudge(request, &report)?;
             return Ok(GuardrailDecision::Retry {
                 request,
@@ -187,14 +226,35 @@ impl GuardrailsEngine {
             }
         }
 
+        crate::respond::inject_respond_tool(Arc::make_mut(&mut processed.body));
+
         if route_config.validate_steps {
             apply_step_enforcement(&mut processed);
         }
 
         let mut trace = GuardrailTrace::default();
-        self.stream_validator.finish(&mut trace)?;
+        let _ = self.stream_validator.finish(&mut trace)?;
 
         Ok(processed)
+    }
+
+    pub fn evaluate_stream(
+        &self,
+        request: &GuardrailRequest,
+        frames: Vec<Value>,
+    ) -> Result<GuardrailDecision, GuardrailError> {
+        let mut trace = GuardrailTrace::default();
+        let validator = BufferingStreamValidator::default();
+        for frame in &frames {
+            validator.validate_frame(frame, &mut trace)?;
+        }
+        let body = validator.finish(&mut trace)?;
+        let response = GuardrailResponse {
+            status: 200,
+            headers: BTreeMap::new(),
+            body,
+        };
+        self.evaluate_response(request, response)
     }
 }
 
@@ -202,28 +262,33 @@ impl GuardrailsEngine {
 impl GuardrailPipeline for GuardrailsEngine {
     async fn before_request(
         &self,
-        _ctx: &mut GuardrailContext,
+        ctx: &mut GuardrailContext,
         request: GuardrailRequest,
     ) -> Result<GuardrailRequest, GuardrailError> {
+        if let Some(policy) = &request.step_policy {
+            ctx.step_policy = Some(policy.clone());
+        }
+        ctx.attempt = request.attempt.clone();
+        ctx.request = Some(request.clone());
         self.preprocess(&request)
     }
 
     async fn after_response(
         &self,
-        _ctx: &mut GuardrailContext,
+        ctx: &mut GuardrailContext,
         response: GuardrailResponse,
     ) -> Result<GuardrailDecision, GuardrailError> {
-        let request = GuardrailRequest {
-            route: _ctx.route.clone(),
+        let request = ctx.request.clone().unwrap_or_else(|| GuardrailRequest {
+            route: ctx.route.clone(),
             provider: String::new(),
             upstream_path: String::new(),
             model: String::new(),
-            body: Value::Null,
+            body: Arc::new(Value::Null),
             stream: false,
             schema_hint: None,
-            step_policy: None,
-            attempt: Default::default(),
-        };
+            step_policy: ctx.step_policy.clone(),
+            attempt: ctx.attempt.clone(),
+        });
         self.evaluate_response(&request, response)
     }
 
@@ -282,8 +347,7 @@ fn apply_step_enforcement(request: &mut GuardrailRequest) {
         )
     };
 
-    if let Some(messages) = request
-        .body
+    if let Some(messages) = Arc::make_mut(&mut request.body)
         .get_mut("messages")
         .and_then(Value::as_array_mut)
     {
@@ -295,7 +359,7 @@ fn apply_step_enforcement(request: &mut GuardrailRequest) {
             }),
         );
     } else {
-        request.body["guardrail_step_policy"] = serde_json::json!({
+        Arc::make_mut(&mut request.body)["guardrail_step_policy"] = serde_json::json!({
             "required_steps": policy.required_steps,
             "before_steps": policy.before_steps,
             "instruction": instruction,

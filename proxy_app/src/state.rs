@@ -1,8 +1,9 @@
 use crate::guardrails_adapter::{GuardrailsAdapter, any_guardrails_enabled};
 use proxy_config::ProxyConfig;
 use rotator::{
-    CircuitBreakerRegistry, CooldownManager, CredentialManager, EmbeddingBatcher, HttpClientPool,
-    ModelInfoService, ProviderRegistry, RateLimiterRegistry, RotatorClient, UsageManager,
+    AdaptiveRateLimiterRegistry, CircuitBreakerRegistry, CooldownManager, CredentialManager,
+    EmbeddingBatcher, HttpClientPool, ModelInfoService, ProviderRegistry, RateLimiterRegistry,
+    RotatorClient, UsageManager,
 };
 use std::{
     collections::HashMap,
@@ -53,7 +54,7 @@ impl AppState {
             Duration::from_secs(cfg.usage_flush_interval_secs),
             cfg.usage_batch_size,
         ));
-        let client = RotatorClient::new(
+        let mut client = RotatorClient::new(
             creds,
             pool,
             registry.clone(),
@@ -63,6 +64,10 @@ impl AppState {
             Some(usage_manager),
             cfg.max_retries,
         );
+        if cfg.adaptive_rate_limiter.enabled {
+            let adaptive_rate_limiter = Arc::new(AdaptiveRateLimiterRegistry::new());
+            client = client.with_adaptive_rate_limiter(adaptive_rate_limiter);
+        }
         let catalog_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.request_timeout_secs))
             .connect_timeout(Duration::from_secs(5))

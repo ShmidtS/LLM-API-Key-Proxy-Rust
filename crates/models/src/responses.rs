@@ -1,4 +1,3 @@
-use crate::chat::FunctionDefinition;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 fn default_response_object() -> String {
@@ -114,9 +113,28 @@ pub struct ResponseTool {
     #[serde(rename = "type")]
     pub type_: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub function: Option<FunctionDefinition>,
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web_search: Option<WebSearchTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<ResponseToolFunction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResponseToolFunction {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -131,11 +149,14 @@ pub enum ResponseToolChoice {
 pub struct ResponseNamedToolChoice {
     #[serde(rename = "type")]
     pub type_: String,
-    pub function: ResponseNamedToolFunction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<ResponseNamedToolChoiceFunction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ResponseNamedToolFunction {
+pub struct ResponseNamedToolChoiceFunction {
     pub name: String,
 }
 

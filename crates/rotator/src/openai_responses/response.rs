@@ -80,11 +80,13 @@ pub fn chat_content_to_response_content(content: ChatMessageContent) -> Vec<Resp
                         .map(|text| ResponseOutputContent::Text {
                             text: text.to_owned(),
                         }),
-                    Some("refusal") => part.get("refusal").and_then(serde_json::Value::as_str).map(
-                        |refusal| ResponseOutputContent::Refusal {
-                            refusal: refusal.to_owned(),
-                        },
-                    ),
+                    Some("refusal") => {
+                        part.get("refusal")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|refusal| ResponseOutputContent::Refusal {
+                                refusal: refusal.to_owned(),
+                            })
+                    }
                     _ => None,
                 }
             })

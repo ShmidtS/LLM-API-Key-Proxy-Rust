@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RouteKind {
@@ -22,7 +23,7 @@ pub struct GuardrailRequest {
     pub provider: String,
     pub upstream_path: String,
     pub model: String,
-    pub body: serde_json::Value,
+    pub body: Arc<serde_json::Value>,
     pub stream: bool,
     pub schema_hint: Option<SchemaHint>,
     pub step_policy: Option<StepPolicy>,
@@ -34,6 +35,8 @@ pub struct GuardrailRequest {
 pub struct GuardrailAttempt {
     pub semantic_retry_index: u32,
     pub max_semantic_retries: u32,
+    pub tool_error_count: u32,
+    pub tool_resolution_error_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -55,6 +58,8 @@ pub enum SchemaHint {
 pub struct StepPolicy {
     pub required_steps: Vec<String>,
     pub before_steps: Vec<String>,
+    #[serde(default)]
+    pub terminal_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -123,12 +128,16 @@ pub struct ValidationOptions {
     pub validate_json_mode: bool,
     pub validate_schema: bool,
     pub validate_steps: bool,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ValidationReport {
     pub ok: bool,
     pub violations: Vec<ValidationIssue>,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
 }
 
 impl ValidationReport {
@@ -136,6 +145,7 @@ impl ValidationReport {
         Self {
             ok: true,
             violations: Vec::new(),
+            allowed_tools: Vec::new(),
         }
     }
 
@@ -143,6 +153,7 @@ impl ValidationReport {
         Self {
             ok: violations.is_empty(),
             violations,
+            allowed_tools: Vec::new(),
         }
     }
 }
@@ -187,7 +198,7 @@ impl Default for ContextBudget {
 pub enum CompactionResult {
     Unchanged,
     Compacted {
-        body: serde_json::Value,
+        body: Arc<serde_json::Value>,
         summary_message: serde_json::Value,
         removed_messages: usize,
     },

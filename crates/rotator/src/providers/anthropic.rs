@@ -37,9 +37,42 @@ impl Provider for AnthropicProvider {
     }
 
     fn transform_request(&self, body: &mut serde_json::Value) {
-        if let Some(object) = body.as_object_mut() {
-            object.remove("stream_options");
+        let Some(object) = body.as_object_mut() else {
+            return;
+        };
+        object.remove("stream_options");
+
+        // Claude 4 adaptive thinking conversion
+        let model_value = object
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let model_name = model_value
+            .split_once('/')
+            .map(|(_, m)| m)
+            .unwrap_or(model_value);
+        if !(model_name.starts_with("claude-opus-4") || model_name.starts_with("claude-sonnet-4")) {
+            return;
         }
+        let Some(effort) = object.get("reasoning_effort").and_then(|v| v.as_str()) else {
+            return;
+        };
+        let effort_str = effort.to_lowercase();
+        if !matches!(effort_str.as_str(), "low" | "medium" | "high") {
+            return;
+        }
+        if object.get("thinking").is_some() || object.get("output_config").is_some() {
+            return;
+        }
+        object.remove("reasoning_effort");
+        object.insert(
+            "thinking".to_owned(),
+            serde_json::json!({"type": "adaptive"}),
+        );
+        object.insert(
+            "output_config".to_owned(),
+            serde_json::json!({"effort": effort_str}),
+        );
     }
 
     async fn request(
@@ -102,5 +135,78 @@ mod tests {
             ]
         );
         assert!(provider.supports_streaming());
+    }
+
+    #[test]
+    fn claude_opus_4_converts_reasoning_effort_to_adaptive_thinking() {
+        let provider = AnthropicProvider::new();
+        let mut body = serde_json::json!({
+            "model": "claude-opus-4-1-20250805",
+            "reasoning_effort": "high",
+            "messages": [{"role": "user", "content": "hello"}],
+        });
+        provider.transform_request(&mut body);
+
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"], serde_json::json!({"effort": "high"}));
+    }
+
+    #[test]
+    fn claude_sonnet_4_converts_reasoning_effort_to_adaptive_thinking() {
+        let provider = AnthropicProvider::new();
+        let mut body = serde_json::json!({
+            "model": "anthropic/claude-sonnet-4-20250514",
+            "reasoning_effort": "medium",
+        });
+        provider.transform_request(&mut body);
+
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(
+            body["output_config"],
+            serde_json::json!({"effort": "medium"})
+        );
+    }
+
+    #[test]
+    fn non_claude_4_reasoning_effort_left_unchanged() {
+        let provider = AnthropicProvider::new();
+        let mut body = serde_json::json!({
+            "model": "claude-3-7-sonnet-20250219",
+            "reasoning_effort": "low",
+        });
+        provider.transform_request(&mut body);
+
+        assert_eq!(body["reasoning_effort"], "low");
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn claude_4_existing_thinking_not_overridden() {
+        let provider = AnthropicProvider::new();
+        let mut body = serde_json::json!({
+            "model": "claude-opus-4-1-20250805",
+            "reasoning_effort": "high",
+            "thinking": {"type": "enabled"},
+        });
+        provider.transform_request(&mut body);
+
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["thinking"], serde_json::json!({"type": "enabled"}));
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn stream_options_still_removed_for_all_models() {
+        let provider = AnthropicProvider::new();
+        let mut body = serde_json::json!({
+            "model": "claude-opus-4-1-20250805",
+            "stream_options": {"include_usage": true},
+        });
+        provider.transform_request(&mut body);
+
+        assert!(body.get("stream_options").is_none());
     }
 }

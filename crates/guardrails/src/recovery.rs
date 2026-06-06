@@ -42,8 +42,10 @@ impl ErrorRecovery for DefaultErrorRecovery {
             return Ok(RecoveryAction::GiveUp);
         }
 
-        if matches!(error.status_code, Some(408 | 409 | 425 | 429 | 500 | 502 | 503 | 504))
-            && config.recovery.retry_same_provider
+        if matches!(
+            error.status_code,
+            Some(408 | 409 | 425 | 429 | 500 | 502 | 503 | 504)
+        ) && config.recovery.retry_same_provider
         {
             return Ok(RecoveryAction::RetrySameRequest);
         }

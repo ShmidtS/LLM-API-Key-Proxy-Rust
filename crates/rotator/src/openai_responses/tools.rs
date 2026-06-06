@@ -12,13 +12,23 @@ pub fn response_tool_to_chat_tool(tool: &ResponseTool) -> Result<ToolDefinition>
             tool_type: tool.type_.clone(),
         });
     }
-    let function = tool
-        .function
+    let name = tool
+        .name
         .clone()
+        .or_else(|| tool.function.as_ref().map(|f| f.name.clone()))
         .ok_or(ResponsesBridgeError::MissingFunctionDefinition)?;
+    let parameters = tool
+        .parameters
+        .clone()
+        .or_else(|| tool.function.as_ref().and_then(|f| f.parameters.clone()))
+        .unwrap_or_else(|| serde_json::json!({"type": "object"}));
     Ok(ToolDefinition {
         r#type: "function".to_owned(),
-        function,
+        function: FunctionDefinition {
+            name,
+            description: tool.description.clone().or_else(|| tool.function.as_ref().and_then(|f| f.description.clone())),
+            parameters,
+        },
     })
 }
 
@@ -33,10 +43,17 @@ pub fn response_tool_choice_to_chat_tool_choice(choice: &ResponseToolChoice) -> 
                     reason: format!("unsupported named tool choice type: {}", choice.type_),
                 });
             }
+            let name = choice
+                .name
+                .clone()
+                .or_else(|| choice.function.as_ref().map(|f| f.name.clone()))
+                .ok_or_else(|| ResponsesBridgeError::InvalidToolChoice {
+                    reason: "named tool choice missing name".to_owned(),
+                })?;
             ToolChoice::Object {
                 r#type: "function".to_owned(),
                 function: FunctionDefinition {
-                    name: choice.function.name.clone(),
+                    name,
                     description: None,
                     parameters: json!({}),
                 },

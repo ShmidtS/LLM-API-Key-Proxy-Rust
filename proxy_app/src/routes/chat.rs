@@ -17,6 +17,7 @@ use futures::StreamExt;
 use guardrails::{GuardrailDecision, RouteKind};
 use models::chat::ChatCompletionRequest;
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn router() -> Router<AppState> {
@@ -50,10 +51,28 @@ async fn chat_completions(
     normalize_model_in_body(&mut body, &provider);
     let override_temperature_zero = state.config.override_temperature_zero.as_deref();
     apply_temperature_override(&mut body, override_temperature_zero);
+    let input_tokens = body
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .map(|messages| rotator::tokenizer::count_chat_tokens(messages, &req.model))
+        .unwrap_or(0);
+    let auto_max_tokens = rotator::calculate_max_tokens(
+        &req.model,
+        input_tokens as u32,
+        req.max_tokens,
+        1000,
+    );
+    if req.max_tokens.is_none() {
+        body["max_tokens"] = serde_json::json!(auto_max_tokens);
+    } else if let Some(existing) = req.max_tokens
+        && existing > auto_max_tokens {
+            body["max_tokens"] = serde_json::json!(auto_max_tokens);
+        }
+    let body = Arc::new(body);
     let upstream_body = if is_anthropic {
         openai_to_anthropic_messages(&body)
     } else {
-        body.clone()
+        (*body).clone()
     };
     let upstream_path = if is_anthropic {
         "messages"
@@ -62,60 +81,169 @@ async fn chat_completions(
     } else {
         "chat/completions"
     };
-    let input_tokens = body
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-        .map(|messages| rotator::tokenizer::count_chat_tokens(messages, &req.model))
-        .unwrap_or(0);
     let input_tokens_header = HeaderValue::from_str(&input_tokens.to_string())
         .unwrap_or_else(|_| HeaderValue::from_static("0"));
 
     if req.stream == Some(true) {
         let guardrails_enabled = state.guardrails.is_some()
             && should_enable_guardrails(RouteKind::ChatCompletions, &state.config.guardrails);
-        if guardrails_enabled && state.config.guardrails.chat.validate_streaming {
-            return Ok(crate::errors::invalid_request_error(
-                "Streaming is not supported while chat guardrails.validate_streaming is enabled.",
-            )
-            .into_response());
+        if !guardrails_enabled {
+            let upstream =
+                request_chat_upstream(&state, &provider, upstream_path, upstream_body, &req.model)
+                    .await?;
+            let status = upstream.status();
+            let headers = upstream.headers().clone();
+            let model = req.model.clone();
+            let mut batcher = ChunkBatcher::new();
+            let mut translator = AnthropicStreamTranslator::new(model.clone());
+            let stream = upstream.bytes_stream().map(move |result| {
+                result
+                    .map(|bytes| {
+                        if is_anthropic {
+                            let output = batcher
+                                .push(bytes)
+                                .iter()
+                                .flat_map(|record| translator.translate_sse_record_to_sse(record))
+                                .collect::<String>();
+                            Bytes::from(output)
+                        } else if is_responses_compat {
+                            Bytes::from(translate_responses_sse_chunk(&bytes, &model))
+                        } else {
+                            bytes
+                        }
+                    })
+                    .map_err(std::io::Error::other)
+            });
+            let mut builder = Response::builder().status(status);
+            if let Some(ct) = headers.get(header::CONTENT_TYPE) {
+                builder = builder.header(header::CONTENT_TYPE, ct);
+            }
+            builder = builder.header("x-input-tokens", input_tokens_header);
+            return Ok(builder.body(Body::from_stream(stream)).unwrap());
         }
-        if guardrails_enabled {
-            tracing::trace!(
-                "streaming chat request bypasses guardrails because validate_streaming is disabled"
+
+        let adapter = state.guardrails.as_ref().unwrap();
+        let mut guardrail_body = Arc::clone(&body);
+        let mut guardrail_attempts = 0;
+        let mut upstream_attempts = 0;
+        loop {
+            if upstream_attempts >= MAX_GUARDRAIL_UPSTREAM_ATTEMPTS {
+                return Err(guardrails::GuardrailError::MaxRetriesExceeded {
+                    attempts: guardrail_attempts,
+                }
+                .into());
+            }
+            upstream_attempts += state
+                .rotator
+                .max_retries()
+                .saturating_add(1)
+                .min(MAX_GUARDRAIL_UPSTREAM_ATTEMPTS.saturating_sub(upstream_attempts));
+
+            let guardrail_request = build_guardrail_request(
+                RouteKind::ChatCompletions,
+                provider.clone(),
+                upstream_path.to_owned(),
+                req.model.clone(),
+                Arc::clone(&guardrail_body),
+                true,
             );
-        }
-        let upstream =
-            request_chat_upstream(&state, &provider, upstream_path, upstream_body, &req.model)
-                .await?;
-        let status = upstream.status();
-        let headers = upstream.headers().clone();
-        let model = req.model.clone();
-        let mut batcher = ChunkBatcher::new();
-        let mut translator = AnthropicStreamTranslator::new(model.clone());
-        let stream = upstream.bytes_stream().map(move |result| {
-            result
-                .map(|bytes| {
-                    if is_anthropic {
-                        let output = batcher
-                            .push(bytes)
-                            .iter()
-                            .flat_map(|record| translator.translate_sse_record_to_sse(record))
-                            .collect::<String>();
-                        Bytes::from(output)
-                    } else if is_responses_compat {
-                        Bytes::from(translate_responses_sse_chunk(&bytes, &model))
-                    } else {
-                        bytes
+            let guardrail_request = adapter.preprocess_request(&guardrail_request)?;
+            let preprocessed_body = Arc::clone(&guardrail_request.body);
+            let attempt_upstream_body = if is_anthropic {
+                openai_to_anthropic_messages(&preprocessed_body)
+            } else {
+                (*preprocessed_body).clone()
+            };
+
+            let resp = request_chat_upstream(
+                &state,
+                &provider,
+                upstream_path,
+                attempt_upstream_body,
+                &req.model,
+            )
+            .await?;
+            let status = resp.status();
+            let _headers = resp.headers().clone();
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| rotator::RotatorError::Http(e.to_string()))?;
+
+            let openai_sse_bytes = if is_anthropic {
+                let mut batcher = ChunkBatcher::new();
+                let mut translator = AnthropicStreamTranslator::new(req.model.clone());
+                let records = batcher.push(bytes);
+                let mut output = String::new();
+                for record in records {
+                    for part in translator.translate_sse_record_to_sse(&record) {
+                        output.push_str(&part);
                     }
-                })
-                .map_err(std::io::Error::other)
-        });
-        let mut builder = Response::builder().status(status);
-        if let Some(ct) = headers.get(header::CONTENT_TYPE) {
-            builder = builder.header(header::CONTENT_TYPE, ct);
+                }
+                output.into_bytes()
+            } else if is_responses_compat {
+                translate_responses_sse_chunk(&bytes, &req.model).into_bytes()
+            } else {
+                bytes.to_vec()
+            };
+
+            let records = sse_data_records(&openai_sse_bytes);
+            let mut frames = Vec::with_capacity(records.len());
+            for record in records {
+                if record == "[DONE]" {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_str::<Value>(&record) {
+                    frames.push(value);
+                }
+            }
+
+            let decision = adapter
+                .evaluate_streaming(&guardrail_request, frames)
+                .await?;
+
+            match decision {
+                GuardrailDecision::Accept { ref response, .. }
+                | GuardrailDecision::Repair { ref response, .. } => {
+                    let sse_body = guardrails::chat_completion_to_sse_bytes(&response.body);
+                    let mut builder = Response::builder().status(status);
+                    builder = builder.header(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    );
+                    builder = builder.header("x-input-tokens", input_tokens_header);
+                    if cfg!(debug_assertions) {
+                        let trace = match decision {
+                            GuardrailDecision::Accept { .. } => "accept",
+                            GuardrailDecision::Repair { .. } => "repair",
+                            _ => unreachable!(),
+                        };
+                        builder =
+                            builder.header("x-guardrail-trace", HeaderValue::from_static(trace));
+                    }
+                    return Ok(builder.body(Body::from(sse_body)).unwrap());
+                }
+                GuardrailDecision::Retry { request, .. } => {
+                    let max_guardrail_retries = adapter
+                        .config()
+                        .max_guardrail_retries
+                        .min(MAX_GUARDRAIL_RETRY_ATTEMPTS);
+                    if guardrail_attempts >= max_guardrail_retries {
+                        return Err(guardrails::GuardrailError::MaxRetriesExceeded {
+                            attempts: guardrail_attempts,
+                        }
+                        .into());
+                    }
+                    guardrail_body = request.body;
+                    guardrail_attempts += 1;
+                }
+                decision @ (GuardrailDecision::Reject { .. } | GuardrailDecision::Abort { .. }) => {
+                    if let Some(response) = decision_to_error_response(&decision) {
+                        return Ok(response);
+                    }
+                }
+            }
         }
-        builder = builder.header("x-input-tokens", input_tokens_header);
-        return Ok(builder.body(Body::from_stream(stream)).unwrap());
     }
 
     if state.guardrails.is_none()
@@ -165,7 +293,7 @@ async fn chat_completions(
         return Ok(response);
     };
 
-    let mut guardrail_body = body.clone();
+    let mut guardrail_body = Arc::clone(&body);
     let mut guardrail_attempts = 0;
     let mut upstream_attempts = 0;
     loop {
@@ -174,15 +302,15 @@ async fn chat_completions(
             provider.clone(),
             upstream_path.to_owned(),
             req.model.clone(),
-            guardrail_body.clone(),
+            Arc::clone(&guardrail_body),
             false,
         );
         let guardrail_request = adapter.preprocess_request(&guardrail_request)?;
-        let preprocessed_body = guardrail_request.body.clone();
+        let preprocessed_body = Arc::clone(&guardrail_request.body);
         let attempt_upstream_body = if is_anthropic {
             openai_to_anthropic_messages(&preprocessed_body)
         } else {
-            preprocessed_body.clone()
+            (*preprocessed_body).clone()
         };
         if upstream_attempts >= MAX_GUARDRAIL_UPSTREAM_ATTEMPTS {
             return Err(guardrails::GuardrailError::MaxRetriesExceeded {
@@ -211,7 +339,9 @@ async fn chat_completions(
             .await?;
 
         match decision {
-            GuardrailDecision::Accept { response: accepted, .. } => {
+            GuardrailDecision::Accept {
+                response: accepted, ..
+            } => {
                 let mut response = buffered_json_response(status, &headers, accepted.body);
                 response
                     .headers_mut()
@@ -223,7 +353,9 @@ async fn chat_completions(
                 }
                 return Ok(response);
             }
-            GuardrailDecision::Repair { response: repaired, .. } => {
+            GuardrailDecision::Repair {
+                response: repaired, ..
+            } => {
                 let mut response = buffered_json_response(status, &headers, repaired.body);
                 response
                     .headers_mut()
@@ -433,16 +565,28 @@ fn chat_sse_payload(
 }
 
 fn sse_data_records(bytes: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(bytes)
-        .split("\n\n")
-        .filter_map(|record| {
-            let lines: Vec<_> = record
-                .lines()
-                .filter_map(|line| line.strip_prefix("data: "))
-                .collect();
-            (!lines.is_empty()).then(|| lines.join("\n"))
-        })
-        .collect()
+    let text = String::from_utf8_lossy(bytes);
+    let mut records = Vec::new();
+    let mut current_data = String::new();
+
+    for line in text.lines() {
+        if line.is_empty() {
+            if !current_data.is_empty() {
+                records.push(std::mem::take(&mut current_data));
+            }
+        } else if let Some(data) = line.strip_prefix("data: ") {
+            if !current_data.is_empty() {
+                current_data.push('\n');
+            }
+            current_data.push_str(data);
+        }
+    }
+
+    if !current_data.is_empty() {
+        records.push(current_data);
+    }
+
+    records
 }
 
 fn response_output_text(response: &Value) -> String {

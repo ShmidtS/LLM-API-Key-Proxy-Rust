@@ -31,6 +31,23 @@ pub trait SchemaValidator: Send + Sync {
     ) -> Result<Vec<ValidationIssue>, GuardrailError>;
 }
 
+pub fn extract_allowed_tools(body: &Value) -> Vec<String> {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    tool.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DefaultResponseValidator;
 
@@ -49,10 +66,18 @@ impl ResponseValidator for DefaultResponseValidator {
         let body = &response.body;
         let chat_response = serde_json::from_value::<ChatCompletionResponse>(body.clone()).ok();
 
+        let mut options = options.clone();
+        if options.allowed_tools.is_empty() {
+            options.allowed_tools = extract_allowed_tools(&request.body);
+        }
+
         if options.validate_tool_calls || matches!(request.schema_hint, Some(SchemaHint::ToolCalls))
         {
             match &chat_response {
-                Some(parsed) => validate_tool_calls(parsed, &mut violations),
+                Some(parsed) => {
+                    validate_tool_calls(parsed, &options, &mut violations);
+                    validate_bare_text_when_tools_available(parsed, &options, &mut violations);
+                }
                 None => violations.push(issue(
                     "response",
                     "response is not a valid chat completion response",
@@ -98,7 +123,11 @@ impl ResponseValidator for DefaultResponseValidator {
             );
         }
 
-        Ok(ValidationReport::from_violations(violations))
+        Ok(ValidationReport {
+            ok: violations.is_empty(),
+            violations,
+            allowed_tools: options.allowed_tools,
+        })
     }
 }
 
@@ -106,9 +135,10 @@ impl ToolCallValidator for DefaultResponseValidator {
     fn validate_tool_calls(
         &self,
         response: &GuardrailResponse,
-        _allowed_tools: &[ToolSpec],
+        allowed_tools: &[ToolSpec],
     ) -> Result<Vec<ValidationIssue>, GuardrailError> {
-        let Some(parsed) = serde_json::from_value::<ChatCompletionResponse>(response.body.clone()).ok()
+        let Some(parsed) =
+            serde_json::from_value::<ChatCompletionResponse>(response.body.clone()).ok()
         else {
             return Ok(vec![issue(
                 "response",
@@ -117,7 +147,12 @@ impl ToolCallValidator for DefaultResponseValidator {
             )]);
         };
         let mut violations = Vec::new();
-        validate_tool_calls(&parsed, &mut violations);
+        let options = ValidationOptions {
+            validate_tool_calls: true,
+            allowed_tools: allowed_tools.iter().map(|t| t.name.clone()).collect(),
+            ..ValidationOptions::default()
+        };
+        validate_tool_calls(&parsed, &options, &mut violations);
         Ok(violations)
     }
 }
@@ -134,11 +169,15 @@ impl SchemaValidator for DefaultResponseValidator {
     }
 }
 
-fn validate_tool_calls(response: &ChatCompletionResponse, violations: &mut Vec<ValidationIssue>) {
+fn validate_tool_calls(
+    response: &ChatCompletionResponse,
+    options: &ValidationOptions,
+    violations: &mut Vec<ValidationIssue>,
+) {
     for (choice_index, choice) in response.choices.iter().enumerate() {
         if let Some(tool_calls) = &choice.message.tool_calls {
             for (tool_index, tool_call) in tool_calls.iter().enumerate() {
-                validate_tool_call(choice_index, tool_index, tool_call, violations);
+                validate_tool_call(choice_index, tool_index, tool_call, options, violations);
             }
         }
     }
@@ -148,6 +187,7 @@ fn validate_tool_call(
     choice_index: usize,
     tool_index: usize,
     tool_call: &ToolCall,
+    options: &ValidationOptions,
     violations: &mut Vec<ValidationIssue>,
 ) {
     let prefix = format!("choices.{choice_index}.message.tool_calls.{tool_index}");
@@ -172,12 +212,48 @@ fn validate_tool_call(
             "error",
         ));
     }
+    if !options.allowed_tools.is_empty()
+        && !options.allowed_tools.contains(&tool_call.function.name)
+    {
+        violations.push(issue(
+            format!("{prefix}.function.name"),
+            format!("unknown tool name `{}`", tool_call.function.name),
+            "error",
+        ));
+    }
     if serde_json::from_str::<Value>(&tool_call.function.arguments).is_err() {
         violations.push(issue(
             format!("{prefix}.function.arguments"),
             "tool function arguments must be valid JSON",
             "error",
         ));
+    }
+}
+
+fn validate_bare_text_when_tools_available(
+    response: &ChatCompletionResponse,
+    options: &ValidationOptions,
+    violations: &mut Vec<ValidationIssue>,
+) {
+    if !options.validate_tool_calls || options.allowed_tools.is_empty() {
+        return;
+    }
+    for (choice_index, choice) in response.choices.iter().enumerate() {
+        let has_tool_calls = choice
+            .message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|tc| !tc.is_empty());
+        if !has_tool_calls
+            && let Some(content) = message_text(&choice.message)
+            && !content.trim().is_empty()
+        {
+            violations.push(issue(
+                format!("choices.{choice_index}.message.content"),
+                "response contains bare text but tools are available; please use a tool",
+                "error",
+            ));
+        }
     }
 }
 

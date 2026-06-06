@@ -1,7 +1,7 @@
 use crate::types::{ContextBudget, GuardrailMode, RouteKind, TokenBudget};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GuardrailsConfig {
     pub enabled: bool,
@@ -11,6 +11,8 @@ pub struct GuardrailsConfig {
     pub responses: RouteGuardrailConfig,
     pub max_rescue_attempts: u32,
     pub max_guardrail_retries: u32,
+    pub max_tool_errors: u32,
+    pub max_tool_resolution_errors: u32,
     pub context: ContextCompactionConfig,
     pub context_compaction: ContextCompactionConfig,
     pub vram: VramConfig,
@@ -93,6 +95,27 @@ pub struct RecoveryConfig {
     pub retry_same_provider: bool,
     pub retry_fallback_provider: bool,
     pub retry_model_swap: bool,
+}
+
+impl Default for GuardrailsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_semantic_retries: 0,
+            chat_completions: RouteGuardrailConfig::default(),
+            anthropic_messages: RouteGuardrailConfig::default(),
+            responses: RouteGuardrailConfig::default(),
+            max_rescue_attempts: 0,
+            max_guardrail_retries: 0,
+            max_tool_errors: 2,
+            max_tool_resolution_errors: 2,
+            context: ContextCompactionConfig::default(),
+            context_compaction: ContextCompactionConfig::default(),
+            vram: VramConfig::default(),
+            trace: GuardrailTraceConfig::default(),
+            recovery: RecoveryConfig::default(),
+        }
+    }
 }
 
 impl GuardrailsConfig {

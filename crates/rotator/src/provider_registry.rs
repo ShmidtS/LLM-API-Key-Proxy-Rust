@@ -20,13 +20,14 @@ pub enum ProviderAction {
     Embeddings,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ProviderDefinition {
     pub id: String,
     pub display_name: String,
     pub base_url: String,
     pub auth_type: AuthType,
     pub model_patterns: Vec<String>,
+    pub compiled_patterns: Vec<Regex>,
     pub endpoints: Vec<String>,
     pub features: Vec<String>,
     pub model_count: usize,
@@ -37,11 +38,38 @@ pub struct ProviderDefinition {
     pub client_secret: Option<String>,
 }
 
+impl PartialEq for ProviderDefinition {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.display_name == other.display_name
+            && self.base_url == other.base_url
+            && self.auth_type == other.auth_type
+            && self.model_patterns == other.model_patterns
+            && self.endpoints == other.endpoints
+            && self.features == other.features
+            && self.model_count == other.model_count
+            && self.timeout_secs == other.timeout_secs
+            && self.default_headers == other.default_headers
+            && self.token_endpoint == other.token_endpoint
+            && self.client_id == other.client_id
+            && self.client_secret == other.client_secret
+    }
+}
+
+impl Eq for ProviderDefinition {}
+
+/// Registry of provider definitions.
+///
+/// **Note on `Default`:** `ProviderRegistry::default()` creates an *empty*
+/// registry with no providers. Use `ProviderRegistry::new()` for a registry
+/// pre-populated with the built-in default provider definitions.
 #[derive(Debug, Default)]
 pub struct ProviderRegistry {
     providers: DashMap<String, ProviderDefinition>,
     provider_models: HashMap<String, Vec<String>>,
+    env_model_patterns: HashMap<String, Vec<String>>,
     model_filter: ModelFilterEngine,
+    cached_providers: std::sync::RwLock<Vec<ProviderDefinition>>,
 }
 
 impl ProviderRegistry {
@@ -49,7 +77,9 @@ impl ProviderRegistry {
         let registry = Self {
             providers: DashMap::new(),
             provider_models: parse_provider_models_env(),
+            env_model_patterns: HashMap::new(),
             model_filter: ModelFilterEngine::default(),
+            cached_providers: std::sync::RwLock::new(Vec::new()),
         };
         for provider in default_provider_definitions() {
             registry.register(provider);
@@ -59,7 +89,21 @@ impl ProviderRegistry {
 
     pub fn register(&self, mut def: ProviderDefinition) {
         def.id = normalize_provider_id(&def.id);
-        self.providers.insert(def.id.clone(), def);
+        def.compiled_patterns = def
+            .model_patterns
+            .iter()
+            .filter_map(|pattern| Regex::new(pattern).ok())
+            .collect();
+        let id = def.id.clone();
+        self.providers.insert(id.clone(), def.clone());
+
+        let mut cached = self.cached_providers.write().unwrap();
+        if let Some(pos) = cached.iter().position(|p| p.id == id) {
+            cached[pos] = def;
+        } else {
+            cached.push(def);
+        }
+        cached.sort_by(|left, right| left.id.cmp(&right.id));
     }
 
     pub fn get(&self, id: &str) -> Option<ProviderDefinition> {
@@ -97,10 +141,13 @@ impl ProviderRegistry {
     ///   PROXY_<PROVIDER>_TIMEOUT=60
     /// If a variable is set for a provider already in the default registry, it overrides the default.
     pub fn load_from_env(&mut self) {
+        self.env_model_patterns.clear();
         let mut provider_keys: Vec<String> = self
-            .providers
+            .cached_providers
+            .read()
+            .unwrap()
             .iter()
-            .map(|entry| provider_env_key(entry.key()))
+            .map(|p| provider_env_key(&p.id))
             .collect();
         for (key, _) in std::env::vars() {
             if let Some(provider_key) = key
@@ -173,11 +220,12 @@ impl ProviderRegistry {
                 .or_else(|| self.get(&id).and_then(|def| def.client_secret));
 
             self.register(ProviderDefinition {
-                id,
+                id: id.clone(),
                 display_name,
                 base_url,
                 auth_type,
-                model_patterns,
+                model_patterns: model_patterns.clone(),
+                compiled_patterns: Vec::new(),
                 endpoints,
                 features,
                 model_count,
@@ -187,24 +235,23 @@ impl ProviderRegistry {
                 client_id,
                 client_secret,
             });
+            if std::env::var(format!("PROXY_{provider_key}_MODELS")).is_ok() {
+                self.env_model_patterns.insert(id, model_patterns);
+            }
         }
 
         let provider_ids: Vec<String> = self
-            .providers
+            .cached_providers
+            .read()
+            .unwrap()
             .iter()
-            .map(|entry| entry.key().to_owned())
+            .map(|p| p.id.clone())
             .collect();
         self.model_filter = ModelFilterEngine::from_env(provider_ids.iter().map(String::as_str));
     }
 
     pub fn all_providers(&self) -> Vec<ProviderDefinition> {
-        let mut providers: Vec<_> = self
-            .providers
-            .iter()
-            .map(|entry| entry.value().clone())
-            .collect();
-        providers.sort_by(|left, right| left.id.cmp(&right.id));
-        providers
+        self.cached_providers.read().unwrap().clone()
     }
 
     pub fn get_provider_endpoints(&self, id: &str) -> Option<Vec<String>> {
@@ -226,6 +273,12 @@ impl ProviderRegistry {
         let provider = normalize_provider_id(provider);
         if matches!(provider.as_str(), "elysiver" | "colin")
             && path.trim_start_matches('/') == "chat/completions"
+        {
+            return "responses".to_owned();
+        }
+        if provider.as_str() == "openai"
+            && path.trim_start_matches('/') == "chat/completions"
+            && crate::providers::is_openai_responses_model(body)
         {
             return "responses".to_owned();
         }
@@ -268,13 +321,13 @@ impl ProviderRegistry {
         static_provider_for_model(model)
             .map(ToOwned::to_owned)
             .or_else(|| {
-                self.all_providers().into_iter().find_map(|provider| {
+                self.providers.iter().find_map(|entry| {
+                    let provider = entry.value();
                     provider
-                        .model_patterns
+                        .compiled_patterns
                         .iter()
-                        .filter_map(|pattern| Regex::new(pattern).ok())
                         .any(|regex| regex.is_match(model))
-                        .then_some(provider.id)
+                        .then_some(provider.id.clone())
                 })
             })
     }
@@ -296,15 +349,11 @@ impl ProviderRegistry {
                     .then_some(normalize_provider_id(provider))
             })
             .or_else(|| {
-                self.all_providers().into_iter().find_map(|provider| {
-                    let provider_key = provider_env_key(&provider.id);
-                    let env_name = format!("{provider_key}_MODELS");
-                    std::env::var(env_name).ok().and_then(|models| {
-                        parse_models_csv(&models)
-                            .into_iter()
-                            .any(|name| name == model)
-                            .then_some(provider.id)
-                    })
+                self.env_model_patterns.iter().find_map(|(provider, models)| {
+                    models
+                        .iter()
+                        .any(|name| name == model)
+                        .then_some(normalize_provider_id(provider))
                 })
             })
             .or_else(|| static_provider_for_model(model).map(ToOwned::to_owned))
@@ -398,7 +447,28 @@ fn static_provider_models(id: &str) -> &'static [&'static str] {
         ],
         "qwen" => &["qwen-plus", "qwen-max", "qwen-turbo", "qwq-plus"],
         "qwen_code" => &["qwen_code/qwen3-coder-plus", "qwen3-coder-plus"],
-        "zai" => &["glm-4.5", "glm-4.5-air", "zai/glm-4.5"],
+        "zai" => &[
+            "zai/glm-5.1",
+            "zai/glm-5",
+            "zai/glm-5-turbo",
+            "zai/glm-4.7",
+            "zai/glm-4.6",
+            "zai/glm-4.5",
+            "zai/glm-4-32b-0414-128k",
+            "zai/glm-5v-turbo",
+            "zai/glm-4.6v",
+            "zai/glm-ocr",
+            "zai/autoglm-phone-multilingual",
+            "zai/glm-4.5v",
+            "zai/glm-image",
+            "zai/cogView-4-250304",
+            "zai/cogvideox-3",
+            "zai/viduq1-text",
+            "zai/viduq1-image",
+            "zai/vidu2-image",
+            "zai/glm-asr-2512",
+            "zai/glm-4.5-air",
+        ],
         "iflow" => &["iflow/Qwen3-Coder", "kimi-k2", "Qwen3-Coder"],
         "colin" => &[
             "colin/claude-sonnet-4",
@@ -408,7 +478,15 @@ fn static_provider_models(id: &str) -> &'static [&'static str] {
         ],
         "elysiver" => &["elysiver/claude-sonnet-4", "elysiver/gpt-4o", "gpt-5.5"],
         "chutes" => &["chutes/deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-R1"],
-        "nanogpt" => &["nanogpt/gpt-4o", "nano-gpt/claude-sonnet-4"],
+        "nanogpt" => &[
+            "nanogpt/gpt-4o",
+            "nanogpt/gpt-4o-mini",
+            "nanogpt/claude-3.5-sonnet",
+            "nanogpt/claude-3.5-haiku",
+            "nanogpt/gemini-2.5-flash",
+            "nanogpt/gemini-2.5-pro",
+            "nano-gpt/claude-sonnet-4",
+        ],
         "opencode" => &["opencode/zen", "zen/gpt-4o"],
         "firmware" => &["firmware/gpt-4o", "fw/claude-sonnet-4"],
         "antigravity" => &["antigravity/gemini-2.5-pro", "ag/gemini-2.5-flash"],
@@ -678,18 +756,25 @@ fn provider(
     timeout_secs: u64,
     default_headers: &[(&str, &str)],
 ) -> ProviderDefinition {
+    let model_patterns: Vec<String> = model_patterns
+        .iter()
+        .map(|pattern| (*pattern).to_owned())
+        .collect();
+    let model_count = model_patterns.len();
+    let compiled_patterns = model_patterns
+        .iter()
+        .filter_map(|pattern| Regex::new(pattern).ok())
+        .collect();
     ProviderDefinition {
         id: id.to_owned(),
         display_name: provider_display_name(id),
         base_url: base_url.to_owned(),
         auth_type,
-        model_patterns: model_patterns
-            .iter()
-            .map(|pattern| (*pattern).to_owned())
-            .collect(),
+        model_patterns,
+        compiled_patterns,
         endpoints: provider_endpoints(id),
         features: provider_features(id),
-        model_count: model_patterns.len(),
+        model_count,
         timeout_secs,
         default_headers: default_headers
             .iter()
@@ -748,6 +833,12 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn default_registry_is_empty() {
+        let registry = ProviderRegistry::default();
+        assert!(registry.all_providers().is_empty());
+    }
 
     #[test]
     fn default_registry_resolves_provider_base_url() {
@@ -1060,6 +1151,68 @@ mod tests {
         unsafe {
             std::env::remove_var("MODEL_ALLOWLIST");
             std::env::remove_var("MODEL_DENYLIST");
+        }
+    }
+
+    #[test]
+    fn nanogpt_static_catalog_contains_fallback_models() {
+        let registry = ProviderRegistry::new();
+        for model in [
+            "nanogpt/gpt-4o",
+            "nanogpt/gpt-4o-mini",
+            "nanogpt/claude-3.5-sonnet",
+            "nanogpt/claude-3.5-haiku",
+            "nanogpt/gemini-2.5-flash",
+            "nanogpt/gemini-2.5-pro",
+            "nano-gpt/claude-sonnet-4",
+        ] {
+            assert!(
+                registry.resolve_provider_by_model(model).as_deref() == Some("nanogpt"),
+                "expected {model} to resolve to nanogpt"
+            );
+        }
+    }
+
+    #[test]
+    fn zai_static_catalog_contains_documented_models() {
+        let registry = ProviderRegistry::new();
+        for model in [
+            "zai/glm-5.1",
+            "zai/glm-5",
+            "zai/glm-5-turbo",
+            "zai/glm-4.7",
+            "zai/glm-4.6",
+            "zai/glm-4.5",
+            "zai/glm-5v-turbo",
+            "zai/glm-ocr",
+            "zai/cogvideox-3",
+        ] {
+            assert!(
+                registry.resolve_provider_by_model(model).as_deref() == Some("zai"),
+                "expected {model} to resolve to zai"
+            );
+        }
+    }
+
+    #[test]
+    fn chutes_static_catalog_contains_fallback_models() {
+        let registry = ProviderRegistry::new();
+        for model in ["chutes/deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-R1"] {
+            assert!(
+                registry.resolve_provider_by_model(model).as_deref() == Some("chutes"),
+                "expected {model} to resolve to chutes"
+            );
+        }
+    }
+
+    #[test]
+    fn firmware_static_catalog_contains_fallback_models() {
+        let registry = ProviderRegistry::new();
+        for model in ["firmware/gpt-4o", "fw/claude-sonnet-4"] {
+            assert!(
+                registry.resolve_provider_by_model(model).as_deref() == Some("firmware"),
+                "expected {model} to resolve to firmware"
+            );
         }
     }
 }

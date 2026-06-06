@@ -6,14 +6,74 @@ use reqwest::{
     header::{HeaderMap, RETRY_AFTER},
 };
 
+/// Область действия rate-limit, влияющая на стратегию восстановления.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThrottleScope {
+    /// Throttle на уровне IP: ротация ключа не поможет (все ключи с одного IP).
+    /// Требуется provider-level cooldown + open circuit.
+    Ip,
+    /// Throttle на уровне отдельного credential: ротация на другой ключ помогает.
+    Credential,
+    /// Область неизвестна (нет явных индикаторов в body).
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum FailureClass {
-    RateLimit { retry_after: Option<Duration> },
+    RateLimit {
+        retry_after: Option<Duration>,
+        scope: ThrottleScope,
+    },
     ProviderAbort,
     StreamError,
     QuotaExceeded,
+    /// 401/403 — текущий ключ невалиден/запрещён. Другой ключ может работать,
+    /// поэтому ротируем (паритет с Python authentication/forbidden rotation).
+    AuthError,
+    /// Ответ содержит мусорный/некачественный контент (гарbage detection).
+    /// Ротируем на другой ключ, т.к. проблема может быть специфична
+    /// для текущего бэкенда/квоты.
+    GarbageResponse {
+        reason: String,
+        score: f32,
+    },
     Transient,
     Fatal,
+}
+
+/// Провайдеры-прокси: агрегируют несколько бэкендов или общие квоты, поэтому
+/// 429 на нескольких ключах НЕ означает IP-throttle. Для них IP-корреляция
+/// пропускается, применяется credential-level cooldown (паритет с Python PROXY_PROVIDERS).
+pub const PROXY_PROVIDERS: &[&str] = &[
+    "kilocode",
+    "openrouter",
+    "requesty",
+    "opencode",
+    "inception",
+    "nvidia",
+    "zai",
+    "friendli",
+];
+
+/// Явные индикаторы IP-throttle в теле ответа (паритет с Python IP_THROTTLE_INDICATORS).
+const IP_THROTTLE_INDICATORS: &[&str] = &[
+    "rate limit exceeded for your ip",
+    "too many requests from your ip",
+    "rate limit exceeded for ip",
+    "too many requests from ip",
+    "ip rate limit",
+    "rate limit exceeded for your ip address",
+    "per-ip rate limit",
+];
+
+pub fn is_proxy_provider(provider: &str) -> bool {
+    PROXY_PROVIDERS.contains(&provider)
+}
+
+fn detect_ip_throttle(body_text: &str) -> bool {
+    IP_THROTTLE_INDICATORS
+        .iter()
+        .any(|indicator| body_text.contains(indicator))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,18 +87,57 @@ pub enum RetryDecision {
 }
 
 pub fn decide_retry(failure: FailureClass, attempt: u32, max_retries: u32) -> RetryDecision {
+    decide_retry_for_provider(failure, attempt, max_retries, None)
+}
+
+/// Решение о повторе с учётом провайдера. Для proxy-провайдеров (см. PROXY_PROVIDERS)
+/// 429 без явного IP-индикатора трактуется как credential-throttle (ротация ключа),
+/// а не provider-cooldown — паритет с Python handle_429_error.
+pub fn decide_retry_for_provider(
+    failure: FailureClass,
+    attempt: u32,
+    max_retries: u32,
+    provider: Option<&str>,
+) -> RetryDecision {
     let attempts_remain = attempt < max_retries;
+    let is_proxy = provider.is_some_and(is_proxy_provider);
 
     match failure {
+        // Явный IP-throttle: ротация ключа бесполезна (все ключи с одного IP) →
+        // provider-level cooldown.
+        FailureClass::RateLimit {
+            scope: ThrottleScope::Ip,
+            retry_after,
+        } if attempts_remain => RetryDecision::CooldownProvider {
+            duration: retry_after.unwrap_or_else(|| get_retry_backoff(attempt, 1_000, 60_000)),
+        },
+        // Явный retry-after на уровне ключа → cooldown этого ключа.
         FailureClass::RateLimit {
             retry_after: Some(duration),
+            scope: _,
         } if attempts_remain => RetryDecision::CooldownKey { duration },
-        FailureClass::RateLimit { retry_after: None } if attempts_remain => {
-            RetryDecision::CooldownProvider {
-                duration: get_retry_backoff(attempt, 1_000, 60_000),
+        // 429 без retry-after: для proxy-провайдеров — credential cooldown (ротация),
+        // иначе консервативно — provider cooldown.
+        FailureClass::RateLimit {
+            retry_after: None,
+            scope: _,
+        } if attempts_remain => {
+            if is_proxy {
+                RetryDecision::CooldownKey {
+                    duration: get_retry_backoff(attempt, 1_000, 60_000),
+                }
+            } else {
+                RetryDecision::CooldownProvider {
+                    duration: get_retry_backoff(attempt, 1_000, 60_000),
+                }
             }
         }
-        FailureClass::ProviderAbort | FailureClass::QuotaExceeded if attempts_remain => {
+        FailureClass::ProviderAbort
+        | FailureClass::QuotaExceeded
+        | FailureClass::AuthError
+        | FailureClass::GarbageResponse { .. }
+            if attempts_remain =>
+        {
             RetryDecision::RotateKey
         }
         FailureClass::StreamError | FailureClass::Transient if attempts_remain => {
@@ -48,6 +147,8 @@ pub fn decide_retry(failure: FailureClass, attempt: u32, max_retries: u32) -> Re
         | FailureClass::RateLimit { .. }
         | FailureClass::ProviderAbort
         | FailureClass::QuotaExceeded
+        | FailureClass::AuthError
+        | FailureClass::GarbageResponse { .. }
         | FailureClass::StreamError
         | FailureClass::Transient => RetryDecision::Abort,
     }
@@ -103,14 +204,24 @@ pub fn classify_upstream_failure(
     }
 
     if status == StatusCode::TOO_MANY_REQUESTS {
+        let scope = if detect_ip_throttle(&body_text) {
+            ThrottleScope::Ip
+        } else {
+            ThrottleScope::Unknown
+        };
         return FailureClass::RateLimit {
             retry_after: retry_after_from_headers(headers)
                 .or_else(|| parsed_body.as_ref().and_then(retry_after_from_body)),
+            scope,
         };
     }
 
     if status.is_server_error() || status.as_u16() == 529 {
         return FailureClass::Transient;
+    }
+
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        return FailureClass::AuthError;
     }
 
     FailureClass::Fatal
@@ -246,7 +357,8 @@ mod tests {
         assert_eq!(
             decide_retry(
                 FailureClass::RateLimit {
-                    retry_after: Some(Duration::from_secs(3))
+                    retry_after: Some(Duration::from_secs(3)),
+                    scope: ThrottleScope::Unknown,
                 },
                 0,
                 1,
@@ -259,13 +371,82 @@ mod tests {
 
     #[test]
     fn rate_limit_without_retry_after_cools_down_provider() {
-        let decision = decide_retry(FailureClass::RateLimit { retry_after: None }, 0, 1);
+        let decision = decide_retry(
+            FailureClass::RateLimit {
+                retry_after: None,
+                scope: ThrottleScope::Unknown,
+            },
+            0,
+            1,
+        );
 
         let RetryDecision::CooldownProvider { duration } = decision else {
             panic!("expected provider cooldown");
         };
         assert!(duration <= Duration::from_millis(60_000));
         assert!(duration >= Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn proxy_provider_429_without_retry_after_rotates_key() {
+        // Для proxy-провайдера 429 без retry-after → credential cooldown (ротация),
+        // не provider cooldown.
+        let decision = decide_retry_for_provider(
+            FailureClass::RateLimit {
+                retry_after: None,
+                scope: ThrottleScope::Unknown,
+            },
+            0,
+            1,
+            Some("openrouter"),
+        );
+        assert!(matches!(decision, RetryDecision::CooldownKey { .. }));
+    }
+
+    #[test]
+    fn explicit_ip_throttle_cools_down_provider_even_for_proxy() {
+        // Явный IP-throttle всегда provider-level, даже для proxy-провайдера.
+        let decision = decide_retry_for_provider(
+            FailureClass::RateLimit {
+                retry_after: None,
+                scope: ThrottleScope::Ip,
+            },
+            0,
+            1,
+            Some("openrouter"),
+        );
+        assert!(matches!(decision, RetryDecision::CooldownProvider { .. }));
+    }
+
+    #[test]
+    fn classifies_429_ip_indicator_body_as_ip_scope() {
+        let headers = HeaderMap::new();
+        let failure = classify_upstream_failure(
+            StatusCode::TOO_MANY_REQUESTS,
+            &headers,
+            Some(r#"{"error":{"message":"Rate limit exceeded for your IP"}}"#),
+        );
+        assert!(matches!(
+            failure,
+            FailureClass::RateLimit {
+                scope: ThrottleScope::Ip,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn non_proxy_429_without_retry_after_cools_down_provider() {
+        let decision = decide_retry_for_provider(
+            FailureClass::RateLimit {
+                retry_after: None,
+                scope: ThrottleScope::Unknown,
+            },
+            0,
+            1,
+            Some("openai"),
+        );
+        assert!(matches!(decision, RetryDecision::CooldownProvider { .. }));
     }
 
     #[test]
@@ -305,7 +486,8 @@ mod tests {
         assert_eq!(
             decide_retry(
                 FailureClass::RateLimit {
-                    retry_after: Some(Duration::from_secs(3))
+                    retry_after: Some(Duration::from_secs(3)),
+                    scope: ThrottleScope::Unknown,
                 },
                 1,
                 1,
@@ -369,7 +551,8 @@ mod tests {
         assert_eq!(
             failure,
             FailureClass::RateLimit {
-                retry_after: Some(Duration::from_secs(7))
+                retry_after: Some(Duration::from_secs(7)),
+                scope: ThrottleScope::Unknown,
             }
         );
     }
@@ -387,7 +570,8 @@ mod tests {
         assert_eq!(
             failure,
             FailureClass::RateLimit {
-                retry_after: Some(Duration::from_secs_f64(2.5))
+                retry_after: Some(Duration::from_secs_f64(2.5)),
+                scope: ThrottleScope::Unknown,
             }
         );
     }
@@ -405,6 +589,7 @@ mod tests {
 
         let FailureClass::RateLimit {
             retry_after: Some(retry_after),
+            ..
         } = failure
         else {
             panic!("expected rate limit with retry_after");
@@ -436,6 +621,70 @@ mod tests {
         assert_eq!(
             classify_upstream_failure(StatusCode::BAD_REQUEST, &headers, None),
             FailureClass::Fatal
+        );
+    }
+
+    #[test]
+    fn classifies_401_and_403_as_auth_error() {
+        let headers = HeaderMap::new();
+
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            assert_eq!(
+                classify_upstream_failure(status, &headers, None),
+                FailureClass::AuthError
+            );
+        }
+    }
+
+    #[test]
+    fn auth_error_rotates_key_then_aborts_when_exhausted() {
+        assert_eq!(
+            decide_retry(FailureClass::AuthError, 0, 1),
+            RetryDecision::RotateKey
+        );
+        assert_eq!(
+            decide_retry(FailureClass::AuthError, 1, 1),
+            RetryDecision::Abort
+        );
+    }
+
+    #[test]
+    fn garbage_response_rotates_key_then_aborts_when_exhausted() {
+        assert_eq!(
+            decide_retry(
+                FailureClass::GarbageResponse {
+                    reason: "word repetition".to_string(),
+                    score: 1.0,
+                },
+                0,
+                1,
+            ),
+            RetryDecision::RotateKey
+        );
+        assert_eq!(
+            decide_retry(
+                FailureClass::GarbageResponse {
+                    reason: "word repetition".to_string(),
+                    score: 1.0,
+                },
+                1,
+                1,
+            ),
+            RetryDecision::Abort
+        );
+    }
+
+    #[test]
+    fn quota_in_403_body_still_wins_over_auth() {
+        // 403 с quota-индикатором классифицируется как QuotaExceeded, не AuthError.
+        let headers = HeaderMap::new();
+        assert_eq!(
+            classify_upstream_failure(
+                StatusCode::FORBIDDEN,
+                &headers,
+                Some(r#"{"error":{"code":"insufficient_quota"}}"#),
+            ),
+            FailureClass::QuotaExceeded
         );
     }
 
@@ -493,7 +742,10 @@ mod tests {
 
         assert_eq!(
             classify_upstream_failure(StatusCode::TOO_MANY_REQUESTS, &headers, None),
-            FailureClass::RateLimit { retry_after: None }
+            FailureClass::RateLimit {
+                retry_after: None,
+                scope: ThrottleScope::Unknown,
+            }
         );
 
         assert_eq!(
@@ -502,7 +754,10 @@ mod tests {
                 &HeaderMap::new(),
                 Some(r#"{"error":{"retry_after":"bad"}}"#),
             ),
-            FailureClass::RateLimit { retry_after: None }
+            FailureClass::RateLimit {
+                retry_after: None,
+                scope: ThrottleScope::Unknown,
+            }
         );
     }
 }

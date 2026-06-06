@@ -3,15 +3,17 @@ use crate::cooldown::CooldownManager;
 use crate::credentials::{CredentialManager, CredentialPermit};
 use crate::error::{Result, RotatorError};
 use crate::http_pool::HttpClientPool;
+use crate::ip_throttle::{IPThrottleDetector, ThrottleAssessment};
 use crate::provider_registry::{AuthType, ProviderRegistry};
 use crate::provider_runtime::normalize_upstream_url;
 use crate::provider_utils::extract_usage;
 use crate::providers::oauth::{OAuthManager, OAuthToken, refresh_oauth_token};
 use crate::providers::transform_request_for_provider;
-use crate::rate_limiter::RateLimiterRegistry;
+use crate::rate_limiter::{AdaptiveRateLimiterRegistry, RateLimiterRegistry};
 use crate::request_sanitizer::{SanitizerContext, sanitize_request};
 use crate::retry_policy::{
-    FailureClass, RetryDecision, classify_upstream_failure, decide_retry, get_retry_backoff,
+    FailureClass, RetryDecision, classify_upstream_failure, decide_retry_for_provider,
+    get_retry_backoff,
 };
 use crate::usage::UsageManager;
 use dashmap::DashMap;
@@ -40,6 +42,8 @@ pub struct RotatorClient {
     max_retries: usize,
     oauth_manager: Arc<OAuthManager>,
     oauth_refresh_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    ip_throttle: Arc<IPThrottleDetector>,
+    adaptive_rate_limiter: Option<Arc<AdaptiveRateLimiterRegistry>>,
 }
 
 impl RotatorClient {
@@ -66,7 +70,17 @@ impl RotatorClient {
             max_retries,
             oauth_manager: Arc::new(OAuthManager::new()),
             oauth_refresh_locks: Arc::new(DashMap::new()),
+            ip_throttle: Arc::new(IPThrottleDetector::new()),
+            adaptive_rate_limiter: None,
         }
+    }
+
+    pub fn with_adaptive_rate_limiter(
+        mut self,
+        adaptive_rate_limiter: Arc<AdaptiveRateLimiterRegistry>,
+    ) -> Self {
+        self.adaptive_rate_limiter = Some(adaptive_rate_limiter);
+        self
     }
 
     pub fn max_retries(&self) -> usize {
@@ -135,9 +149,74 @@ impl RotatorClient {
             match result {
                 Ok(resp) if resp.status().is_success() => {
                     self.circuit_breakers.record_success(provider);
+                    if let Some(ref arl) = self.adaptive_rate_limiter {
+                        arl.record_success(provider, permit.key());
+                    }
                     if stream {
                         return Ok(resp);
                     }
+
+                    let status = resp.status();
+                    let version = resp.version();
+                    let headers = resp.headers().clone();
+                    let bytes = resp
+                        .bytes()
+                        .await
+                        .map_err(|e| RotatorError::Http(e.to_string()))?;
+                    let body_text = String::from_utf8_lossy(&bytes);
+
+                    if let Err(garbage_err) =
+                        crate::garbage_detection::validate_response(&body_text)
+                    {
+                        let failure = FailureClass::GarbageResponse {
+                            reason: garbage_err.reason,
+                            score: garbage_err.score,
+                        };
+                        let decision = decide_retry_for_provider(
+                            failure.clone(),
+                            attempt as u32,
+                            self.max_retries as u32,
+                            Some(provider),
+                        );
+                        warn!(
+                            provider,
+                            attempt,
+                            ?failure,
+                            ?decision,
+                            "garbage response detected, retrying..."
+                        );
+                        match decision {
+                            RetryDecision::RotateKey => {
+                                self.cooldown.add_cooldown(
+                                    provider,
+                                    permit.key(),
+                                    Duration::from_secs(5),
+                                );
+                                drop(permit);
+                                tokio::time::sleep(get_retry_backoff(attempt as u32, 500, 60_000))
+                                    .await;
+                                continue;
+                            }
+                            _ => {
+                                let mut builder =
+                                    http::Response::builder().status(status).version(version);
+                                *builder
+                                    .headers_mut()
+                                    .expect("response builder is valid") = headers;
+                                return Ok(builder
+                                    .body(bytes)
+                                    .expect("response body rebuild should not fail")
+                                    .into());
+                            }
+                        }
+                    }
+
+                    let mut builder = http::Response::builder().status(status).version(version);
+                    *builder.headers_mut().expect("response builder is valid") = headers;
+                    let resp = builder
+                        .body(bytes)
+                        .expect("response body rebuild should not fail")
+                        .into();
                     return self
                         .record_usage_from_response(provider, permit.key(), resp)
                         .await;
@@ -146,14 +225,29 @@ impl RotatorClient {
                     let status = resp.status();
                     let headers = resp.headers().clone();
                     let body_text = resp.text().await.unwrap_or_default();
+                    if let Some(ref arl) = self.adaptive_rate_limiter {
+                        arl.record_429(provider, permit.key());
+                    }
                     let failure = classify_upstream_failure(status, &headers, Some(&body_text));
-                    let decision =
-                        decide_retry(failure.clone(), attempt as u32, self.max_retries as u32);
+                    self.ip_throttle.record_429(permit.key(), &body_text, provider);
+                    let assessment = self.ip_throttle.assess_throttle(permit.key(), provider);
+                    let mut decision = decide_retry_for_provider(
+                        failure.clone(),
+                        attempt as u32,
+                        self.max_retries as u32,
+                        Some(provider),
+                    );
+                    if assessment == ThrottleAssessment::Throttled {
+                        decision = RetryDecision::CooldownProvider {
+                            duration: get_retry_backoff(attempt as u32, 1_000, 60_000),
+                        };
+                    }
                     warn!(
                         provider,
                         attempt,
                         ?failure,
                         ?decision,
+                        ?assessment,
                         "throttled, retrying..."
                     );
                     match decision {
@@ -194,7 +288,7 @@ impl RotatorClient {
                             return Err(RotatorError::RateLimited(
                                 provider.to_string(),
                                 match failure {
-                                    FailureClass::RateLimit { retry_after } => {
+                                    FailureClass::RateLimit { retry_after, .. } => {
                                         retry_after.map(|duration| duration.as_secs())
                                     }
                                     _ => None,
@@ -209,8 +303,12 @@ impl RotatorClient {
                     let headers = resp.headers().clone();
                     let body_text = resp.text().await.unwrap_or_default();
                     let failure = classify_upstream_failure(status, &headers, Some(&body_text));
-                    let decision =
-                        decide_retry(failure.clone(), attempt as u32, self.max_retries as u32);
+                    let decision = decide_retry_for_provider(
+                        failure.clone(),
+                        attempt as u32,
+                        self.max_retries as u32,
+                        Some(provider),
+                    );
                     error!(provider, attempt, status = %status, ?failure, ?decision, "server error, retrying...");
                     match decision {
                         RetryDecision::RetrySameKey => {
@@ -255,6 +353,45 @@ impl RotatorClient {
                                 permit.key(),
                                 Duration::from_secs(5),
                             );
+                            let mut builder =
+                                http::Response::builder().status(status).version(version);
+                            *builder.headers_mut().expect("response builder is valid") = headers;
+                            return Ok(builder
+                                .body(bytes::Bytes::from(body_text))
+                                .expect("response body rebuild should not fail")
+                                .into());
+                        }
+                    }
+                }
+                Ok(resp) if matches!(resp.status().as_u16(), 401 | 403) && self.max_retries > 0 => {
+                    // 401/403: текущий ключ невалиден/запрещён. Ротируем на другой ключ
+                    // (паритет с Python authentication/forbidden rotation). При исчерпании
+                    // попыток возвращаем исходный ответ upstream клиенту.
+                    let status = resp.status();
+                    let version = resp.version();
+                    let headers = resp.headers().clone();
+                    let body_text = resp.text().await.unwrap_or_default();
+                    let failure = classify_upstream_failure(status, &headers, Some(&body_text));
+                    let decision = decide_retry_for_provider(
+                        failure.clone(),
+                        attempt as u32,
+                        self.max_retries as u32,
+                        Some(provider),
+                    );
+                    warn!(provider, attempt, status = %status, ?failure, ?decision, "auth error, rotating key...");
+                    match decision {
+                        RetryDecision::RotateKey => {
+                            self.cooldown.add_cooldown(
+                                provider,
+                                permit.key(),
+                                Duration::from_secs(5),
+                            );
+                            drop(permit);
+                            tokio::time::sleep(get_retry_backoff(attempt as u32, 300, 60_000))
+                                .await;
+                            continue;
+                        }
+                        _ => {
                             let mut builder =
                                 http::Response::builder().status(status).version(version);
                             *builder.headers_mut().expect("response builder is valid") = headers;
@@ -333,6 +470,9 @@ impl RotatorClient {
             match result {
                 Ok(resp) if resp.status().is_success() => {
                     self.circuit_breakers.record_success(provider);
+                    if let Some(ref arl) = self.adaptive_rate_limiter {
+                        arl.record_success(provider, permit.key());
+                    }
                     return self
                         .record_usage_from_response(provider, permit.key(), resp)
                         .await;
@@ -341,14 +481,29 @@ impl RotatorClient {
                     let status = resp.status();
                     let headers = resp.headers().clone();
                     let body_text = resp.text().await.unwrap_or_default();
+                    if let Some(ref arl) = self.adaptive_rate_limiter {
+                        arl.record_429(provider, permit.key());
+                    }
                     let failure = classify_upstream_failure(status, &headers, Some(&body_text));
-                    let decision =
-                        decide_retry(failure.clone(), attempt as u32, self.max_retries as u32);
+                    self.ip_throttle.record_429(permit.key(), &body_text, provider);
+                    let assessment = self.ip_throttle.assess_throttle(permit.key(), provider);
+                    let mut decision = decide_retry_for_provider(
+                        failure.clone(),
+                        attempt as u32,
+                        self.max_retries as u32,
+                        Some(provider),
+                    );
+                    if assessment == ThrottleAssessment::Throttled {
+                        decision = RetryDecision::CooldownProvider {
+                            duration: get_retry_backoff(attempt as u32, 1_000, 60_000),
+                        };
+                    }
                     warn!(
                         provider,
                         attempt,
                         ?failure,
                         ?decision,
+                        ?assessment,
                         "throttled, retrying..."
                     );
                     match decision {
@@ -378,7 +533,7 @@ impl RotatorClient {
                             return Err(RotatorError::RateLimited(
                                 provider.to_string(),
                                 match failure {
-                                    FailureClass::RateLimit { retry_after } => {
+                                    FailureClass::RateLimit { retry_after, .. } => {
                                         retry_after.map(|duration| duration.as_secs())
                                     }
                                     _ => None,
@@ -393,8 +548,12 @@ impl RotatorClient {
                     let headers = resp.headers().clone();
                     let body_text = resp.text().await.unwrap_or_default();
                     let failure = classify_upstream_failure(status, &headers, Some(&body_text));
-                    let decision =
-                        decide_retry(failure.clone(), attempt as u32, self.max_retries as u32);
+                    let decision = decide_retry_for_provider(
+                        failure.clone(),
+                        attempt as u32,
+                        self.max_retries as u32,
+                        Some(provider),
+                    );
                     error!(provider, attempt, status = %status, ?failure, ?decision, "server error, retrying...");
                     match decision {
                         RetryDecision::RetrySameKey => {
@@ -856,6 +1015,7 @@ mod tests {
             base_url: format!("http://{addr}/v1"),
             auth_type: AuthType::ApiKey,
             model_patterns: Vec::new(),
+            compiled_patterns: Vec::new(),
             endpoints: vec!["/chat/completions".to_string()],
             features: vec!["chat".to_string()],
             model_count: 1,
@@ -907,6 +1067,7 @@ mod tests {
             base_url: format!("http://{addr}/v1beta"),
             auth_type: AuthType::ApiKey,
             model_patterns: Vec::new(),
+            compiled_patterns: Vec::new(),
             endpoints: vec!["/chat/completions".to_string()],
             features: vec!["chat".to_string()],
             model_count: 1,
@@ -1066,6 +1227,7 @@ mod tests {
             base_url: format!("http://{addr}/v1"),
             auth_type: AuthType::ApiKey,
             model_patterns: Vec::new(),
+            compiled_patterns: Vec::new(),
             endpoints: vec!["/chat/completions".to_string()],
             features: vec!["chat".to_string()],
             model_count: 1,

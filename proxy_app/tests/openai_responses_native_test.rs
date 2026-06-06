@@ -57,6 +57,7 @@ fn test_state(base_url: String) -> AppState {
             r"^(openai/)?gpt[-/].*".to_owned(),
             r"^(openai/)?o4.*".to_owned(),
         ],
+        compiled_patterns: Vec::new(),
         endpoints: vec!["/chat/completions".to_owned(), "/responses".to_owned()],
         features: vec!["chat".to_owned(), "responses".to_owned()],
         model_count: 2,
@@ -273,12 +274,9 @@ async fn chat_openai_gpt5_converts_tool_calls_and_outputs() {
         ])
     );
     assert_eq!(upstream_json["tools"][0]["type"], "function");
-    assert_eq!(upstream_json["tools"][0]["function"]["name"], "get_weather");
+    assert_eq!(upstream_json["tools"][0]["name"], "get_weather");
     assert_eq!(upstream_json["tool_choice"]["type"], "function");
-    assert_eq!(
-        upstream_json["tool_choice"]["function"]["name"],
-        "get_weather"
-    );
+    assert_eq!(upstream_json["tool_choice"]["name"], "get_weather");
 }
 
 #[tokio::test]

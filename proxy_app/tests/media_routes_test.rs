@@ -18,7 +18,19 @@ use tokio::{
 use tower::ServiceExt;
 
 fn authed_app() -> axum::Router {
-    let mut state = AppState::new();
+    let registry = Arc::new(ProviderRegistry::new());
+    let credentials = CredentialManager::new();
+    let rotator = RotatorClient::new(
+        credentials,
+        HttpClientPool::new(30),
+        registry.clone(),
+        Arc::new(RateLimiterRegistry::new()),
+        Arc::new(CooldownManager::new()),
+        Arc::new(CircuitBreakerRegistry::new()),
+        None,
+        0,
+    );
+    let mut state = AppState::with_parts(rotator, registry);
     state.config.api_keys = vec!["test-proxy-token".to_owned()];
     proxy_app::build_app_with_state(state)
 }
@@ -52,6 +64,7 @@ fn media_test_state(base_url: String) -> AppState {
         base_url: base_url.clone(),
         auth_type: AuthType::ApiKey,
         model_patterns: vec![r"^gpt-.*".to_owned()],
+            compiled_patterns: Vec::new(),
         endpoints: vec!["/images".to_owned()],
         features: vec!["images".to_owned()],
         model_count: 1,
@@ -67,6 +80,7 @@ fn media_test_state(base_url: String) -> AppState {
         base_url,
         auth_type: AuthType::ApiKey,
         model_patterns: vec![r"^glm-.*".to_owned()],
+            compiled_patterns: Vec::new(),
         endpoints: vec!["/video".to_owned()],
         features: vec!["video".to_owned()],
         model_count: 1,

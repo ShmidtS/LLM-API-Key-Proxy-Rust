@@ -56,6 +56,48 @@ impl Default for ContextCompactionConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AdaptiveRateLimiterConfig {
+    #[serde(default = "default_aimd_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_aimd_floor_rps")]
+    pub floor_rps: f64,
+    #[serde(default = "default_aimd_additive_increase")]
+    pub additive_increase: f64,
+    #[serde(default = "default_aimd_multiplicative_decrease")]
+    pub multiplicative_decrease: f64,
+    #[serde(default = "default_aimd_success_window_threshold")]
+    pub success_window_threshold: u64,
+}
+
+impl Default for AdaptiveRateLimiterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_aimd_enabled(),
+            floor_rps: default_aimd_floor_rps(),
+            additive_increase: default_aimd_additive_increase(),
+            multiplicative_decrease: default_aimd_multiplicative_decrease(),
+            success_window_threshold: default_aimd_success_window_threshold(),
+        }
+    }
+}
+
+fn default_aimd_enabled() -> bool {
+    false
+}
+fn default_aimd_floor_rps() -> f64 {
+    1.0
+}
+fn default_aimd_additive_increase() -> f64 {
+    0.5
+}
+fn default_aimd_multiplicative_decrease() -> f64 {
+    0.7
+}
+fn default_aimd_success_window_threshold() -> u64 {
+    10
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GuardrailsProxyConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -160,6 +202,8 @@ pub struct ProxyConfig {
     pub http_dns_resolver: Option<String>,
     #[serde(default)]
     pub guardrails: GuardrailsProxyConfig,
+    #[serde(default)]
+    pub adaptive_rate_limiter: AdaptiveRateLimiterConfig,
 }
 
 impl Default for ProxyConfig {
@@ -196,6 +240,7 @@ impl Default for ProxyConfig {
             http2_enabled: default_http2_enabled(),
             http_dns_resolver: default_http_dns_resolver(),
             guardrails: GuardrailsProxyConfig::default(),
+            adaptive_rate_limiter: AdaptiveRateLimiterConfig::default(),
         }
     }
 }

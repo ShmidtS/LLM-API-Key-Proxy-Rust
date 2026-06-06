@@ -24,6 +24,126 @@ pub trait VramAwareContextManager: Send + Sync {
     ) -> Result<ContextBudget, GuardrailError>;
 }
 
+pub trait GpuProbe: Send + Sync {
+    fn probe(&self) -> Option<VramSnapshot>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FakeGpuProbe {
+    total_bytes: u64,
+    free_bytes: u64,
+    used_bytes: u64,
+    device_count: u32,
+}
+
+impl FakeGpuProbe {
+    pub fn new(total_bytes: u64, free_bytes: u64, used_bytes: u64, device_count: u32) -> Self {
+        Self {
+            total_bytes,
+            free_bytes,
+            used_bytes,
+            device_count,
+        }
+    }
+}
+
+impl GpuProbe for FakeGpuProbe {
+    fn probe(&self) -> Option<VramSnapshot> {
+        Some(VramSnapshot {
+            total_bytes: self.total_bytes,
+            free_bytes: self.free_bytes,
+            used_bytes: self.used_bytes,
+            device_count: self.device_count,
+            source: VramSource::StaticConfig,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NvidiaSmiProbe;
+
+impl GpuProbe for NvidiaSmiProbe {
+    fn probe(&self) -> Option<VramSnapshot> {
+        match std::process::Command::new("nvidia-smi")
+            .args([
+                "--query-gpu=name,memory.total",
+                "--format=csv,noheader,nounits",
+            ])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let line = stdout.lines().next()?;
+                let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+                if parts.len() < 2 {
+                    return None;
+                }
+                let total_mb = parts[1].parse::<u64>().ok()?;
+                Some(VramSnapshot {
+                    total_bytes: total_mb * 1024 * 1024,
+                    free_bytes: 0,
+                    used_bytes: 0,
+                    device_count: 1,
+                    source: VramSource::NvidiaSmi,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AmdSysfsProbe;
+
+impl GpuProbe for AmdSysfsProbe {
+    fn probe(&self) -> Option<VramSnapshot> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::path::Path;
+            let drm_root = Path::new("/sys/class/drm");
+            if !drm_root.exists() {
+                return None;
+            }
+            let mut total_bytes = 0u64;
+            let mut found = false;
+            let entries = std::fs::read_dir(drm_root).ok()?;
+            for entry in entries {
+                let entry = entry.ok()?;
+                let name = entry.file_name();
+                let name_str = name.to_str()?;
+                if !name_str.starts_with("card") {
+                    continue;
+                }
+                if name_str.contains("render") {
+                    continue;
+                }
+                let vram_file = entry.path().join("device/mem_info_vram_total");
+                if let Ok(content) = std::fs::read_to_string(&vram_file) {
+                    if let Ok(bytes) = content.trim().parse::<u64>() {
+                        total_bytes += bytes;
+                        found = true;
+                    }
+                }
+            }
+            if found {
+                Some(VramSnapshot {
+                    total_bytes,
+                    free_bytes: 0,
+                    used_bytes: 0,
+                    device_count: 1,
+                    source: VramSource::AmdSysfs,
+                })
+            } else {
+                None
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VramSnapshot {
     pub total_bytes: u64,
@@ -37,6 +157,7 @@ pub struct VramSnapshot {
 pub enum VramSource {
     NvidiaSmi,
     RocmSmi,
+    AmdSysfs,
     StaticConfig,
     Unknown,
 }
@@ -77,7 +198,9 @@ impl VramAwareContextManager for StaticVramContextManager {
         let max_context_tokens = if matches!(vram.source, VramSource::Unknown) {
             model.max_context_tokens
         } else {
-            model.max_context_tokens.min((vram.free_bytes / 1024 / 1024) as usize)
+            model
+                .max_context_tokens
+                .min((vram.free_bytes / 1024 / 1024) as usize)
         };
         Ok(ContextBudget {
             max_context_tokens,

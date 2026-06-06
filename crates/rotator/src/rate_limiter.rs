@@ -1,5 +1,138 @@
 use dashmap::DashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderRateInfo {
+    pub current_rps: f64,
+    pub ceiling_rps: f64,
+    pub floor_rps: f64,
+}
+
+#[derive(Debug)]
+pub struct AdaptiveRateLimiter {
+    current_rps: AtomicU64,
+    ceiling_rps: AtomicU64,
+    floor_rps: f64,
+    additive_increase: f64,
+    multiplicative_decrease: f64,
+    last_429_time: AtomicU64,
+    success_window: AtomicU64,
+    success_window_threshold: u64,
+}
+
+impl AdaptiveRateLimiter {
+    pub fn new(
+        initial_rps: f64,
+        ceiling_rps: f64,
+        floor_rps: f64,
+        additive_increase: f64,
+        multiplicative_decrease: f64,
+        success_window_threshold: u64,
+    ) -> Self {
+        Self {
+            current_rps: AtomicU64::new(initial_rps.to_bits()),
+            ceiling_rps: AtomicU64::new(ceiling_rps.to_bits()),
+            floor_rps,
+            additive_increase,
+            multiplicative_decrease,
+            last_429_time: AtomicU64::new(0),
+            success_window: AtomicU64::new(0),
+            success_window_threshold,
+        }
+    }
+
+    pub fn record_success(&self) {
+        let count = self.success_window.fetch_add(1, Ordering::Relaxed) + 1;
+        if count >= self.success_window_threshold {
+            self.success_window.store(0, Ordering::Relaxed);
+            let current = f64::from_bits(self.current_rps.load(Ordering::Relaxed));
+            let ceiling = f64::from_bits(self.ceiling_rps.load(Ordering::Relaxed));
+            let new = (current + self.additive_increase).min(ceiling);
+            self.current_rps.store(new.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_429(&self) {
+        let current = f64::from_bits(self.current_rps.load(Ordering::Relaxed));
+        let new = (current * self.multiplicative_decrease).max(self.floor_rps);
+        self.current_rps.store(new.to_bits(), Ordering::Relaxed);
+        self.success_window.store(0, Ordering::Relaxed);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+        self.last_429_time.store(now, Ordering::Relaxed);
+    }
+
+    pub fn get_provider_info(&self) -> ProviderRateInfo {
+        ProviderRateInfo {
+            current_rps: f64::from_bits(self.current_rps.load(Ordering::Relaxed)),
+            ceiling_rps: f64::from_bits(self.ceiling_rps.load(Ordering::Relaxed)),
+            floor_rps: self.floor_rps,
+        }
+    }
+
+    pub fn last_429_time(&self) -> Option<u64> {
+        let ts = self.last_429_time.load(Ordering::Relaxed);
+        if ts == 0 { None } else { Some(ts) }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct AdaptiveRateLimiterRegistry {
+    limiters: DashMap<(String, String), AdaptiveRateLimiter>,
+}
+
+impl AdaptiveRateLimiterRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn configure(
+        &self,
+        provider: &str,
+        key: &str,
+        initial_rps: f64,
+        ceiling_rps: f64,
+        floor_rps: f64,
+        additive_increase: f64,
+        multiplicative_decrease: f64,
+        success_window_threshold: u64,
+    ) {
+        self.limiters.insert(
+            (provider.to_owned(), key.to_owned()),
+            AdaptiveRateLimiter::new(
+                initial_rps,
+                ceiling_rps,
+                floor_rps,
+                additive_increase,
+                multiplicative_decrease,
+                success_window_threshold,
+            ),
+        );
+    }
+
+    pub fn record_success(&self, provider: &str, key: &str) {
+        if let Some(entry) = self.limiters.get(&(provider.to_owned(), key.to_owned())) {
+            entry.record_success();
+        }
+    }
+
+    pub fn record_429(&self, provider: &str, key: &str) {
+        if let Some(entry) = self.limiters.get(&(provider.to_owned(), key.to_owned())) {
+            entry.record_429();
+        }
+    }
+
+    pub fn get_provider_info(&self, provider: &str, key: &str) -> Option<ProviderRateInfo> {
+        self.limiters
+            .get(&(provider.to_owned(), key.to_owned()))
+            .map(|entry| entry.get_provider_info())
+    }
+}
 
 #[derive(Debug)]
 pub struct TokenBucket {
@@ -125,5 +258,89 @@ mod tests {
         assert!(registry.acquire("openai", "key-1"));
         assert!(registry.acquire("openai", "key-1"));
         assert!(!registry.acquire("openai", "key-1"));
+    }
+
+    #[test]
+    fn adaptive_record_success_increases_rps_additively() {
+        let limiter = AdaptiveRateLimiter::new(5.0, 10.0, 1.0, 0.5, 0.7, 3);
+        limiter.record_success();
+        limiter.record_success();
+        limiter.record_success();
+        assert_eq!(limiter.get_provider_info().current_rps, 5.5);
+    }
+
+    #[test]
+    fn adaptive_record_success_caps_at_ceiling() {
+        let limiter = AdaptiveRateLimiter::new(9.5, 10.0, 1.0, 0.5, 0.7, 3);
+        limiter.record_success();
+        limiter.record_success();
+        limiter.record_success();
+        assert_eq!(limiter.get_provider_info().current_rps, 10.0);
+    }
+
+    #[test]
+    fn adaptive_record_429_decreases_rps_multiplicatively() {
+        let limiter = AdaptiveRateLimiter::new(10.0, 10.0, 1.0, 0.5, 0.7, 10);
+        limiter.record_429();
+        assert_eq!(limiter.get_provider_info().current_rps, 7.0);
+    }
+
+    #[test]
+    fn adaptive_record_429_floors_at_floor_rps() {
+        let limiter = AdaptiveRateLimiter::new(1.2, 10.0, 1.0, 0.5, 0.7, 10);
+        limiter.record_429();
+        assert_eq!(limiter.get_provider_info().current_rps, 1.0);
+    }
+
+    #[test]
+    fn adaptive_record_429_resets_success_window() {
+        let limiter = AdaptiveRateLimiter::new(5.0, 10.0, 1.0, 0.5, 0.7, 3);
+        limiter.record_success();
+        limiter.record_success();
+        limiter.record_429();
+        limiter.record_success();
+        assert_eq!(limiter.get_provider_info().current_rps, 3.5);
+    }
+
+    #[test]
+    fn adaptive_registry_configure_and_get_info() {
+        let registry = AdaptiveRateLimiterRegistry::new();
+        registry.configure("openai", "key-1", 5.0, 10.0, 1.0, 0.5, 0.7, 3);
+        let info = registry.get_provider_info("openai", "key-1").unwrap();
+        assert_eq!(info.current_rps, 5.0);
+        assert_eq!(info.ceiling_rps, 10.0);
+        assert_eq!(info.floor_rps, 1.0);
+    }
+
+    #[test]
+    fn adaptive_registry_record_success_and_429() {
+        let registry = AdaptiveRateLimiterRegistry::new();
+        registry.configure("openai", "key-1", 5.0, 10.0, 1.0, 0.5, 0.7, 3);
+        registry.record_success("openai", "key-1");
+        registry.record_success("openai", "key-1");
+        registry.record_success("openai", "key-1");
+        assert!(
+            (registry.get_provider_info("openai", "key-1").unwrap().current_rps - 5.5).abs() < 1e-9
+        );
+        registry.record_429("openai", "key-1");
+        assert!(
+            (registry.get_provider_info("openai", "key-1").unwrap().current_rps - 3.85).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn adaptive_registry_no_panic_on_missing_key() {
+        let registry = AdaptiveRateLimiterRegistry::new();
+        registry.record_success("openai", "key-1");
+        registry.record_429("openai", "key-1");
+        assert!(registry.get_provider_info("openai", "key-1").is_none());
+    }
+
+    #[test]
+    fn adaptive_limiter_records_last_429_time() {
+        let limiter = AdaptiveRateLimiter::new(5.0, 10.0, 1.0, 0.5, 0.7, 3);
+        assert!(limiter.last_429_time().is_none());
+        limiter.record_429();
+        assert!(limiter.last_429_time().is_some());
     }
 }

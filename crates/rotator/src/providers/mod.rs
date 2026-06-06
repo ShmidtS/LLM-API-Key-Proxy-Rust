@@ -15,6 +15,7 @@ pub mod fireworks;
 pub mod firmware;
 pub mod gemini;
 pub mod gemini_cli;
+pub mod gemini_tool_handler;
 pub mod iflow;
 pub mod kilocode;
 pub mod nanogpt;
@@ -95,7 +96,7 @@ pub fn transform_request_for_provider(provider: &str, body: &mut serde_json::Val
     }
 }
 
-fn is_openai_responses_model(body: &serde_json::Value) -> bool {
+pub(crate) fn is_openai_responses_model(body: &serde_json::Value) -> bool {
     body.get("model")
         .and_then(serde_json::Value::as_str)
         .map(|model| model.strip_prefix("openai/").unwrap_or(model))

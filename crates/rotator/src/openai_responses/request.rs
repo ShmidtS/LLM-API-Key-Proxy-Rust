@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use models::chat::{ChatCompletionRequest, ChatMessage, ChatMessageContent, ToolChoice};
 use models::responses::{
-    CreateResponseRequest, ResponseInput, ResponseInputContent, ResponseInputItem,
-    ResponseNamedToolChoice, ResponseNamedToolFunction, ResponseTextConfig, ResponseTool,
+    CreateResponseRequest, ResponseContentPart, ResponseInput, ResponseInputContent,
+    ResponseInputItem, ResponseNamedToolChoice, ResponseTextConfig, ResponseTool,
     ResponseToolChoice,
 };
 use serde_json::Value;
@@ -62,21 +62,20 @@ pub fn chat_request_to_responses_request(
         let content = message
             .content
             .as_ref()
-            .map(chat_message_content_to_text)
+            .map(chat_message_content_to_response_input_content)
             .transpose()?;
 
         match message.role.as_str() {
             "system" => {
-                if let Some(content) = content
-                    && !content.is_empty()
-                {
-                    instructions.push(content);
+                let text = response_input_content_to_text(&content);
+                if !text.is_empty() {
+                    instructions.push(text);
                 }
             }
             "user" => input.push(ResponseInputItem::Message {
                 type_: "message".to_owned(),
                 role: "user".to_owned(),
-                content: ResponseInputContent::Text(content.unwrap_or_default()),
+                content: content.unwrap_or_else(|| ResponseInputContent::Text(String::new())),
             }),
             "assistant" => {
                 let tool_calls = message.tool_calls.as_deref().unwrap_or_default();
@@ -84,17 +83,16 @@ pub fn chat_request_to_responses_request(
                     input.push(ResponseInputItem::Message {
                         type_: "message".to_owned(),
                         role: "assistant".to_owned(),
-                        content: ResponseInputContent::Text(content.unwrap_or_default()),
+                        content: content.unwrap_or_else(|| ResponseInputContent::Text(String::new())),
                     });
                     continue;
                 }
-                if let Some(content) = content
-                    && !content.is_empty()
-                {
+                let text = response_input_content_to_text(&content);
+                if !text.is_empty() {
                     input.push(ResponseInputItem::Message {
                         type_: "message".to_owned(),
                         role: "assistant".to_owned(),
-                        content: ResponseInputContent::Text(content),
+                        content: ResponseInputContent::Text(text),
                     });
                 }
                 for tool_call in tool_calls {
@@ -107,29 +105,39 @@ pub fn chat_request_to_responses_request(
                     });
                 }
             }
-            "tool" => input.push(ResponseInputItem::FunctionCallOutput {
-                call_id: message.tool_call_id.clone().unwrap_or_default(),
-                output: content.unwrap_or_default(),
-                type_: "function_call_output".to_owned(),
-            }),
+            "tool" => {
+                let text = response_input_content_to_text(&content);
+                input.push(ResponseInputItem::FunctionCallOutput {
+                    call_id: message.tool_call_id.clone().unwrap_or_default(),
+                    output: text,
+                    type_: "function_call_output".to_owned(),
+                });
+            }
             _ => {}
         }
     }
+
+    let bare_model = chat_req.model.strip_prefix("openai/").unwrap_or(&chat_req.model);
+    let is_reasoning = bare_model.starts_with("gpt-5") || bare_model.starts_with("o4");
 
     Ok(CreateResponseRequest {
         model: chat_req.model.clone(),
         input: ResponseInput::Items(input),
         instructions: (!instructions.is_empty()).then(|| instructions.join("\n")),
         max_output_tokens: chat_req.max_tokens,
-        temperature: chat_req.temperature,
-        top_p: chat_req.top_p,
+        temperature: if is_reasoning { None } else { chat_req.temperature },
+        top_p: if is_reasoning { None } else { chat_req.top_p },
         tools: chat_req.tools.as_ref().map(|tools| {
             tools
                 .iter()
                 .map(|tool| ResponseTool {
                     type_: "function".to_owned(),
-                    function: Some(tool.function.clone()),
+                    name: Some(tool.function.name.clone()),
+                    description: tool.function.description.clone(),
+                    parameters: Some(tool.function.parameters.clone()),
+                    strict: None,
                     web_search: None,
+                    function: None,
                 })
                 .collect()
         }),
@@ -145,14 +153,65 @@ pub fn chat_request_to_responses_request(
     })
 }
 
-fn chat_message_content_to_text(
+fn chat_message_content_to_response_input_content(
     content: &ChatMessageContent,
-) -> std::result::Result<String, String> {
+) -> std::result::Result<ResponseInputContent, String> {
     match content {
-        ChatMessageContent::Text(text) => Ok(text.clone()),
+        ChatMessageContent::Text(text) => Ok(ResponseInputContent::Text(text.clone())),
         ChatMessageContent::Blocks(blocks) => {
-            serde_json::to_string(blocks).map_err(|err| err.to_string())
+            let parts: std::result::Result<Vec<_>, _> = blocks
+                .iter()
+                .map(|block| {
+                    let block_type = block.get("type").and_then(Value::as_str);
+                    match block_type {
+                        Some("text") => block
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .map(|text| ResponseContentPart::Text { text: text.to_owned() })
+                            .ok_or_else(|| "text block missing text field".to_owned()),
+                        Some("image_url") => {
+                            let url = block
+                                .get("image_url")
+                                .and_then(|v| v.get("url"))
+                                .and_then(Value::as_str)
+                                .map(|s| s.to_owned());
+                            let detail = block
+                                .get("image_url")
+                                .and_then(|v| v.get("detail"))
+                                .and_then(Value::as_str)
+                                .map(|s| s.to_owned());
+                            match url {
+                                Some(image_url) => Ok(ResponseContentPart::Image {
+                                    image_url,
+                                    detail,
+                                }),
+                                None => Err("image_url block missing url".to_owned()),
+                            }
+                        }
+                        _ => Err(format!(
+                            "unsupported content block type: {:?}",
+                            block_type
+                        )),
+                    }
+                })
+                .collect();
+            Ok(ResponseInputContent::Array(parts?))
         }
+    }
+}
+
+fn response_input_content_to_text(content: &Option<ResponseInputContent>) -> String {
+    match content {
+        Some(ResponseInputContent::Text(text)) => text.clone(),
+        Some(ResponseInputContent::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| match p {
+                ResponseContentPart::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => String::new(),
     }
 }
 
@@ -169,9 +228,8 @@ fn chat_tool_choice_to_response_tool_choice(
         ToolChoice::Object { r#type, function } if r#type == "function" => {
             Some(ResponseToolChoice::Named(ResponseNamedToolChoice {
                 type_: "function".to_owned(),
-                function: ResponseNamedToolFunction {
-                    name: function.name.clone(),
-                },
+                name: Some(function.name.clone()),
+                function: None,
             }))
         }
         ToolChoice::Object { .. } => None,
