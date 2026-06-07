@@ -197,8 +197,8 @@ fn chat_tools_converted_to_flat_responses_format() {
         extra: std::collections::HashMap::new(),
     };
 
-    let responses_req = rotator::openai_responses::chat_request_to_responses_request(&chat_req)
-        .unwrap();
+    let responses_req =
+        rotator::openai_responses::chat_request_to_responses_request(&chat_req).unwrap();
     let body = serde_json::to_value(responses_req).unwrap();
 
     let tools = body["tools"].as_array().unwrap();
@@ -207,7 +207,10 @@ fn chat_tools_converted_to_flat_responses_format() {
     assert_eq!(tools[0]["name"], "get_weather");
     assert_eq!(tools[0]["description"], "Get weather");
     assert_eq!(tools[0]["parameters"], json!({"type": "object"}));
-    assert!(tools[0].get("function").is_none(), "tools must be flat, not nested under function");
+    assert!(
+        tools[0].get("function").is_none(),
+        "tools must be flat, not nested under function"
+    );
 }
 
 #[test]
@@ -245,13 +248,16 @@ fn chat_tool_choice_converted_to_flat_responses_format() {
         extra: std::collections::HashMap::new(),
     };
 
-    let responses_req = rotator::openai_responses::chat_request_to_responses_request(&chat_req)
-        .unwrap();
+    let responses_req =
+        rotator::openai_responses::chat_request_to_responses_request(&chat_req).unwrap();
     let body = serde_json::to_value(responses_req).unwrap();
 
     assert_eq!(body["tool_choice"]["type"], "function");
     assert_eq!(body["tool_choice"]["name"], "get_weather");
-    assert!(body["tool_choice"].get("function").is_none(), "tool_choice must be flat, not nested under function");
+    assert!(
+        body["tool_choice"].get("function").is_none(),
+        "tool_choice must be flat, not nested under function"
+    );
 }
 
 #[test]
@@ -282,8 +288,8 @@ fn reasoning_models_drop_temperature_and_top_p() {
             extra: std::collections::HashMap::new(),
         };
 
-        let responses_req = rotator::openai_responses::chat_request_to_responses_request(&chat_req)
-            .unwrap();
+        let responses_req =
+            rotator::openai_responses::chat_request_to_responses_request(&chat_req).unwrap();
         assert!(
             responses_req.temperature.is_none(),
             "model={model}: temperature must be removed for reasoning models"
@@ -322,8 +328,8 @@ fn non_reasoning_models_preserve_temperature_and_top_p() {
         extra: std::collections::HashMap::new(),
     };
 
-    let responses_req = rotator::openai_responses::chat_request_to_responses_request(&chat_req)
-        .unwrap();
+    let responses_req =
+        rotator::openai_responses::chat_request_to_responses_request(&chat_req).unwrap();
     assert_eq!(responses_req.temperature, Some(0.7));
     assert_eq!(responses_req.top_p, Some(0.9));
 }
@@ -358,12 +364,15 @@ fn chat_blocks_converted_to_content_parts_array() {
         extra: std::collections::HashMap::new(),
     };
 
-    let responses_req = rotator::openai_responses::chat_request_to_responses_request(&chat_req)
-        .unwrap();
+    let responses_req =
+        rotator::openai_responses::chat_request_to_responses_request(&chat_req).unwrap();
     let body = serde_json::to_value(responses_req).unwrap();
 
     let input_content = &body["input"][0]["content"];
-    assert!(input_content.is_array(), "blocks content must serialize as array, not string");
+    assert!(
+        input_content.is_array(),
+        "blocks content must serialize as array, not string"
+    );
     let arr = input_content.as_array().unwrap();
     assert_eq!(arr[0]["type"], "input_text");
     assert_eq!(arr[0]["text"], "hello");

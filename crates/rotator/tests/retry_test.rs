@@ -317,8 +317,8 @@ async fn auth_error_exhausts_keys_then_stops_retrying() {
     let result = send_request(&client).await;
 
     assert!(
-        matches!(result, Err(RotatorError::NoCredentials(ref provider)) if provider == "test"),
-        "expected NoCredentials after auth rotation exhausted, got {result:?}"
+        matches!(result, Err(RotatorError::AllKeysBusy(ref provider, _)) if provider == "test"),
+        "expected AllKeysBusy after auth rotation exhausted, got {result:?}"
     );
     // Первый запрос получил 403, второй прерван отсутствием доступных ключей.
     assert_eq!(server.calls.load(Ordering::SeqCst), 1);

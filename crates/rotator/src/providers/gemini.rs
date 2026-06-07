@@ -21,10 +21,7 @@ impl GeminiProvider {
     }
 
     /// Group Gemini-format tool responses with their matching function calls.
-    pub fn group_tool_responses(
-        &self,
-        contents: Vec<serde_json::Value>,
-    ) -> Vec<serde_json::Value> {
+    pub fn group_tool_responses(&self, contents: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
         gemini_tool_handler::group_tool_responses(&contents)
     }
 }
@@ -72,10 +69,11 @@ impl Provider for GeminiProvider {
 
         if let Some(tool_choice) = body.get("tool_choice")
             && let Ok(tc) = serde_json::from_value::<models::chat::ToolChoice>(tool_choice.clone())
-                && let Some(config) = gemini_tool_handler::transform_tool_choice_to_gemini(&tc)
-                    && let Ok(val) = serde_json::to_value(config) {
-                        body["toolConfig"] = val;
-                    }
+            && let Some(config) = gemini_tool_handler::transform_tool_choice_to_gemini(&tc)
+            && let Ok(val) = serde_json::to_value(config)
+        {
+            body["toolConfig"] = val;
+        }
     }
 
     async fn request(

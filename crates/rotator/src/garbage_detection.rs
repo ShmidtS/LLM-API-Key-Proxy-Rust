@@ -50,10 +50,11 @@ pub fn validate_response(response_text: &str) -> Result<(), GarbageResponseError
 
     for check in checks {
         if let Some(err) = check
-            && err.score > max_score {
-                max_score = err.score;
-                primary_reason = err.reason;
-            }
+            && err.score > max_score
+        {
+            max_score = err.score;
+            primary_reason = err.reason;
+        }
     }
 
     if max_score > 0.0 {
@@ -108,18 +109,15 @@ fn check_unmatched_brackets(text: &str) -> Option<GarbageResponseError> {
     for ch in text.chars() {
         match ch {
             '(' | '[' | '{' => stack.push(ch),
-            ')'
-                if stack.pop() != Some('(') => {
-                    unmatched += 1;
-                }
-            ']'
-                if stack.pop() != Some('[') => {
-                    unmatched += 1;
-                }
-            '}'
-                if stack.pop() != Some('{') => {
-                    unmatched += 1;
-                }
+            ')' if stack.pop() != Some('(') => {
+                unmatched += 1;
+            }
+            ']' if stack.pop() != Some('[') => {
+                unmatched += 1;
+            }
+            '}' if stack.pop() != Some('{') => {
+                unmatched += 1;
+            }
             _ => {}
         }
     }
@@ -397,7 +395,8 @@ mod tests {
 
     #[test]
     fn json_response_with_repetition_is_flagged() {
-        let text = r#"{"choices":[{"message":{"content":"repeat repeat repeat repeat repeat repeat"}}]}"#;
+        let text =
+            r#"{"choices":[{"message":{"content":"repeat repeat repeat repeat repeat repeat"}}]}"#;
         let err = validate_response(text).unwrap_err();
         assert!(err.reason.contains("word repetition"));
     }

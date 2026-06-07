@@ -40,10 +40,7 @@ fn sanitize_tools(value: &mut serde_json::Value) {
         return;
     };
     for tool in tools {
-        let Some(func) = tool
-            .get_mut("function")
-            .and_then(|v| v.as_object_mut())
-        else {
+        let Some(func) = tool.get_mut("function").and_then(|v| v.as_object_mut()) else {
             continue;
         };
         func.insert(
@@ -58,9 +55,10 @@ fn sanitize_tool_choice(value: &mut serde_json::Value) {
         return;
     };
     if let Some(choice) = object.get("tool_choice")
-        && choice.is_object() {
-            object.insert("tool_choice".to_owned(), serde_json::json!("required"));
-        }
+        && choice.is_object()
+    {
+        object.insert("tool_choice".to_owned(), serde_json::json!("required"));
+    }
 }
 
 fn remove_stream_options(value: &mut serde_json::Value) {

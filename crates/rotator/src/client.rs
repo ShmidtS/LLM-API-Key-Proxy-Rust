@@ -95,6 +95,30 @@ impl RotatorClient {
     ) -> Result<reqwest::Response> {
         Self::transform_request(provider, path, &mut body);
 
+        // Pre-serialize body once to avoid expensive re-serialization on every retry.
+        let body_bytes = match serde_json::to_vec(&body) {
+            Ok(bytes) => Arc::new(bytes),
+            Err(e) => return Err(RotatorError::Serialization(e.to_string())),
+        };
+
+        let stream = body
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let route = self
+            .provider_registry
+            .resolve_runtime_route(provider, path)
+            .unwrap_or_else(|| crate::provider_runtime::RuntimeProviderRoute {
+                provider_id: provider.to_owned(),
+                kind: crate::provider_runtime::RuntimeProviderKind::LegacyModule,
+                base_url: self.resolve_base_url(provider),
+                action: path.trim_start_matches('/').to_owned(),
+            });
+        let upstream_path =
+            self.provider_registry
+                .resolve_endpoint_path(&route.provider_id, &route.action, &body);
+        let url = normalize_upstream_url(&route.base_url, &upstream_path);
+
         for attempt in 0..=self.max_retries {
             if !self.circuit_breakers.is_allowed(provider) {
                 return Err(RotatorError::CircuitOpen(provider.to_string()));
@@ -104,8 +128,23 @@ impl RotatorClient {
                 .credentials
                 .acquire_least_loaded_where(provider, |key| {
                     self.cooldown.is_available(provider, key)
-                })
-                .ok_or_else(|| RotatorError::NoCredentials(provider.to_string()))?;
+                });
+            let cred = match cred {
+                Some(cred) => cred,
+                None => {
+                    let has_any_keys = self.credentials.has_any_keys(provider);
+                    if !has_any_keys {
+                        return Err(RotatorError::NoCredentials(provider.to_string()));
+                    }
+                    let key_status = self.credentials.get_key_status(provider);
+                    let status_str = key_status
+                        .iter()
+                        .map(|(key, current, limit)| format!("{}: {}/{}", key, current, limit))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(RotatorError::AllKeysBusy(provider.to_string(), status_str));
+                }
+            };
             let permit =
                 CredentialPermit::new(self.credentials.clone(), provider, cred.key.clone());
 
@@ -115,34 +154,19 @@ impl RotatorClient {
                 continue;
             }
 
-            let stream = body
-                .get("stream")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
             let client = if stream {
                 self.http_pool.get_or_create_streaming(provider)
             } else {
                 self.http_pool.get_or_create(provider)
             };
-            let route = self
-                .provider_registry
-                .resolve_runtime_route(provider, path)
-                .unwrap_or_else(|| crate::provider_runtime::RuntimeProviderRoute {
-                    provider_id: provider.to_owned(),
-                    kind: crate::provider_runtime::RuntimeProviderKind::LegacyModule,
-                    base_url: self.resolve_base_url(provider),
-                    action: path.trim_start_matches('/').to_owned(),
-                });
-            let upstream_path = self.provider_registry.resolve_endpoint_path(
-                &route.provider_id,
-                &route.action,
-                &body,
-            );
-            let url = normalize_upstream_url(&route.base_url, &upstream_path);
             let token = self.resolve_auth_token(provider, permit.key()).await?;
             let request = self.apply_auth_headers(provider, client.post(&url), &token);
             let started_at = Instant::now();
-            let result = request.json(&body).send().await;
+            let result = request
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(reqwest::Body::from(body_bytes.as_ref().to_vec()))
+                .send()
+                .await;
             self.last_latency_ms
                 .insert(provider.to_owned(), started_at.elapsed().as_millis() as u64);
 
@@ -200,9 +224,8 @@ impl RotatorClient {
                             _ => {
                                 let mut builder =
                                     http::Response::builder().status(status).version(version);
-                                *builder
-                                    .headers_mut()
-                                    .expect("response builder is valid") = headers;
+                                *builder.headers_mut().expect("response builder is valid") =
+                                    headers;
                                 return Ok(builder
                                     .body(bytes)
                                     .expect("response body rebuild should not fail")
@@ -229,7 +252,8 @@ impl RotatorClient {
                         arl.record_429(provider, permit.key());
                     }
                     let failure = classify_upstream_failure(status, &headers, Some(&body_text));
-                    self.ip_throttle.record_429(permit.key(), &body_text, provider);
+                    self.ip_throttle
+                        .record_429(permit.key(), &body_text, provider);
                     let assessment = self.ip_throttle.assess_throttle(permit.key(), provider);
                     let mut decision = decide_retry_for_provider(
                         failure.clone(),
@@ -439,8 +463,23 @@ impl RotatorClient {
                 .credentials
                 .acquire_least_loaded_where(provider, |key| {
                     self.cooldown.is_available(provider, key)
-                })
-                .ok_or_else(|| RotatorError::NoCredentials(provider.to_string()))?;
+                });
+            let cred = match cred {
+                Some(cred) => cred,
+                None => {
+                    let has_any_keys = self.credentials.has_any_keys(provider);
+                    if !has_any_keys {
+                        return Err(RotatorError::NoCredentials(provider.to_string()));
+                    }
+                    let key_status = self.credentials.get_key_status(provider);
+                    let status_str = key_status
+                        .iter()
+                        .map(|(key, current, limit)| format!("{}: {}/{}", key, current, limit))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(RotatorError::AllKeysBusy(provider.to_string(), status_str));
+                }
+            };
             let permit =
                 CredentialPermit::new(self.credentials.clone(), provider, cred.key.clone());
 
@@ -485,7 +524,8 @@ impl RotatorClient {
                         arl.record_429(provider, permit.key());
                     }
                     let failure = classify_upstream_failure(status, &headers, Some(&body_text));
-                    self.ip_throttle.record_429(permit.key(), &body_text, provider);
+                    self.ip_throttle
+                        .record_429(permit.key(), &body_text, provider);
                     let assessment = self.ip_throttle.assess_throttle(permit.key(), provider);
                     let mut decision = decide_retry_for_provider(
                         failure.clone(),
@@ -662,10 +702,23 @@ impl RotatorClient {
     }
 
     pub async fn get(&self, provider: &str, path: &str) -> Result<reqwest::Response> {
-        let cred = self
-            .credentials
-            .acquire_least_loaded(provider)
-            .ok_or_else(|| RotatorError::NoCredentials(provider.to_string()))?;
+        let cred = self.credentials.acquire_least_loaded(provider);
+        let cred = match cred {
+            Some(cred) => cred,
+            None => {
+                let has_any_keys = self.credentials.has_any_keys(provider);
+                if !has_any_keys {
+                    return Err(RotatorError::NoCredentials(provider.to_string()));
+                }
+                let key_status = self.credentials.get_key_status(provider);
+                let status_str = key_status
+                    .iter()
+                    .map(|(key, current, limit)| format!("{}: {}/{}", key, current, limit))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(RotatorError::AllKeysBusy(provider.to_string(), status_str));
+            }
+        };
         let permit = CredentialPermit::new(self.credentials.clone(), provider, cred.key.clone());
 
         let client = self.http_pool.get_or_create(provider);
@@ -682,10 +735,23 @@ impl RotatorClient {
     }
 
     pub async fn delete(&self, provider: &str, path: &str) -> Result<reqwest::Response> {
-        let cred = self
-            .credentials
-            .acquire_least_loaded(provider)
-            .ok_or_else(|| RotatorError::NoCredentials(provider.to_string()))?;
+        let cred = self.credentials.acquire_least_loaded(provider);
+        let cred = match cred {
+            Some(cred) => cred,
+            None => {
+                let has_any_keys = self.credentials.has_any_keys(provider);
+                if !has_any_keys {
+                    return Err(RotatorError::NoCredentials(provider.to_string()));
+                }
+                let key_status = self.credentials.get_key_status(provider);
+                let status_str = key_status
+                    .iter()
+                    .map(|(key, current, limit)| format!("{}: {}/{}", key, current, limit))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(RotatorError::AllKeysBusy(provider.to_string(), status_str));
+            }
+        };
         let permit = CredentialPermit::new(self.credentials.clone(), provider, cred.key.clone());
 
         let client = self.http_pool.get_or_create(provider);
@@ -707,10 +773,23 @@ impl RotatorClient {
         path: &str,
         query: &[(String, String)],
     ) -> Result<reqwest::Response> {
-        let cred = self
-            .credentials
-            .acquire_least_loaded(provider)
-            .ok_or_else(|| RotatorError::NoCredentials(provider.to_string()))?;
+        let cred = self.credentials.acquire_least_loaded(provider);
+        let cred = match cred {
+            Some(cred) => cred,
+            None => {
+                let has_any_keys = self.credentials.has_any_keys(provider);
+                if !has_any_keys {
+                    return Err(RotatorError::NoCredentials(provider.to_string()));
+                }
+                let key_status = self.credentials.get_key_status(provider);
+                let status_str = key_status
+                    .iter()
+                    .map(|(key, current, limit)| format!("{}: {}/{}", key, current, limit))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(RotatorError::AllKeysBusy(provider.to_string(), status_str));
+            }
+        };
         let permit = CredentialPermit::new(self.credentials.clone(), provider, cred.key.clone());
 
         let client = self.http_pool.get_or_create(provider);
@@ -732,10 +811,23 @@ impl RotatorClient {
         path: &str,
         query: &[(String, String)],
     ) -> Result<reqwest::Response> {
-        let cred = self
-            .credentials
-            .acquire_least_loaded(provider)
-            .ok_or_else(|| RotatorError::NoCredentials(provider.to_string()))?;
+        let cred = self.credentials.acquire_least_loaded(provider);
+        let cred = match cred {
+            Some(cred) => cred,
+            None => {
+                let has_any_keys = self.credentials.has_any_keys(provider);
+                if !has_any_keys {
+                    return Err(RotatorError::NoCredentials(provider.to_string()));
+                }
+                let key_status = self.credentials.get_key_status(provider);
+                let status_str = key_status
+                    .iter()
+                    .map(|(key, current, limit)| format!("{}: {}/{}", key, current, limit))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(RotatorError::AllKeysBusy(provider.to_string(), status_str));
+            }
+        };
         let permit = CredentialPermit::new(self.credentials.clone(), provider, cred.key.clone());
 
         let client = self.http_pool.get_or_create(provider);

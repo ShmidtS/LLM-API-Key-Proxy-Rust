@@ -83,7 +83,8 @@ pub fn chat_request_to_responses_request(
                     input.push(ResponseInputItem::Message {
                         type_: "message".to_owned(),
                         role: "assistant".to_owned(),
-                        content: content.unwrap_or_else(|| ResponseInputContent::Text(String::new())),
+                        content: content
+                            .unwrap_or_else(|| ResponseInputContent::Text(String::new())),
                     });
                     continue;
                 }
@@ -117,7 +118,10 @@ pub fn chat_request_to_responses_request(
         }
     }
 
-    let bare_model = chat_req.model.strip_prefix("openai/").unwrap_or(&chat_req.model);
+    let bare_model = chat_req
+        .model
+        .strip_prefix("openai/")
+        .unwrap_or(&chat_req.model);
     let is_reasoning = bare_model.starts_with("gpt-5") || bare_model.starts_with("o4");
 
     Ok(CreateResponseRequest {
@@ -125,7 +129,11 @@ pub fn chat_request_to_responses_request(
         input: ResponseInput::Items(input),
         instructions: (!instructions.is_empty()).then(|| instructions.join("\n")),
         max_output_tokens: chat_req.max_tokens,
-        temperature: if is_reasoning { None } else { chat_req.temperature },
+        temperature: if is_reasoning {
+            None
+        } else {
+            chat_req.temperature
+        },
         top_p: if is_reasoning { None } else { chat_req.top_p },
         tools: chat_req.tools.as_ref().map(|tools| {
             tools
@@ -167,7 +175,9 @@ fn chat_message_content_to_response_input_content(
                         Some("text") => block
                             .get("text")
                             .and_then(Value::as_str)
-                            .map(|text| ResponseContentPart::Text { text: text.to_owned() })
+                            .map(|text| ResponseContentPart::Text {
+                                text: text.to_owned(),
+                            })
                             .ok_or_else(|| "text block missing text field".to_owned()),
                         Some("image_url") => {
                             let url = block
@@ -181,17 +191,13 @@ fn chat_message_content_to_response_input_content(
                                 .and_then(Value::as_str)
                                 .map(|s| s.to_owned());
                             match url {
-                                Some(image_url) => Ok(ResponseContentPart::Image {
-                                    image_url,
-                                    detail,
-                                }),
+                                Some(image_url) => {
+                                    Ok(ResponseContentPart::Image { image_url, detail })
+                                }
                                 None => Err("image_url block missing url".to_owned()),
                             }
                         }
-                        _ => Err(format!(
-                            "unsupported content block type: {:?}",
-                            block_type
-                        )),
+                        _ => Err(format!("unsupported content block type: {:?}", block_type)),
                     }
                 })
                 .collect();

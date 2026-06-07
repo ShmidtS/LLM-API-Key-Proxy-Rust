@@ -58,7 +58,10 @@ pub use providers::oauth::{
     QwenOAuthFlow, RefreshTokenResponse, refresh_oauth_token,
 };
 pub use providers::{Provider, ProviderManager};
-pub use rate_limiter::{AdaptiveRateLimiter, AdaptiveRateLimiterRegistry, ProviderRateInfo, RateLimiterRegistry, TokenBucket};
+pub use rate_limiter::{
+    AdaptiveRateLimiter, AdaptiveRateLimiterRegistry, ProviderRateInfo, RateLimiterRegistry,
+    TokenBucket,
+};
 pub use request_sanitizer::{SanitizerAction, SanitizerContext, SanitizerRule, sanitize_request};
 pub use throttle::{ThrottleReason, classify_throttle};
 pub use token_calculator::{TokenCalculator, calculate_max_tokens};

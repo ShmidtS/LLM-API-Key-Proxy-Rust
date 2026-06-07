@@ -183,7 +183,9 @@ impl TokenCalculator {
         safety_buffer: u32,
     ) -> u32 {
         let context_window = self.registry.lookup(model);
-        let available = context_window.saturating_sub(input_tokens).saturating_sub(safety_buffer);
+        let available = context_window
+            .saturating_sub(input_tokens)
+            .saturating_sub(safety_buffer);
 
         let max_tokens = match existing_max {
             Some(requested) => requested.min(available),
@@ -226,7 +228,8 @@ mod tests {
     #[test]
     fn caps_existing_max_tokens_when_exceeds_limit() {
         let calc = TokenCalculator::new();
-        let result = calc.calculate_max_tokens("gpt-4o", 1000, Some(200_000), DEFAULT_SAFETY_BUFFER);
+        let result =
+            calc.calculate_max_tokens("gpt-4o", 1000, Some(200_000), DEFAULT_SAFETY_BUFFER);
         assert_eq!(result, 128_000 - 1000 - DEFAULT_SAFETY_BUFFER);
     }
 
@@ -240,15 +243,20 @@ mod tests {
     #[test]
     fn uses_prefix_fallback_for_unknown_variant() {
         let calc = TokenCalculator::new();
-        let result = calc.calculate_max_tokens("gpt-4o-2024-08-06", 1000, None, DEFAULT_SAFETY_BUFFER);
+        let result =
+            calc.calculate_max_tokens("gpt-4o-2024-08-06", 1000, None, DEFAULT_SAFETY_BUFFER);
         assert_eq!(result, 128_000 - 1000 - DEFAULT_SAFETY_BUFFER);
     }
 
     #[test]
     fn uses_default_context_window_for_unknown_model() {
         let calc = TokenCalculator::new();
-        let result = calc.calculate_max_tokens("unknown-model-v99", 1000, None, DEFAULT_SAFETY_BUFFER);
-        assert_eq!(result, DEFAULT_CONTEXT_WINDOW - 1000 - DEFAULT_SAFETY_BUFFER);
+        let result =
+            calc.calculate_max_tokens("unknown-model-v99", 1000, None, DEFAULT_SAFETY_BUFFER);
+        assert_eq!(
+            result,
+            DEFAULT_CONTEXT_WINDOW - 1000 - DEFAULT_SAFETY_BUFFER
+        );
     }
 
     #[test]
@@ -261,7 +269,8 @@ mod tests {
     #[test]
     fn caps_existing_max_when_headroom_exhausted() {
         let calc = TokenCalculator::new();
-        let result = calc.calculate_max_tokens("gpt-4o", 200_000, Some(50_000), DEFAULT_SAFETY_BUFFER);
+        let result =
+            calc.calculate_max_tokens("gpt-4o", 200_000, Some(50_000), DEFAULT_SAFETY_BUFFER);
         assert_eq!(result, MIN_MAX_TOKENS);
     }
 
@@ -275,15 +284,27 @@ mod tests {
     #[test]
     fn context_window_claude_models() {
         let calc = TokenCalculator::new();
-        assert_eq!(calc.calculate_max_tokens("claude-3-5-sonnet-20241022", 0, None, 0), 200_000);
-        assert_eq!(calc.calculate_max_tokens("anthropic/claude-3-opus-20240229", 0, None, 0), 200_000);
+        assert_eq!(
+            calc.calculate_max_tokens("claude-3-5-sonnet-20241022", 0, None, 0),
+            200_000
+        );
+        assert_eq!(
+            calc.calculate_max_tokens("anthropic/claude-3-opus-20240229", 0, None, 0),
+            200_000
+        );
     }
 
     #[test]
     fn context_window_gemini_models() {
         let calc = TokenCalculator::new();
-        assert_eq!(calc.calculate_max_tokens("gemini-1.5-pro", 0, None, 0), 2_097_152);
-        assert_eq!(calc.calculate_max_tokens("gemini-2.5-flash", 0, None, 0), 1_048_576);
+        assert_eq!(
+            calc.calculate_max_tokens("gemini-1.5-pro", 0, None, 0),
+            2_097_152
+        );
+        assert_eq!(
+            calc.calculate_max_tokens("gemini-2.5-flash", 0, None, 0),
+            1_048_576
+        );
     }
 
     #[test]

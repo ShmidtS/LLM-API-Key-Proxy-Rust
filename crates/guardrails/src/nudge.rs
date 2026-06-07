@@ -45,11 +45,12 @@ impl RetryNudger for DefaultRetryNudger {
                     .get("instructions")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                Arc::make_mut(&mut nudged.body)["instructions"] = Value::String(if existing.is_empty() {
-                    text.to_owned()
-                } else {
-                    format!("{existing}\n{text}")
-                });
+                Arc::make_mut(&mut nudged.body)["instructions"] =
+                    Value::String(if existing.is_empty() {
+                        text.to_owned()
+                    } else {
+                        format!("{existing}\n{text}")
+                    });
             }
         }
         nudged.attempt.semantic_retry_index = nudged.attempt.semantic_retry_index.saturating_add(1);

@@ -349,12 +349,14 @@ impl ProviderRegistry {
                     .then_some(normalize_provider_id(provider))
             })
             .or_else(|| {
-                self.env_model_patterns.iter().find_map(|(provider, models)| {
-                    models
-                        .iter()
-                        .any(|name| name == model)
-                        .then_some(normalize_provider_id(provider))
-                })
+                self.env_model_patterns
+                    .iter()
+                    .find_map(|(provider, models)| {
+                        models
+                            .iter()
+                            .any(|name| name == model)
+                            .then_some(normalize_provider_id(provider))
+                    })
             })
             .or_else(|| static_provider_for_model(model).map(ToOwned::to_owned))
             .or_else(|| prefix_provider_for_model(model).map(ToOwned::to_owned))
@@ -611,7 +613,7 @@ fn default_provider_definitions() -> Vec<ProviderDefinition> {
             "fireworks",
             "https://api.fireworks.ai/inference/v1",
             AuthType::Bearer,
-            &[r"^accounts/fireworks/models/.*", r"^fireworks/.*"],
+            &[r"^accounts/fireworks/.*", r"^fireworks/.*"],
             120,
             &[],
         ),

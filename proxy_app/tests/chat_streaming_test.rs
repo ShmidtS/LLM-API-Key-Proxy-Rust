@@ -56,7 +56,7 @@ fn provider_test_state(provider: &str, base_url: String) -> AppState {
         base_url,
         auth_type: AuthType::ApiKey,
         model_patterns: vec![format!(r"^{provider}/.*")],
-            compiled_patterns: Vec::new(),
+        compiled_patterns: Vec::new(),
         endpoints: vec![endpoint.to_owned()],
         features: vec!["chat".to_owned()],
         model_count: 1,

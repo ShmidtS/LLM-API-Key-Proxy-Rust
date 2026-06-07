@@ -87,11 +87,26 @@ pub fn load_from_env() -> Result<proxy::ProxyConfig, ConfigError> {
     apply_vec_env("HTTP_SSL_VERIFY_HOSTS", &mut config.http_ssl_verify_hosts);
     apply_env("HTTP2_ENABLED", &mut config.http2_enabled)?;
     apply_optional_string_env("HTTP_DNS_RESOLVER", &mut config.http_dns_resolver);
-    apply_env("ADAPTIVE_RATE_LIMITER__ENABLED", &mut config.adaptive_rate_limiter.enabled)?;
-    apply_env("ADAPTIVE_RATE_LIMITER__FLOOR_RPS", &mut config.adaptive_rate_limiter.floor_rps)?;
-    apply_env("ADAPTIVE_RATE_LIMITER__ADDITIVE_INCREASE", &mut config.adaptive_rate_limiter.additive_increase)?;
-    apply_env("ADAPTIVE_RATE_LIMITER__MULTIPLICATIVE_DECREASE", &mut config.adaptive_rate_limiter.multiplicative_decrease)?;
-    apply_env("ADAPTIVE_RATE_LIMITER__SUCCESS_WINDOW_THRESHOLD", &mut config.adaptive_rate_limiter.success_window_threshold)?;
+    apply_env(
+        "ADAPTIVE_RATE_LIMITER__ENABLED",
+        &mut config.adaptive_rate_limiter.enabled,
+    )?;
+    apply_env(
+        "ADAPTIVE_RATE_LIMITER__FLOOR_RPS",
+        &mut config.adaptive_rate_limiter.floor_rps,
+    )?;
+    apply_env(
+        "ADAPTIVE_RATE_LIMITER__ADDITIVE_INCREASE",
+        &mut config.adaptive_rate_limiter.additive_increase,
+    )?;
+    apply_env(
+        "ADAPTIVE_RATE_LIMITER__MULTIPLICATIVE_DECREASE",
+        &mut config.adaptive_rate_limiter.multiplicative_decrease,
+    )?;
+    apply_env(
+        "ADAPTIVE_RATE_LIMITER__SUCCESS_WINDOW_THRESHOLD",
+        &mut config.adaptive_rate_limiter.success_window_threshold,
+    )?;
 
     Ok(config)
 }

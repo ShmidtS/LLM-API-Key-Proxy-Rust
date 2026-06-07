@@ -4,6 +4,10 @@ use thiserror::Error;
 pub enum RotatorError {
     #[error("no credentials available for provider: {0}")]
     NoCredentials(String),
+    #[error("all keys busy for provider: {0} (concurrent limit reached) — {1}")]
+    AllKeysBusy(String, String),
+    #[error("garbage response, retrying: {reason} (score: {score})")]
+    GarbageRetry { reason: String, score: f64 },
     #[error("circuit breaker open for provider: {0}")]
     CircuitOpen(String),
     #[error("rate limited for provider: {0}, retry after: {1:?}")]

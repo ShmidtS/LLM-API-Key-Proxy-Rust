@@ -19,10 +19,7 @@ pub struct GeminiFunctionDeclaration {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(
-        rename = "parameters",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "parameters", skip_serializing_if = "Option::is_none")]
     pub parameters: Option<serde_json::Value>,
 }
 
@@ -86,7 +83,10 @@ pub fn transform_tool_choice_to_gemini(tool_choice: &ToolChoice) -> Option<Gemin
             },
             _ => return None,
         },
-        ToolChoice::Object { r#type: _, function } => GeminiFunctionCallingConfig {
+        ToolChoice::Object {
+            r#type: _,
+            function,
+        } => GeminiFunctionCallingConfig {
             mode: "ANY".to_owned(),
             allowed_function_names: Some(vec![function.name.clone()]),
         },
@@ -102,9 +102,7 @@ pub fn transform_tool_choice_to_gemini(tool_choice: &ToolChoice) -> Option<Gemin
 /// Converts linear format `(call, response, call, response)` into grouped
 /// format `(model with calls, user with all responses)` while preserving
 /// ID-based pairing.
-pub fn group_tool_responses(
-    contents: &[serde_json::Value],
-) -> Vec<serde_json::Value> {
+pub fn group_tool_responses(contents: &[serde_json::Value]) -> Vec<serde_json::Value> {
     let mut new_contents: Vec<serde_json::Value> = Vec::new();
     #[derive(Debug)]
     struct PendingGroup {
@@ -116,10 +114,7 @@ pub fn group_tool_responses(
     let mut collected_responses: HashMap<String, serde_json::Value> = HashMap::new();
 
     for content in contents {
-        let role = content
-            .get("role")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let role = content.get("role").and_then(|v| v.as_str()).unwrap_or("");
         let parts = content
             .get("parts")
             .and_then(|v| v.as_array())
@@ -215,11 +210,7 @@ pub fn group_tool_responses(
         let mut group_responses: Vec<serde_json::Value> = Vec::new();
 
         for (i, expected_id) in group.ids.iter().enumerate() {
-            let expected_name = group
-                .func_names
-                .get(i)
-                .cloned()
-                .unwrap_or_default();
+            let expected_name = group.func_names.get(i).cloned().unwrap_or_default();
 
             if let Some(resp) = collected_responses.remove(expected_id) {
                 group_responses.push(resp);
@@ -259,29 +250,35 @@ pub fn group_tool_responses(
                 if let Some(oid) = matched_orphan_id {
                     let mut orphan_resp = collected_responses.remove(&oid).unwrap();
                     if let Some(obj) = orphan_resp.get_mut("functionResponse")
-                        && let Some(map) = obj.as_object_mut() {
-                            let old_id = map
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_owned();
-                            map.insert("id".to_owned(), serde_json::Value::String(expected_id.clone()));
-                            if let Some(name) = map.get("name").and_then(|v| v.as_str())
-                                && name == "unknown_function" && !expected_name.is_empty() {
-                                    map.insert(
-                                        "name".to_owned(),
-                                        serde_json::Value::String(expected_name.clone()),
-                                    );
-                                }
-                            if old_id != *expected_id {
-                                tracing::warn!(
-                                    "Auto-repaired ID mismatch: mapped response '{}' to call '{}' (function: {})",
-                                    old_id,
-                                    expected_id,
-                                    expected_name
-                                );
-                            }
+                        && let Some(map) = obj.as_object_mut()
+                    {
+                        let old_id = map
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_owned();
+                        map.insert(
+                            "id".to_owned(),
+                            serde_json::Value::String(expected_id.clone()),
+                        );
+                        if let Some(name) = map.get("name").and_then(|v| v.as_str())
+                            && name == "unknown_function"
+                            && !expected_name.is_empty()
+                        {
+                            map.insert(
+                                "name".to_owned(),
+                                serde_json::Value::String(expected_name.clone()),
+                            );
                         }
+                        if old_id != *expected_id {
+                            tracing::warn!(
+                                "Auto-repaired ID mismatch: mapped response '{}' to call '{}' (function: {})",
+                                old_id,
+                                expected_id,
+                                expected_name
+                            );
+                        }
+                    }
                     group_responses.push(orphan_resp);
                 }
             } else {
@@ -343,10 +340,7 @@ pub fn strip_gemini3_prefix(name: &str) -> String {
 ///
 /// The `template` should contain a `{params}` placeholder which will be
 /// replaced with the formatted parameter list.
-pub fn inject_tool_signature(
-    declaration: &mut GeminiFunctionDeclaration,
-    template: &str,
-) {
+pub fn inject_tool_signature(declaration: &mut GeminiFunctionDeclaration, template: &str) {
     let schema = declaration
         .parameters
         .clone()
@@ -471,10 +465,7 @@ fn format_type_hint(prop_data: &serde_json::Value) -> String {
             let nested_list: Vec<String> = nested_props
                 .iter()
                 .map(|(n, d)| {
-                    let t = d
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
+                    let t = d.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
                     let req = nested_req.contains(&serde_json::json!(n));
                     format!("{}: {}{}", n, t, if req { " REQUIRED" } else { "" })
                 })
@@ -580,7 +571,12 @@ mod tests {
         let tc = ToolChoice::String("auto".to_owned());
         let config = transform_tool_choice_to_gemini(&tc).unwrap();
         assert_eq!(config.function_calling_config.mode, "AUTO");
-        assert!(config.function_calling_config.allowed_function_names.is_none());
+        assert!(
+            config
+                .function_calling_config
+                .allowed_function_names
+                .is_none()
+        );
     }
 
     #[test]
@@ -658,12 +654,10 @@ mod tests {
 
     #[test]
     fn group_tool_responses_placeholder_for_missing() {
-        let contents = vec![
-            json!({
-                "role": "model",
-                "parts": [{"functionCall": {"id": "call_1", "name": "get_weather"}}]
-            }),
-        ];
+        let contents = vec![json!({
+            "role": "model",
+            "parts": [{"functionCall": {"id": "call_1", "name": "get_weather"}}]
+        })];
 
         let grouped = group_tool_responses(&contents);
         assert_eq!(grouped.len(), 2);
@@ -752,10 +746,7 @@ mod tests {
     #[test]
     fn format_type_hint_enum() {
         let prop = json!({"type": "string", "enum": ["a", "b", "c"]});
-        assert_eq!(
-            format_type_hint(&prop),
-            "string ENUM['a', 'b', 'c']"
-        );
+        assert_eq!(format_type_hint(&prop), "string ENUM['a', 'b', 'c']");
     }
 
     #[test]
@@ -776,7 +767,10 @@ mod tests {
                 "required": ["x"]
             }
         });
-        assert_eq!(format_type_hint(&prop), "ARRAY_OF_OBJECTS[x: number REQUIRED]");
+        assert_eq!(
+            format_type_hint(&prop),
+            "ARRAY_OF_OBJECTS[x: number REQUIRED]"
+        );
     }
 
     #[test]

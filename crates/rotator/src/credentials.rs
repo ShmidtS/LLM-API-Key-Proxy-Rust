@@ -87,43 +87,44 @@ impl CredentialManager {
         // 2. Fallback: read .env file directly so keys are found even when the
         //    process was started from a different working directory.
         if let Some(path) = dotenv_path
-            && let Ok(contents) = std::fs::read_to_string(path) {
-                for line in contents.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-                    let Some((key_name, value)) = line.split_once('=') else {
-                        continue;
+            && let Ok(contents) = std::fs::read_to_string(path)
+        {
+            for line in contents.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let Some((key_name, value)) = line.split_once('=') else {
+                    continue;
+                };
+                let key_name = key_name.trim();
+                if !key_name.contains("_API_KEY") {
+                    continue;
+                }
+                if key_name == "PROXY_API_KEY" {
+                    continue;
+                }
+                let mut value = value.trim();
+                value = value.strip_prefix('"').unwrap_or(value);
+                value = value.strip_suffix('"').unwrap_or(value);
+                value = value.strip_prefix('\'').unwrap_or(value);
+                value = value.strip_suffix('\'').unwrap_or(value);
+                if value.is_empty() || value.starts_with("YOUR_") {
+                    continue;
+                }
+                if let Some(captures) = regex.captures(key_name) {
+                    let provider = match &captures[1] {
+                        "NVIDIA_NIM" => "nvidia".to_string(),
+                        provider => provider.to_lowercase(),
                     };
-                    let key_name = key_name.trim();
-                    if !key_name.contains("_API_KEY") {
-                        continue;
-                    }
-                    if key_name == "PROXY_API_KEY" {
-                        continue;
-                    }
-                    let mut value = value.trim();
-                    value = value.strip_prefix('"').unwrap_or(value);
-                    value = value.strip_suffix('"').unwrap_or(value);
-                    value = value.strip_prefix('\'').unwrap_or(value);
-                    value = value.strip_suffix('\'').unwrap_or(value);
-                    if value.is_empty() || value.starts_with("YOUR_") {
-                        continue;
-                    }
-                    if let Some(captures) = regex.captures(key_name) {
-                        let provider = match &captures[1] {
-                            "NVIDIA_NIM" => "nvidia".to_string(),
-                            provider => provider.to_lowercase(),
-                        };
-                        let index = captures
-                            .get(2)
-                            .and_then(|capture| capture.as_str().parse().ok())
-                            .unwrap_or(0);
-                        unique_keys.insert(key_name.to_string(), (provider, index, value.to_string()));
-                    }
+                    let index = captures
+                        .get(2)
+                        .and_then(|capture| capture.as_str().parse().ok())
+                        .unwrap_or(0);
+                    unique_keys.insert(key_name.to_string(), (provider, index, value.to_string()));
                 }
             }
+        }
 
         let mut keys_by_provider: HashMap<String, Vec<(usize, String)>> = HashMap::new();
         for (_, (provider, index, value)) in unique_keys {
@@ -137,7 +138,11 @@ impl CredentialManager {
         for (provider, mut keys) in keys_by_provider {
             let count = keys.len();
             keys.sort_by_key(|(index, _)| *index);
-            manager.register_keys(provider.clone(), keys.into_iter().map(|(_, key)| key).collect(), 10);
+            manager.register_keys(
+                provider.clone(),
+                keys.into_iter().map(|(_, key)| key).collect(),
+                50,
+            );
             loaded_counts.push((provider, count));
         }
 
@@ -196,7 +201,7 @@ impl CredentialManager {
 
         for (provider, mut keys) in keys_by_provider {
             keys.sort_by_key(|(index, _)| *index);
-            self.register_keys(provider, keys.into_iter().map(|(_, key)| key).collect(), 10);
+            self.register_keys(provider, keys.into_iter().map(|(_, key)| key).collect(), 50);
         }
         Ok(())
     }
@@ -221,6 +226,31 @@ impl CredentialManager {
             .filter(|e| e.current_requests.load(Ordering::Relaxed) < e.concurrent_limit)
             .min_by_key(|e| e.current_requests.load(Ordering::Relaxed))
             .cloned()
+    }
+
+    pub fn get_key_status(&self, provider: &str) -> Vec<(String, usize, usize)> {
+        self.credentials
+            .get(provider)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.key.clone(),
+                            e.current_requests.load(Ordering::Relaxed),
+                            e.concurrent_limit,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn has_any_keys(&self, provider: &str) -> bool {
+        self.credentials
+            .get(provider)
+            .map(|e| !e.is_empty())
+            .unwrap_or(false)
     }
 
     pub fn acquire_least_loaded(&self, provider: &str) -> Option<CredentialEntry> {
@@ -389,14 +419,14 @@ mod tests {
             openai_keys,
             vec!["openai-base-key", "openai-key-0", "openai-key-1"]
         );
-        assert!(openai.iter().all(|entry| entry.concurrent_limit == 10));
+        assert!(openai.iter().all(|entry| entry.concurrent_limit == 50));
 
         let gemini_cli = manager.credentials.get("gemini_cli").unwrap();
         let mut gemini_cli_keys: Vec<_> =
             gemini_cli.iter().map(|entry| entry.key.as_str()).collect();
         gemini_cli_keys.sort_unstable();
         assert_eq!(gemini_cli_keys, vec!["gemini-cli-key-1"]);
-        assert!(gemini_cli.iter().all(|entry| entry.concurrent_limit == 10));
+        assert!(gemini_cli.iter().all(|entry| entry.concurrent_limit == 50));
 
         let nvidia = manager.credentials.get("nvidia").unwrap();
         let nvidia_keys: Vec<_> = nvidia.iter().map(|entry| entry.key.as_str()).collect();

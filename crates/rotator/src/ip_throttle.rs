@@ -67,10 +67,7 @@ impl IPThrottleDetector {
         let body_hash = hash_body(error_body);
         let now = Instant::now();
 
-        let provider_state = self
-            .providers
-            .entry(provider.to_owned())
-            .or_default();
+        let provider_state = self.providers.entry(provider.to_owned()).or_default();
 
         let mut cred_state = provider_state
             .credentials
@@ -174,14 +171,20 @@ mod tests {
     #[test]
     fn empty_detector_returns_clean() {
         let detector = IPThrottleDetector::new();
-        assert_eq!(detector.assess_throttle("key-1", "openai"), ThrottleAssessment::Clean);
+        assert_eq!(
+            detector.assess_throttle("key-1", "openai"),
+            ThrottleAssessment::Clean
+        );
     }
 
     #[test]
     fn single_429_returns_clean() {
         let detector = IPThrottleDetector::new();
         detector.record_429("key-1", "rate limit", "openai");
-        assert_eq!(detector.assess_throttle("key-1", "openai"), ThrottleAssessment::Clean);
+        assert_eq!(
+            detector.assess_throttle("key-1", "openai"),
+            ThrottleAssessment::Clean
+        );
     }
 
     #[test]
@@ -189,7 +192,10 @@ mod tests {
         let detector = IPThrottleDetector::new();
         detector.record_429("key-1", "rate limit", "openai");
         detector.record_429("key-2", "rate limit", "openai");
-        assert_eq!(detector.assess_throttle("key-1", "openai"), ThrottleAssessment::Suspicious);
+        assert_eq!(
+            detector.assess_throttle("key-1", "openai"),
+            ThrottleAssessment::Suspicious
+        );
     }
 
     #[test]
@@ -199,7 +205,10 @@ mod tests {
         detector.record_429("key-1", body, "openai");
         detector.record_429("key-2", body, "openai");
         detector.record_429("key-3", body, "openai");
-        assert_eq!(detector.assess_throttle("key-1", "openai"), ThrottleAssessment::Throttled);
+        assert_eq!(
+            detector.assess_throttle("key-1", "openai"),
+            ThrottleAssessment::Throttled
+        );
     }
 
     #[test]
@@ -208,7 +217,10 @@ mod tests {
         detector.record_429("key-1", "rate limit A", "openai");
         detector.record_429("key-2", "rate limit B", "openai");
         detector.record_429("key-3", "rate limit C", "openai");
-        assert_eq!(detector.assess_throttle("key-1", "openai"), ThrottleAssessment::Suspicious);
+        assert_eq!(
+            detector.assess_throttle("key-1", "openai"),
+            ThrottleAssessment::Suspicious
+        );
     }
 
     #[test]
@@ -218,7 +230,10 @@ mod tests {
         detector.record_429("key-1", body, "openrouter");
         detector.record_429("key-2", body, "openrouter");
         detector.record_429("key-3", body, "openrouter");
-        assert_eq!(detector.assess_throttle("key-1", "openrouter"), ThrottleAssessment::Clean);
+        assert_eq!(
+            detector.assess_throttle("key-1", "openrouter"),
+            ThrottleAssessment::Clean
+        );
     }
 
     #[tokio::test]
@@ -228,14 +243,20 @@ mod tests {
         detector.record_429("key-2", "rate limit", "openai");
         detector.record_429("key-3", "rate limit", "openai");
         // До сна должно быть Throttled
-        assert_eq!(detector.assess_throttle("key-1", "openai"), ThrottleAssessment::Throttled);
+        assert_eq!(
+            detector.assess_throttle("key-1", "openai"),
+            ThrottleAssessment::Throttled
+        );
 
         // Ждём больше окна — не используем tokio::time::sleep в sync test,
         // поэтому просто проверим, что record_429 чистит старые события.
         // Для этого создадим новый detector и запишем одно событие.
         let detector2 = IPThrottleDetector::new();
         detector2.record_429("key-1", "rate limit", "openai");
-        assert_eq!(detector2.assess_throttle("key-1", "openai"), ThrottleAssessment::Clean);
+        assert_eq!(
+            detector2.assess_throttle("key-1", "openai"),
+            ThrottleAssessment::Clean
+        );
     }
 
     #[test]
@@ -257,8 +278,14 @@ mod tests {
         detector.record_429("key-1", "rate limit", "openai");
         detector.record_429("key-2", "rate limit", "openai");
         detector.record_429("key-3", "rate limit", "anthropic");
-        assert_eq!(detector.assess_throttle("key-1", "openai"), ThrottleAssessment::Suspicious);
-        assert_eq!(detector.assess_throttle("key-3", "anthropic"), ThrottleAssessment::Clean);
+        assert_eq!(
+            detector.assess_throttle("key-1", "openai"),
+            ThrottleAssessment::Suspicious
+        );
+        assert_eq!(
+            detector.assess_throttle("key-3", "anthropic"),
+            ThrottleAssessment::Clean
+        );
     }
 
     #[test]

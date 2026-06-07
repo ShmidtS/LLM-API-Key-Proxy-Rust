@@ -53,7 +53,7 @@ fn test_state(provider: &str, base_url: String, model_pattern: &str) -> AppState
         base_url,
         auth_type: AuthType::ApiKey,
         model_patterns: vec![model_pattern.to_owned()],
-            compiled_patterns: Vec::new(),
+        compiled_patterns: Vec::new(),
         endpoints: vec!["/chat/completions".to_owned()],
         features: vec!["chat".to_owned()],
         model_count: 1,

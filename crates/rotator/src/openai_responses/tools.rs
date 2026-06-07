@@ -26,7 +26,10 @@ pub fn response_tool_to_chat_tool(tool: &ResponseTool) -> Result<ToolDefinition>
         r#type: "function".to_owned(),
         function: FunctionDefinition {
             name,
-            description: tool.description.clone().or_else(|| tool.function.as_ref().and_then(|f| f.description.clone())),
+            description: tool
+                .description
+                .clone()
+                .or_else(|| tool.function.as_ref().and_then(|f| f.description.clone())),
             parameters,
         },
     })

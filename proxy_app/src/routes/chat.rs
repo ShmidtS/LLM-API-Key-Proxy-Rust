@@ -56,18 +56,15 @@ async fn chat_completions(
         .and_then(serde_json::Value::as_array)
         .map(|messages| rotator::tokenizer::count_chat_tokens(messages, &req.model))
         .unwrap_or(0);
-    let auto_max_tokens = rotator::calculate_max_tokens(
-        &req.model,
-        input_tokens as u32,
-        req.max_tokens,
-        1000,
-    );
+    let auto_max_tokens =
+        rotator::calculate_max_tokens(&req.model, input_tokens as u32, req.max_tokens, 1000);
     if req.max_tokens.is_none() {
         body["max_tokens"] = serde_json::json!(auto_max_tokens);
     } else if let Some(existing) = req.max_tokens
-        && existing > auto_max_tokens {
-            body["max_tokens"] = serde_json::json!(auto_max_tokens);
-        }
+        && existing > auto_max_tokens
+    {
+        body["max_tokens"] = serde_json::json!(auto_max_tokens);
+    }
     let body = Arc::new(body);
     let upstream_body = if is_anthropic {
         openai_to_anthropic_messages(&body)

@@ -1,7 +1,6 @@
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time::Instant;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProviderRateInfo {
@@ -134,48 +133,72 @@ impl AdaptiveRateLimiterRegistry {
     }
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis() as u64
+}
+
+/// Token-bucket using lock-free atomics: 64-bit raw tokens for cheap fixed-point math.
+/// One token is represented as `TOKEN_UNIT` (1 << 20). This provides enough fractional
+/// precision while staying entirely inside `AtomicU64` CAS.
+const TOKEN_UNIT: f64 = 1_048_576.0;
+
 #[derive(Debug)]
 pub struct TokenBucket {
     requests_per_minute: u32,
     burst_size: u32,
-    tokens: f64,
-    last_refill: Instant,
+    raw_tokens: AtomicU64,
+    last_refill_ms: AtomicU64,
 }
 
 impl TokenBucket {
     pub fn new(requests_per_minute: u32, burst_size: u32) -> Self {
+        let burst = (f64::from(burst_size) * TOKEN_UNIT) as u64;
         Self {
             requests_per_minute,
             burst_size,
-            tokens: f64::from(burst_size),
-            last_refill: Instant::now(),
+            raw_tokens: AtomicU64::new(burst),
+            last_refill_ms: AtomicU64::new(now_ms()),
         }
     }
 
-    pub fn acquire(&mut self) -> bool {
-        self.refill();
-
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn refill(&mut self) {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_refill);
-        self.last_refill = now;
-
-        if self.requests_per_minute == 0 || self.burst_size == 0 {
-            self.tokens = self.tokens.min(f64::from(self.burst_size));
-            return;
-        }
-
+    pub fn acquire(&self) -> bool {
+        let now = now_ms();
+        let last_refill = self.last_refill_ms.load(Ordering::Acquire);
+        let elapsed_ms = now.saturating_sub(last_refill);
         let refill_rate_per_second = f64::from(self.requests_per_minute) / 60.0;
-        let refilled_tokens = elapsed.as_secs_f64() * refill_rate_per_second;
-        self.tokens = (self.tokens + refilled_tokens).min(f64::from(self.burst_size));
+        let refilled =
+            (f64::from(elapsed_ms as u32) / 1000.0 * refill_rate_per_second * TOKEN_UNIT) as u64;
+        let burst = (f64::from(self.burst_size) * TOKEN_UNIT) as u64;
+
+        loop {
+            let current = self.raw_tokens.load(Ordering::Acquire);
+            let new_tokens = if refilled > 0 {
+                (current + refilled).min(burst)
+            } else {
+                current
+            };
+            if new_tokens < TOKEN_UNIT as u64 {
+                return false;
+            }
+            let next = new_tokens - TOKEN_UNIT as u64;
+            match self.raw_tokens.compare_exchange(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if refilled > 0 {
+                        self.last_refill_ms.store(now, Ordering::Release);
+                    }
+                    return true;
+                }
+                Err(_) => continue,
+            }
+        }
     }
 }
 
@@ -320,11 +343,23 @@ mod tests {
         registry.record_success("openai", "key-1");
         registry.record_success("openai", "key-1");
         assert!(
-            (registry.get_provider_info("openai", "key-1").unwrap().current_rps - 5.5).abs() < 1e-9
+            (registry
+                .get_provider_info("openai", "key-1")
+                .unwrap()
+                .current_rps
+                - 5.5)
+                .abs()
+                < 1e-9
         );
         registry.record_429("openai", "key-1");
         assert!(
-            (registry.get_provider_info("openai", "key-1").unwrap().current_rps - 3.85).abs() < 1e-9
+            (registry
+                .get_provider_info("openai", "key-1")
+                .unwrap()
+                .current_rps
+                - 3.85)
+                .abs()
+                < 1e-9
         );
     }
 

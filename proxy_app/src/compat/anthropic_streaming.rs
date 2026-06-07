@@ -126,9 +126,13 @@ pub struct AnthropicMessage {
 pub struct AnthropicContentBlock {
     #[serde(rename = "type")]
     pub block_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<Value>,
 }
 
@@ -231,7 +235,10 @@ pub fn anthropic_content_block_stop_event(index: u64) -> AnthropicSseEvent {
     AnthropicSseEvent::ContentBlockStop { index }
 }
 
-pub fn anthropic_message_delta_event(stop_reason: Option<&str>, usage: Option<AnthropicUsage>) -> AnthropicSseEvent {
+pub fn anthropic_message_delta_event(
+    stop_reason: Option<&str>,
+    usage: Option<AnthropicUsage>,
+) -> AnthropicSseEvent {
     AnthropicSseEvent::MessageDelta {
         delta: AnthropicMessageDelta {
             stop_reason: stop_reason.map(str::to_owned),
@@ -440,6 +447,16 @@ impl OpenAiToAnthropicStreamTranslator {
             )));
         }
 
+        if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str)
+            && !reasoning.is_empty()
+        {
+            let index = self.ensure_text_block(&mut events);
+            events.push(anthropic_sse_event(&anthropic_text_delta_event(
+                Some(index),
+                reasoning,
+            )));
+        }
+
         if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for tool_call in tool_calls {
                 self.translate_tool_call_delta(tool_call, &mut events);
@@ -520,9 +537,10 @@ impl OpenAiToAnthropicStreamTranslator {
             )));
         }
         self.open_blocks.clear();
-        events.push(anthropic_sse_event(&anthropic_message_delta_event(Some(
-            openai_finish_reason_to_anthropic(finish_reason),
-        ), None)));
+        events.push(anthropic_sse_event(&anthropic_message_delta_event(
+            Some(openai_finish_reason_to_anthropic(finish_reason)),
+            None,
+        )));
         events
     }
 

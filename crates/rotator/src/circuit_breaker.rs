@@ -1,5 +1,6 @@
 use dashmap::DashMap;
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +46,7 @@ impl CircuitBreaker {
     }
 
     pub fn record_success(&self) {
-        let mut inner = self.inner.lock().expect("circuit breaker mutex poisoned");
+        let mut inner = self.inner.lock();
         match inner.state {
             CircuitState::Closed => {
                 inner.failure_count = 0;
@@ -66,7 +67,7 @@ impl CircuitBreaker {
     }
 
     pub fn record_failure(&self) {
-        let mut inner = self.inner.lock().expect("circuit breaker mutex poisoned");
+        let mut inner = self.inner.lock();
         match inner.state {
             CircuitState::Closed => {
                 inner.failure_count += 1;
@@ -86,7 +87,7 @@ impl CircuitBreaker {
     }
 
     pub fn is_allowed(&self) -> bool {
-        let mut inner = self.inner.lock().expect("circuit breaker mutex poisoned");
+        let mut inner = self.inner.lock();
         match inner.state {
             CircuitState::Closed => true,
             CircuitState::Open => {
@@ -109,10 +110,7 @@ impl CircuitBreaker {
     }
 
     pub fn get_state(&self) -> CircuitState {
-        self.inner
-            .lock()
-            .expect("circuit breaker mutex poisoned")
-            .state
+        self.inner.lock().state
     }
 
     fn allow_half_open_call(inner: &mut CircuitBreakerInner, half_open_max_calls: usize) -> bool {
