@@ -129,6 +129,10 @@ pub struct AnthropicContentBlock {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -217,6 +221,8 @@ pub fn anthropic_content_block_start_event(index: u64, text: Option<&str>) -> An
         content_block: AnthropicContentBlock {
             block_type: "text".to_owned(),
             text: text.map(str::to_owned),
+            thinking: None,
+            signature: None,
             id: None,
             name: None,
             input: None,
@@ -229,6 +235,34 @@ pub fn anthropic_text_delta_event(index: Option<u64>, text: &str) -> AnthropicSs
         index,
         delta: AnthropicContentDelta::TextDelta {
             text: text.to_owned(),
+        },
+    }
+}
+
+pub fn anthropic_thinking_block_start_event(
+    index: u64,
+    thinking: Option<&str>,
+    signature: Option<&str>,
+) -> AnthropicSseEvent {
+    AnthropicSseEvent::ContentBlockStart {
+        index,
+        content_block: AnthropicContentBlock {
+            block_type: "thinking".to_owned(),
+            text: None,
+            thinking: thinking.map(str::to_owned),
+            signature: signature.map(str::to_owned),
+            id: None,
+            name: None,
+            input: None,
+        },
+    }
+}
+
+pub fn anthropic_thinking_delta_event(index: Option<u64>, thinking: &str) -> AnthropicSseEvent {
+    AnthropicSseEvent::ContentBlockDelta {
+        index,
+        delta: AnthropicContentDelta::ThinkingDelta {
+            thinking: thinking.to_owned(),
         },
     }
 }
@@ -415,6 +449,7 @@ pub struct OpenAiToAnthropicStreamTranslator {
     stopped: bool,
     next_content_index: u64,
     text_index: Option<u64>,
+    thinking_index: Option<u64>,
     tool_indices: HashMap<u64, u64>,
     open_blocks: HashSet<u64>,
 }
@@ -428,6 +463,7 @@ impl OpenAiToAnthropicStreamTranslator {
             stopped: false,
             next_content_index: 0,
             text_index: None,
+            thinking_index: None,
             tool_indices: HashMap::new(),
             open_blocks: HashSet::new(),
         }
@@ -470,8 +506,8 @@ impl OpenAiToAnthropicStreamTranslator {
         if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str)
             && !reasoning.is_empty()
         {
-            let index = self.ensure_text_block(&mut events);
-            events.push(anthropic_sse_event(&anthropic_text_delta_event(
+            let index = self.ensure_thinking_block(&mut events);
+            events.push(anthropic_sse_event(&anthropic_thinking_delta_event(
                 Some(index),
                 reasoning,
             )));
@@ -493,15 +529,48 @@ impl OpenAiToAnthropicStreamTranslator {
         events
     }
 
+    fn close_text_block(&mut self, events: &mut Vec<String>) {
+        if let Some(index) = self.text_index.take() {
+            self.open_blocks.remove(&index);
+            events.push(anthropic_sse_event(&anthropic_content_block_stop_event(
+                index,
+            )));
+        }
+    }
+
+    fn close_thinking_block(&mut self, events: &mut Vec<String>) {
+        if let Some(index) = self.thinking_index.take() {
+            self.open_blocks.remove(&index);
+            events.push(anthropic_sse_event(&anthropic_content_block_stop_event(
+                index,
+            )));
+        }
+    }
+
     fn ensure_text_block(&mut self, events: &mut Vec<String>) -> u64 {
         if let Some(index) = self.text_index {
             return index;
         }
+        self.close_thinking_block(events);
         let index = self.next_index();
         self.text_index = Some(index);
         self.open_blocks.insert(index);
         events.push(anthropic_sse_event(&anthropic_content_block_start_event(
             index, None,
+        )));
+        index
+    }
+
+    fn ensure_thinking_block(&mut self, events: &mut Vec<String>) -> u64 {
+        if let Some(index) = self.thinking_index {
+            return index;
+        }
+        self.close_text_block(events);
+        let index = self.next_index();
+        self.thinking_index = Some(index);
+        self.open_blocks.insert(index);
+        events.push(anthropic_sse_event(&anthropic_thinking_block_start_event(
+            index, None, None,
         )));
         index
     }
@@ -519,6 +588,8 @@ impl OpenAiToAnthropicStreamTranslator {
                 content_block: AnthropicContentBlock {
                     block_type: "tool_use".to_owned(),
                     text: None,
+                    thinking: None,
+                    signature: None,
                     id: tool_call
                         .get("id")
                         .and_then(Value::as_str)
@@ -557,6 +628,9 @@ impl OpenAiToAnthropicStreamTranslator {
             )));
         }
         self.open_blocks.clear();
+        self.text_index = None;
+        self.thinking_index = None;
+        self.tool_indices.clear();
         events.push(anthropic_sse_event(&anthropic_message_delta_event(
             Some(openai_finish_reason_to_anthropic(finish_reason)),
             None,
@@ -569,6 +643,10 @@ impl OpenAiToAnthropicStreamTranslator {
             return Vec::new();
         }
         self.stopped = true;
+        self.text_index = None;
+        self.thinking_index = None;
+        self.tool_indices.clear();
+        self.open_blocks.clear();
         vec![anthropic_sse_event(&anthropic_message_stop_event())]
     }
 
@@ -705,7 +783,11 @@ impl AnthropicStreamTranslator {
             AnthropicSseEvent::ContentBlockDelta {
                 index,
                 delta: AnthropicContentDelta::ThinkingDelta { thinking },
-            } => vec![openai_reasoning_delta_chunk(self.model(), index.unwrap_or(0), &thinking)],
+            } => vec![openai_reasoning_delta_chunk(
+                self.model(),
+                index.unwrap_or(0),
+                &thinking,
+            )],
             AnthropicSseEvent::ContentBlockDelta {
                 delta: AnthropicContentDelta::Other,
                 ..

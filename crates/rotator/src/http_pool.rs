@@ -27,7 +27,7 @@ impl HttpClientPool {
             streaming_timeout: Duration::from_secs(streaming_timeout_secs),
             connect_timeout: Duration::from_secs(10),
             pool_idle_timeout: Duration::from_secs(30),
-            pool_max_idle_per_host: 50,
+            pool_max_idle_per_host: 100,
         }
     }
 
@@ -50,8 +50,10 @@ impl HttpClientPool {
             .pool_idle_timeout(self.pool_idle_timeout)
             .pool_max_idle_per_host(self.pool_max_idle_per_host)
             .tcp_keepalive(Duration::from_secs(30))
+            .tcp_nodelay(true)
             .http2_keep_alive_interval(Duration::from_secs(30))
             .http2_keep_alive_timeout(Duration::from_secs(10))
+            .use_rustls_tls()
             .gzip(true)
             .brotli(true)
             .build()

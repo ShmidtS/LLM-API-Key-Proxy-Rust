@@ -97,7 +97,7 @@ impl RotatorClient {
 
         // Pre-serialize body once to avoid expensive re-serialization on every retry.
         let body_bytes = match serde_json::to_vec(&body) {
-            Ok(bytes) => Arc::new(bytes),
+            Ok(bytes) => bytes::Bytes::from(bytes),
             Err(e) => return Err(RotatorError::Serialization(e.to_string())),
         };
 
@@ -164,7 +164,7 @@ impl RotatorClient {
             let started_at = Instant::now();
             let result = request
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(reqwest::Body::from(body_bytes.as_ref().to_vec()))
+                .body(reqwest::Body::from(body_bytes.clone()))
                 .send()
                 .await;
             self.last_latency_ms

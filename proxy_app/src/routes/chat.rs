@@ -432,6 +432,7 @@ fn aggregate_responses_sse(bytes: &[u8], fallback_model: &str) -> Value {
     let mut created = now_unix_seconds();
     let mut model = fallback_model.to_owned();
     let mut content = String::new();
+    let mut reasoning_content = String::new();
     let mut usage = json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
 
     for data in sse_data_records(bytes) {
@@ -445,6 +446,11 @@ fn aggregate_responses_sse(bytes: &[u8], fallback_model: &str) -> Value {
             Some("response.output_text.delta") => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
                     content.push_str(delta);
+                }
+            }
+            Some("response.thinking.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    reasoning_content.push_str(delta);
                 }
             }
             Some("response.created") | Some("response.completed") => {
@@ -464,6 +470,9 @@ fn aggregate_responses_sse(bytes: &[u8], fallback_model: &str) -> Value {
                     if content.is_empty() {
                         content.push_str(&response_output_text(response));
                     }
+                    if reasoning_content.is_empty() {
+                        reasoning_content.push_str(&response_reasoning_text(response));
+                    }
                 }
                 if let Some(value) = event.get("usage") {
                     usage = response_usage_to_chat_usage(value);
@@ -473,6 +482,14 @@ fn aggregate_responses_sse(bytes: &[u8], fallback_model: &str) -> Value {
         }
     }
 
+    let mut message = json!({
+        "role": "assistant",
+        "content": content,
+    });
+    if !reasoning_content.is_empty() {
+        message["reasoning_content"] = Value::String(reasoning_content);
+    }
+
     json!({
         "id": id,
         "object": "chat.completion",
@@ -480,7 +497,7 @@ fn aggregate_responses_sse(bytes: &[u8], fallback_model: &str) -> Value {
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": content},
+            "message": message,
             "finish_reason": "stop"
         }],
         "usage": usage
@@ -515,6 +532,18 @@ fn translate_responses_sse_chunk(bytes: &[u8], fallback_model: &str) -> String {
                     &event,
                     fallback_model,
                     json!({"content": delta}),
+                    None,
+                ));
+            }
+            Some("response.thinking.delta") => {
+                let delta = event
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                output.push_str(&chat_sse_payload(
+                    &event,
+                    fallback_model,
+                    json!({"reasoning_content": delta}),
                     None,
                 ));
             }
@@ -599,6 +628,28 @@ fn response_output_text(response: &Value) -> String {
                 .flatten()
         })
         .filter_map(|content| content.get("text").and_then(Value::as_str))
+        .collect()
+}
+
+fn response_reasoning_text(response: &Value) -> String {
+    response
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|item| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|content| {
+            if content.get("type").and_then(Value::as_str) == Some("thinking") {
+                content.get("thinking").and_then(Value::as_str)
+            } else {
+                None
+            }
+        })
         .collect()
 }
 
