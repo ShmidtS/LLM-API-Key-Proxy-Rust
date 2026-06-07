@@ -301,11 +301,12 @@ impl CredentialManager {
     pub fn increment(&self, provider: &str, key: &str) {
         if let Some(index_map) = self.key_index.get(provider)
             && let Some(index) = index_map.get(key)
-                && let Some(entries) = self.credentials.get(provider)
-                    && let Some(entry) = entries.get(*index) {
-                        entry.current_requests.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
+            && let Some(entries) = self.credentials.get(provider)
+            && let Some(entry) = entries.get(*index)
+        {
+            entry.current_requests.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         // Fallback to linear scan
         if let Some(entries) = self.credentials.get(provider) {
             for entry in entries.iter() {
@@ -319,11 +320,12 @@ impl CredentialManager {
     pub fn decrement(&self, provider: &str, key: &str) {
         if let Some(index_map) = self.key_index.get(provider)
             && let Some(index) = index_map.get(key)
-                && let Some(entries) = self.credentials.get(provider)
-                    && let Some(entry) = entries.get(*index) {
-                        let _ = entry.current_requests.fetch_sub(1, Ordering::Relaxed);
-                        return;
-                    }
+            && let Some(entries) = self.credentials.get(provider)
+            && let Some(entry) = entries.get(*index)
+        {
+            let _ = entry.current_requests.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
         // Fallback to linear scan
         if let Some(entries) = self.credentials.get(provider) {
             for entry in entries.iter() {
