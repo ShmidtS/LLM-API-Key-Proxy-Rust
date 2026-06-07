@@ -159,20 +159,11 @@ pub struct AnthropicMessageDelta {
     pub stop_sequence: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AnthropicUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
-}
-
-impl Default for AnthropicUsage {
-    fn default() -> Self {
-        Self {
-            input_tokens: 0,
-            output_tokens: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
