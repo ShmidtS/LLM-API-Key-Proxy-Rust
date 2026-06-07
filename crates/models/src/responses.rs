@@ -339,7 +339,6 @@ pub struct ResponseUsage {
     pub output_tokens_details: Option<serde_json::Value>,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResponseError {
     pub message: String,
