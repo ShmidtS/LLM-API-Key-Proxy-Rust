@@ -118,11 +118,11 @@ impl GpuProbe for AmdSysfsProbe {
                     continue;
                 }
                 let vram_file = entry.path().join("device/mem_info_vram_total");
-                if let Ok(content) = std::fs::read_to_string(&vram_file) {
-                    if let Ok(bytes) = content.trim().parse::<u64>() {
-                        total_bytes += bytes;
-                        found = true;
-                    }
+                if let Ok(content) = std::fs::read_to_string(&vram_file)
+                    && let Ok(bytes) = content.trim().parse::<u64>()
+                {
+                    total_bytes += bytes;
+                    found = true;
                 }
             }
             if found {
