@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::trace;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseRecord {
@@ -20,18 +21,22 @@ impl ChunkBatcher {
     }
 
     pub fn push(&mut self, chunk: impl AsRef<[u8]>) -> Vec<SseRecord> {
+        let chunk_start = std::time::Instant::now();
         self.buffer.extend_from_slice(chunk.as_ref());
         let mut records = Vec::new();
 
         while let Some((record_end, delimiter_len)) = find_record_delimiter(&self.buffer) {
-            let record = self.buffer[..record_end].to_vec();
-            self.buffer.drain(..record_end + delimiter_len);
-
-            if let Some(record) = parse_sse_record(&record) {
+            let record = &self.buffer[..record_end];
+            if let Some(record) = parse_sse_record(record) {
                 records.push(record);
             }
+            let consumed = record_end + delimiter_len;
+            let remaining = self.buffer.len() - consumed;
+            self.buffer.copy_within(consumed.., 0);
+            self.buffer.truncate(remaining);
         }
 
+        trace!(chunk_latency_us = chunk_start.elapsed().as_micros(), records = records.len(), buffered = self.buffer.len(), "sse chunk parsed");
         records
     }
 
@@ -41,36 +46,28 @@ impl ChunkBatcher {
 }
 
 fn find_record_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
-    for (index, window) in buffer.windows(2).enumerate() {
-        if window == b"\n\n" {
-            return Some((index, 2));
-        }
+    if let Some(index) = memchr::memmem::find(buffer, b"\n\n") {
+        return Some((index, 2));
     }
-
-    for (index, window) in buffer.windows(4).enumerate() {
-        if window == b"\r\n\r\n" {
-            return Some((index, 4));
-        }
+    if let Some(index) = memchr::memmem::find(buffer, b"\r\n\r\n") {
+        return Some((index, 4));
     }
-
     None
 }
 
 fn parse_sse_record(bytes: &[u8]) -> Option<SseRecord> {
-    let text = String::from_utf8_lossy(bytes);
     let mut event = None;
     let mut data = Vec::new();
 
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() || line.starts_with(':') {
+    for line in bytes.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() || line.starts_with(b":") {
             continue;
         }
-
-        if let Some(value) = line.strip_prefix("event:") {
-            event = Some(value.trim_start().to_owned());
-        } else if let Some(value) = line.strip_prefix("data:") {
-            data.push(value.trim_start().to_owned());
+        if let Some(value) = line.strip_prefix(b"event:") {
+            event = Some(String::from_utf8_lossy(value).trim_start().to_owned());
+        } else if let Some(value) = line.strip_prefix(b"data:") {
+            data.push(String::from_utf8_lossy(value).trim_start().to_owned());
         }
     }
 
@@ -422,10 +419,12 @@ pub fn openai_tool_call_delta_chunk(
 }
 
 pub fn openai_sse_event(chunk: &OpenAiStreamChunk) -> String {
-    format!(
-        "data: {}\n\n",
-        serde_json::to_string(chunk).unwrap_or_default()
-    )
+    let mut out = String::with_capacity(4096);
+    out.push_str("data: ");
+    let json = serde_json::to_string(chunk).unwrap_or_default();
+    out.push_str(&json);
+    out.push_str("\n\n");
+    out
 }
 
 pub fn openai_done_event() -> String {

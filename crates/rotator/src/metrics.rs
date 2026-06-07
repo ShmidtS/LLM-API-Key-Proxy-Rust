@@ -39,6 +39,7 @@ impl Histogram {
 
 #[derive(Debug, Default)]
 pub struct ProxyMetrics {
+    request_dispatch_latency_ms: Histogram,
     request_duration_ms: Histogram,
     requests_total: DashMap<String, AtomicU64>,
     errors_total: DashMap<(String, String), AtomicU64>,
@@ -53,6 +54,10 @@ pub struct ProxyMetrics {
 impl ProxyMetrics {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn record_request_dispatch_latency(&self, _provider: &str, duration_ms: u64) {
+        self.request_dispatch_latency_ms.record(duration_ms);
     }
 
     pub fn record_request_duration(&self, provider: &str, duration_ms: u64) {
@@ -112,6 +117,10 @@ impl ProxyMetrics {
 
     pub fn export_prometheus(&self) -> String {
         let mut out = String::new();
+
+        out.push_str("# TYPE proxy_request_dispatch_latency_ms histogram\n");
+        self.request_dispatch_latency_ms
+            .write("proxy_request_dispatch_latency_ms", "", &mut out);
 
         // request_duration_ms
         out.push_str("# TYPE proxy_request_duration_ms histogram\n");

@@ -5,7 +5,7 @@ use crate::error::{Result, RotatorError};
 use crate::error_journal::{ErrorClass, ErrorJournal};
 use crate::http_pool::HttpClientPool;
 use crate::ip_throttle::{IPThrottleDetector, ThrottleAssessment};
-use crate::provider_registry::{AuthType, ProviderRegistry};
+use crate::provider_registry::{AuthType, ProviderDefinition, ProviderRegistry};
 use crate::provider_runtime::normalize_upstream_url;
 use crate::provider_utils::extract_usage;
 use crate::providers::oauth::{OAuthManager, OAuthToken, refresh_oauth_token};
@@ -47,6 +47,7 @@ pub struct RotatorClient {
     adaptive_rate_limiter: Option<Arc<AdaptiveRateLimiterRegistry>>,
     error_journal: Option<Arc<ErrorJournal>>,
     metrics: Arc<crate::metrics::ProxyMetrics>,
+    provider_cache: Arc<DashMap<String, ProviderDefinition>>,
 }
 
 impl RotatorClient {
@@ -77,6 +78,7 @@ impl RotatorClient {
             adaptive_rate_limiter: None,
             error_journal: None,
             metrics: Arc::new(crate::metrics::ProxyMetrics::new()),
+            provider_cache: Arc::new(DashMap::new()),
         }
     }
 
@@ -179,12 +181,15 @@ impl RotatorClient {
             };
             let token = self.resolve_auth_token(provider, permit.key()).await?;
             let request = self.apply_auth_headers(provider, client.post(&url), &token);
-            let started_at = Instant::now();
+            let dispatch_started = Instant::now();
+            let started_at = dispatch_started;
             let result = request
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(reqwest::Body::from(body_bytes.clone()))
                 .send()
                 .await;
+            let dispatch_latency_ms = dispatch_started.elapsed().as_millis() as u64;
+            self.metrics.record_request_dispatch_latency(provider, dispatch_latency_ms);
             self.last_latency_ms
                 .insert(provider.to_owned(), started_at.elapsed().as_millis() as u64);
 
@@ -1008,11 +1013,7 @@ impl RotatorClient {
     }
 
     async fn resolve_auth_token(&self, provider: &str, key: &str) -> Result<String> {
-        let definition = match self.provider_registry.get(provider) {
-            Some(def) => def,
-            None => return Ok(key.to_owned()),
-        };
-
+        let definition = self.get_cached_provider(provider);
         if definition.auth_type != AuthType::OAuth {
             return Ok(key.to_owned());
         }
@@ -1095,30 +1096,54 @@ impl RotatorClient {
         if provider == "gemini" {
             request = request.query(&[("key", token)]);
         }
-        if let Some(definition) = self.provider_registry.get(provider) {
-            for (header_key, value) in definition.default_headers {
-                request = request.header(header_key, value);
-            }
-            match definition.auth_type {
-                AuthType::ApiKey => {
-                    if provider != "gemini" {
-                        request = request.header("x-api-key", token);
-                    }
-                }
-                AuthType::Bearer | AuthType::OAuth => {
-                    request = request.header("Authorization", format!("Bearer {token}"));
+        let definition = self.get_cached_provider(provider);
+        for (header_key, value) in definition.default_headers {
+            request = request.header(header_key, value);
+        }
+        match definition.auth_type {
+            AuthType::ApiKey => {
+                if provider != "gemini" {
+                    request = request.header("x-api-key", token);
                 }
             }
-        } else {
-            request = request.header("Authorization", format!("Bearer {token}"));
+            AuthType::Bearer | AuthType::OAuth => {
+                request = request.header("Authorization", format!("Bearer {token}"));
+            }
         }
         request
     }
 
     fn resolve_base_url(&self, provider: &str) -> String {
-        self.provider_registry
-            .resolve_base_url(provider)
-            .unwrap_or_else(|| format!("https://api.{provider}.com/v1"))
+        let base_url = self.get_cached_provider(provider).base_url;
+        if base_url.is_empty() {
+            format!("https://api.{provider}.com/v1")
+        } else {
+            base_url
+        }
+    }
+
+    fn get_cached_provider(&self, provider: &str) -> ProviderDefinition {
+        if let Some(cached) = self.provider_cache.get(provider) {
+            return cached.clone();
+        }
+        let def = self.provider_registry.get(provider).unwrap_or_else(|| ProviderDefinition {
+            id: provider.to_owned(),
+            display_name: provider.to_owned(),
+            base_url: format!("https://api.{provider}.com/v1"),
+            auth_type: AuthType::Bearer,
+            model_patterns: Vec::new(),
+            compiled_patterns: Vec::new(),
+            endpoints: Vec::new(),
+            features: Vec::new(),
+            model_count: 0,
+            timeout_secs: 60,
+            default_headers: std::collections::HashMap::new(),
+            token_endpoint: None,
+            client_id: None,
+            client_secret: None,
+        });
+        self.provider_cache.insert(provider.to_owned(), def.clone());
+        def
     }
 }
 

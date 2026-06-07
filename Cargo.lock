@@ -1876,6 +1876,7 @@ dependencies = [
  "config 0.1.0",
  "futures",
  "guardrails",
+ "memchr",
  "models",
  "reqwest",
  "rotator",

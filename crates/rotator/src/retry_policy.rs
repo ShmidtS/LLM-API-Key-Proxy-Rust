@@ -109,9 +109,10 @@ pub fn decide_retry_for_provider(
 
     // Circuit breaker escalation: если error_rate > 70%, сдаемся.
     if let Some(journal) = error_journal
-        && journal.should_circuit_break(provider_id) {
-            return RetryDecision::GiveUp;
-        }
+        && journal.should_circuit_break(provider_id)
+    {
+        return RetryDecision::GiveUp;
+    }
 
     // Базовый cooldown duration; увеличивается при escalation.
     let base_key_ms: u64 = 1_000;
@@ -128,8 +129,6 @@ pub fn decide_retry_for_provider(
     } else {
         1
     };
-
-    
 
     match failure {
         // Явный IP-throttle: ротация ключа бесполезна (все ключи с одного IP) →
@@ -374,11 +373,7 @@ fn parse_retry_after(raw: &str) -> Option<Duration> {
     raw.parse::<u64>()
         .map(Duration::from_secs)
         .ok()
-        .or_else(|| {
-            raw.parse::<f64>()
-                .ok()
-                .map(Duration::from_secs_f64)
-        })
+        .or_else(|| raw.parse::<f64>().ok().map(Duration::from_secs_f64))
 }
 
 fn parse_retry_after_value(value: &serde_json::Value) -> Option<Duration> {
@@ -386,7 +381,9 @@ fn parse_retry_after_value(value: &serde_json::Value) -> Option<Duration> {
         serde_json::Value::Number(num) => {
             if let Some(secs) = num.as_u64() {
                 Some(Duration::from_secs(secs))
-            } else { num.as_f64().map(Duration::from_secs_f64) }
+            } else {
+                num.as_f64().map(Duration::from_secs_f64)
+            }
         }
         serde_json::Value::String(s) => parse_retry_after(s),
         _ => None,

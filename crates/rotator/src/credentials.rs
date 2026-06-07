@@ -17,6 +17,7 @@ pub struct CredentialEntry {
 #[derive(Debug, Clone, Default)]
 pub struct CredentialManager {
     pub credentials: Arc<DashMap<String, Vec<CredentialEntry>>>,
+    key_index: Arc<DashMap<String, DashMap<String, usize>>>,
 }
 
 #[derive(Debug)]
@@ -27,6 +28,7 @@ pub struct CredentialPermit {
 }
 
 impl CredentialPermit {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         manager: Arc<CredentialManager>,
         provider: impl Into<String>,
@@ -216,7 +218,13 @@ impl CredentialManager {
                 current_requests: Arc::new(AtomicUsize::new(0)),
             })
             .collect();
-        self.credentials.insert(provider, entries);
+        let index_map: DashMap<String, usize> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.key.clone(), i))
+            .collect();
+        self.credentials.insert(provider.clone(), entries);
+        self.key_index.insert(provider, index_map);
     }
 
     pub fn get_least_loaded(&self, provider: &str) -> Option<CredentialEntry> {
@@ -291,6 +299,17 @@ impl CredentialManager {
     }
 
     pub fn increment(&self, provider: &str, key: &str) {
+        if let Some(index_map) = self.key_index.get(provider) {
+            if let Some(index) = index_map.get(key) {
+                if let Some(entries) = self.credentials.get(provider) {
+                    if let Some(entry) = entries.get(*index) {
+                        entry.current_requests.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
+            }
+        }
+        // Fallback to linear scan
         if let Some(entries) = self.credentials.get(provider) {
             for entry in entries.iter() {
                 if entry.key == key {
@@ -301,6 +320,17 @@ impl CredentialManager {
     }
 
     pub fn decrement(&self, provider: &str, key: &str) {
+        if let Some(index_map) = self.key_index.get(provider) {
+            if let Some(index) = index_map.get(key) {
+                if let Some(entries) = self.credentials.get(provider) {
+                    if let Some(entry) = entries.get(*index) {
+                        let _ = entry.current_requests.fetch_sub(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
+            }
+        }
+        // Fallback to linear scan
         if let Some(entries) = self.credentials.get(provider) {
             for entry in entries.iter() {
                 if entry.key == key {
