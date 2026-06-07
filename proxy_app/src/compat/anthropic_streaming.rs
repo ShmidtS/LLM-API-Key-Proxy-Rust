@@ -143,6 +143,8 @@ pub enum AnthropicContentDelta {
     TextDelta { text: String },
     #[serde(rename = "input_json_delta")]
     InputJsonDelta { partial_json: String },
+    #[serde(rename = "thinking_delta")]
+    ThinkingDelta { thinking: String },
     #[serde(other)]
     Other,
 }
@@ -320,6 +322,24 @@ pub fn openai_text_delta_chunk(model: &str, text: &str) -> OpenAiStreamChunk {
         None,
         model,
         serde_json::json!({ "content": text }),
+        Value::Null,
+    )
+}
+
+fn openai_reasoning_start_chunk(model: &str, index: u64) -> OpenAiStreamChunk {
+    openai_stream_chunk(
+        None,
+        model,
+        serde_json::json!({"reasoning_content": "", "index": index}),
+        Value::Null,
+    )
+}
+
+fn openai_reasoning_delta_chunk(model: &str, index: u64, thinking: &str) -> OpenAiStreamChunk {
+    openai_stream_chunk(
+        None,
+        model,
+        serde_json::json!({"reasoning_content": thinking, "index": index}),
         Value::Null,
     )
 }
@@ -667,6 +687,7 @@ impl AnthropicStreamTranslator {
                         .map(|input| input.to_string())
                         .unwrap_or_default(),
                 )],
+                "thinking" => vec![openai_reasoning_start_chunk(self.model(), index)],
                 _ => Vec::new(),
             },
             AnthropicSseEvent::ContentBlockDelta {
@@ -681,6 +702,10 @@ impl AnthropicStreamTranslator {
                 index.unwrap_or(0),
                 partial_json,
             )],
+            AnthropicSseEvent::ContentBlockDelta {
+                index,
+                delta: AnthropicContentDelta::ThinkingDelta { thinking },
+            } => vec![openai_reasoning_delta_chunk(self.model(), index.unwrap_or(0), &thinking)],
             AnthropicSseEvent::ContentBlockDelta {
                 delta: AnthropicContentDelta::Other,
                 ..
