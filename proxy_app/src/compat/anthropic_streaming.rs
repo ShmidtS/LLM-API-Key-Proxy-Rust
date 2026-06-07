@@ -150,9 +150,19 @@ pub struct AnthropicMessageDelta {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
 pub struct AnthropicUsage {
-    pub input_tokens: Option<u64>,
-    pub output_tokens: Option<u64>,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+}
+
+impl Default for AnthropicUsage {
+    fn default() -> Self {
+        Self {
+            input_tokens: 0,
+            output_tokens: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -190,7 +200,7 @@ pub fn anthropic_message_start_event(
             id: id.map(str::to_owned),
             model: model.map(str::to_owned),
             role: Some("assistant".to_owned()),
-            usage,
+            usage: Some(usage.unwrap_or_default()),
         },
     }
 }
@@ -221,13 +231,13 @@ pub fn anthropic_content_block_stop_event(index: u64) -> AnthropicSseEvent {
     AnthropicSseEvent::ContentBlockStop { index }
 }
 
-pub fn anthropic_message_delta_event(stop_reason: Option<&str>) -> AnthropicSseEvent {
+pub fn anthropic_message_delta_event(stop_reason: Option<&str>, usage: Option<AnthropicUsage>) -> AnthropicSseEvent {
     AnthropicSseEvent::MessageDelta {
         delta: AnthropicMessageDelta {
             stop_reason: stop_reason.map(str::to_owned),
             stop_sequence: None,
         },
-        usage: None,
+        usage: Some(usage.unwrap_or_default()),
     }
 }
 
@@ -512,7 +522,7 @@ impl OpenAiToAnthropicStreamTranslator {
         self.open_blocks.clear();
         events.push(anthropic_sse_event(&anthropic_message_delta_event(Some(
             openai_finish_reason_to_anthropic(finish_reason),
-        ))));
+        ), None)));
         events
     }
 
@@ -854,7 +864,7 @@ mod tests {
             AnthropicStreamItem::Event(anthropic_content_block_start_event(0, None)),
             AnthropicStreamItem::Event(anthropic_text_delta_event(Some(0), "Hello")),
             AnthropicStreamItem::Event(anthropic_content_block_stop_event(0)),
-            AnthropicStreamItem::Event(anthropic_message_delta_event(Some("end_turn"))),
+            AnthropicStreamItem::Event(anthropic_message_delta_event(Some("end_turn"), None)),
             AnthropicStreamItem::Event(anthropic_message_stop_event()),
             AnthropicStreamItem::Done,
         ];

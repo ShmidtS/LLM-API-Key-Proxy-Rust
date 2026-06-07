@@ -345,7 +345,7 @@ impl StreamState {
             tools: self.context.tools.clone(),
             top_p: self.context.top_p,
             truncation: self.context.truncation.clone(),
-            usage: self.usage.clone(),
+            usage: Some(self.usage.clone().unwrap_or_default()),
             user: None,
             metadata: self.context.metadata.clone(),
         }
@@ -452,11 +452,12 @@ fn emit_tool_delta(state: &mut StreamState, delta: ToolDelta) {
 
 fn emit_completed(state: &mut StreamState) {
     let response = state.skeleton_response("completed");
+    let usage = state.usage.clone().unwrap_or_default();
     state.push_event(
         "response.completed",
         ResponseStreamEvent::ResponseCompleted {
             response,
-            usage: state.usage.clone(),
+            usage: Some(usage),
         },
     );
 }

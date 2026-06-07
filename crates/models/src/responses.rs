@@ -328,6 +328,7 @@ pub enum ResponseOutputContent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct ResponseUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -336,6 +337,18 @@ pub struct ResponseUsage {
     pub input_tokens_details: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens_details: Option<serde_json::Value>,
+}
+
+impl Default for ResponseUsage {
+    fn default() -> Self {
+        Self {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            input_tokens_details: None,
+            output_tokens_details: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

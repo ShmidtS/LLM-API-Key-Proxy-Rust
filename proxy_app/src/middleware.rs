@@ -177,16 +177,33 @@ fn redacted_headers(headers: &HeaderMap) -> String {
             let value = value.to_str().unwrap_or("<non-utf8>");
             let value = if name == axum::http::header::AUTHORIZATION && value.starts_with("Bearer ")
             {
-                "Bearer <redacted>"
+                let token = &value["Bearer ".len()..];
+                let preview = token_preview(token);
+                format!("Bearer <{preview}>")
             } else if name.as_str().eq_ignore_ascii_case("x-api-key") {
-                "<redacted>"
+                let preview = token_preview(value);
+                format!("<{preview}>")
             } else {
-                value
+                value.to_string()
             };
             format!("{}: {}", name.as_str(), value)
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn token_preview(token: &str) -> String {
+    if token.len() <= 12 {
+        "...".to_string()
+    } else {
+        let prefix = token.chars().take(8).collect::<String>();
+        let suffix = token
+            .chars()
+            .skip(token.len() - 4)
+            .take(4)
+            .collect::<String>();
+        format!("{prefix}...{suffix}")
+    }
 }
 
 fn request_body_preview(body: &str) -> String {
@@ -209,7 +226,7 @@ mod tests {
 
         let headers = redacted_headers(request.headers());
 
-        assert!(headers.contains("authorization: Bearer <redacted>"));
+        assert!(headers.contains("authorization: Bearer <admin-to...-123>"));
         assert!(!headers.contains("admin-token-123"));
     }
 
@@ -217,14 +234,14 @@ mod tests {
     fn redacted_headers_hide_x_api_key_values() {
         let request = HttpRequest::builder()
             .uri("/v1/chat/completions")
-            .header("x-api-key", "proxy-secret")
+            .header("x-api-key", "proxy-secret-long-12345")
             .body(Body::empty())
             .unwrap();
 
         let headers = redacted_headers(request.headers());
 
-        assert!(headers.contains("x-api-key: <redacted>"));
-        assert!(!headers.contains("proxy-secret"));
+        assert!(headers.contains("x-api-key: <proxy-se...2345>"));
+        assert!(!headers.contains("proxy-secret-long-12345"));
     }
 
     #[test]
