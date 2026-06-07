@@ -2,6 +2,7 @@ use crate::circuit_breaker::{CircuitBreakerRegistry, CircuitState};
 use crate::cooldown::CooldownManager;
 use crate::credentials::{CredentialManager, CredentialPermit};
 use crate::error::{Result, RotatorError};
+use crate::error_journal::{ErrorClass, ErrorJournal};
 use crate::http_pool::HttpClientPool;
 use crate::ip_throttle::{IPThrottleDetector, ThrottleAssessment};
 use crate::provider_registry::{AuthType, ProviderRegistry};
@@ -44,6 +45,8 @@ pub struct RotatorClient {
     oauth_refresh_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     ip_throttle: Arc<IPThrottleDetector>,
     adaptive_rate_limiter: Option<Arc<AdaptiveRateLimiterRegistry>>,
+    error_journal: Option<Arc<ErrorJournal>>,
+    metrics: Arc<crate::metrics::ProxyMetrics>,
 }
 
 impl RotatorClient {
@@ -72,6 +75,8 @@ impl RotatorClient {
             oauth_refresh_locks: Arc::new(DashMap::new()),
             ip_throttle: Arc::new(IPThrottleDetector::new()),
             adaptive_rate_limiter: None,
+            error_journal: None,
+            metrics: Arc::new(crate::metrics::ProxyMetrics::new()),
         }
     }
 
@@ -83,8 +88,21 @@ impl RotatorClient {
         self
     }
 
+    pub fn with_error_journal(mut self, error_journal: Arc<ErrorJournal>) -> Self {
+        self.error_journal = Some(error_journal);
+        self
+    }
+
+    pub fn error_journal(&self) -> Option<Arc<ErrorJournal>> {
+        self.error_journal.clone()
+    }
+
     pub fn max_retries(&self) -> usize {
         self.max_retries
+    }
+
+    pub fn metrics(&self) -> Arc<crate::metrics::ProxyMetrics> {
+        self.metrics.clone()
     }
 
     pub async fn request(
@@ -192,6 +210,14 @@ impl RotatorClient {
                     if let Err(garbage_err) =
                         crate::garbage_detection::validate_response(&body_text)
                     {
+                        if let Some(ref ej) = self.error_journal {
+                            ej.record_error(
+                                provider,
+                                ErrorClass::Garbage,
+                                None,
+                                &garbage_err.reason,
+                            );
+                        }
                         let failure = FailureClass::GarbageResponse {
                             reason: garbage_err.reason,
                             score: garbage_err.score,
@@ -201,6 +227,7 @@ impl RotatorClient {
                             attempt as u32,
                             self.max_retries as u32,
                             Some(provider),
+                            self.error_journal.as_deref(),
                         );
                         warn!(
                             provider,
@@ -252,6 +279,9 @@ impl RotatorClient {
                         arl.record_429(provider, permit.key());
                     }
                     let failure = classify_upstream_failure(status, &headers, Some(&body_text));
+                    if let Some(ref ej) = self.error_journal {
+                        ej.record_error(provider, ErrorClass::RateLimit, Some(429), &body_text);
+                    }
                     self.ip_throttle
                         .record_429(permit.key(), &body_text, provider);
                     let assessment = self.ip_throttle.assess_throttle(permit.key(), provider);
@@ -260,6 +290,7 @@ impl RotatorClient {
                         attempt as u32,
                         self.max_retries as u32,
                         Some(provider),
+                        self.error_journal.as_deref(),
                     );
                     if assessment == ThrottleAssessment::Throttled {
                         decision = RetryDecision::CooldownProvider {
@@ -308,6 +339,10 @@ impl RotatorClient {
                             self.circuit_breakers.record_failure(provider);
                             return Err(RotatorError::CircuitOpen(provider.to_string()));
                         }
+                        RetryDecision::GiveUp => {
+                            self.circuit_breakers.record_failure(provider);
+                            return Err(RotatorError::CircuitOpen(provider.to_string()));
+                        }
                         RetryDecision::Abort => {
                             return Err(RotatorError::RateLimited(
                                 provider.to_string(),
@@ -327,11 +362,20 @@ impl RotatorClient {
                     let headers = resp.headers().clone();
                     let body_text = resp.text().await.unwrap_or_default();
                     let failure = classify_upstream_failure(status, &headers, Some(&body_text));
+                    if let Some(ref ej) = self.error_journal {
+                        ej.record_error(
+                            provider,
+                            ErrorClass::ServerError,
+                            Some(status.as_u16()),
+                            &body_text,
+                        );
+                    }
                     let decision = decide_retry_for_provider(
                         failure.clone(),
                         attempt as u32,
                         self.max_retries as u32,
                         Some(provider),
+                        self.error_journal.as_deref(),
                     );
                     error!(provider, attempt, status = %status, ?failure, ?decision, "server error, retrying...");
                     match decision {
@@ -370,6 +414,10 @@ impl RotatorClient {
                             self.circuit_breakers.record_failure(provider);
                             return Err(RotatorError::CircuitOpen(provider.to_string()));
                         }
+                        RetryDecision::GiveUp => {
+                            self.circuit_breakers.record_failure(provider);
+                            return Err(RotatorError::CircuitOpen(provider.to_string()));
+                        }
                         RetryDecision::Abort => {
                             self.circuit_breakers.record_failure(provider);
                             self.cooldown.add_cooldown(
@@ -396,11 +444,20 @@ impl RotatorClient {
                     let headers = resp.headers().clone();
                     let body_text = resp.text().await.unwrap_or_default();
                     let failure = classify_upstream_failure(status, &headers, Some(&body_text));
+                    if let Some(ref ej) = self.error_journal {
+                        ej.record_error(
+                            provider,
+                            ErrorClass::Auth,
+                            Some(status.as_u16()),
+                            &body_text,
+                        );
+                    }
                     let decision = decide_retry_for_provider(
                         failure.clone(),
                         attempt as u32,
                         self.max_retries as u32,
                         Some(provider),
+                        self.error_journal.as_deref(),
                     );
                     warn!(provider, attempt, status = %status, ?failure, ?decision, "auth error, rotating key...");
                     match decision {
@@ -414,6 +471,10 @@ impl RotatorClient {
                             tokio::time::sleep(get_retry_backoff(attempt as u32, 300, 60_000))
                                 .await;
                             continue;
+                        }
+                        RetryDecision::GiveUp => {
+                            self.circuit_breakers.record_failure(provider);
+                            return Err(RotatorError::CircuitOpen(provider.to_string()));
                         }
                         _ => {
                             let mut builder =
@@ -433,6 +494,9 @@ impl RotatorClient {
                         self.cooldown
                             .add_cooldown(provider, permit.key(), Duration::from_secs(5));
                     }
+                    if let Some(ref ej) = self.error_journal {
+                        ej.record_error(provider, ErrorClass::Network, None, e.to_string());
+                    }
                     let sanitized = e.without_url();
                     error!(provider, attempt, error = %sanitized, "request failed");
                     if attempt < self.max_retries {
@@ -443,6 +507,14 @@ impl RotatorClient {
                     return Err(RotatorError::Http(sanitized.to_string()));
                 }
             }
+        }
+        if let Some(ref ej) = self.error_journal {
+            ej.record_error(
+                provider,
+                ErrorClass::Unknown,
+                None,
+                format!("exhausted after {} retries", self.max_retries),
+            );
         }
         Err(RotatorError::Exhausted(self.max_retries))
     }
@@ -524,6 +596,9 @@ impl RotatorClient {
                         arl.record_429(provider, permit.key());
                     }
                     let failure = classify_upstream_failure(status, &headers, Some(&body_text));
+                    if let Some(ref ej) = self.error_journal {
+                        ej.record_error(provider, ErrorClass::RateLimit, Some(429), &body_text);
+                    }
                     self.ip_throttle
                         .record_429(permit.key(), &body_text, provider);
                     let assessment = self.ip_throttle.assess_throttle(permit.key(), provider);
@@ -532,6 +607,7 @@ impl RotatorClient {
                         attempt as u32,
                         self.max_retries as u32,
                         Some(provider),
+                        self.error_journal.as_deref(),
                     );
                     if assessment == ThrottleAssessment::Throttled {
                         decision = RetryDecision::CooldownProvider {
@@ -569,6 +645,10 @@ impl RotatorClient {
                             self.circuit_breakers.record_failure(provider);
                             return Err(RotatorError::CircuitOpen(provider.to_string()));
                         }
+                        RetryDecision::GiveUp => {
+                            self.circuit_breakers.record_failure(provider);
+                            return Err(RotatorError::CircuitOpen(provider.to_string()));
+                        }
                         RetryDecision::Abort => {
                             return Err(RotatorError::RateLimited(
                                 provider.to_string(),
@@ -588,11 +668,20 @@ impl RotatorClient {
                     let headers = resp.headers().clone();
                     let body_text = resp.text().await.unwrap_or_default();
                     let failure = classify_upstream_failure(status, &headers, Some(&body_text));
+                    if let Some(ref ej) = self.error_journal {
+                        ej.record_error(
+                            provider,
+                            ErrorClass::ServerError,
+                            Some(status.as_u16()),
+                            &body_text,
+                        );
+                    }
                     let decision = decide_retry_for_provider(
                         failure.clone(),
                         attempt as u32,
                         self.max_retries as u32,
                         Some(provider),
+                        self.error_journal.as_deref(),
                     );
                     error!(provider, attempt, status = %status, ?failure, ?decision, "server error, retrying...");
                     match decision {
@@ -631,6 +720,10 @@ impl RotatorClient {
                             self.circuit_breakers.record_failure(provider);
                             return Err(RotatorError::CircuitOpen(provider.to_string()));
                         }
+                        RetryDecision::GiveUp => {
+                            self.circuit_breakers.record_failure(provider);
+                            return Err(RotatorError::CircuitOpen(provider.to_string()));
+                        }
                         RetryDecision::Abort => {
                             self.circuit_breakers.record_failure(provider);
                             self.cooldown.add_cooldown(
@@ -655,6 +748,9 @@ impl RotatorClient {
                         self.cooldown
                             .add_cooldown(provider, permit.key(), Duration::from_secs(5));
                     }
+                    if let Some(ref ej) = self.error_journal {
+                        ej.record_error(provider, ErrorClass::Network, None, e.to_string());
+                    }
                     let sanitized = e.without_url();
                     error!(provider, attempt, error = %sanitized, "request failed");
                     if attempt < self.max_retries {
@@ -665,6 +761,14 @@ impl RotatorClient {
                     return Err(RotatorError::Http(sanitized.to_string()));
                 }
             }
+        }
+        if let Some(ref ej) = self.error_journal {
+            ej.record_error(
+                provider,
+                ErrorClass::Unknown,
+                None,
+                format!("exhausted after {} retries", self.max_retries),
+            );
         }
         Err(RotatorError::Exhausted(self.max_retries))
     }

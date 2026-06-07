@@ -2,8 +2,8 @@ use crate::guardrails_adapter::{GuardrailsAdapter, any_guardrails_enabled};
 use proxy_config::ProxyConfig;
 use rotator::{
     AdaptiveRateLimiterRegistry, CircuitBreakerRegistry, CooldownManager, CredentialManager,
-    EmbeddingBatcher, HttpClientPool, ModelInfoService, ProviderRegistry, RateLimiterRegistry,
-    RotatorClient, UsageManager,
+    EmbeddingBatcher, ErrorJournal, HttpClientPool, ModelInfoService, ProviderRegistry,
+    RateLimiterRegistry, RotatorClient, UsageManager,
 };
 use std::{
     collections::HashMap,
@@ -54,6 +54,8 @@ impl AppState {
             Duration::from_secs(cfg.usage_flush_interval_secs),
             cfg.usage_batch_size,
         ));
+        let error_journal = Arc::new(ErrorJournal::new());
+        error_journal.cleanup_task();
         let mut client = RotatorClient::new(
             creds,
             pool,
@@ -63,7 +65,8 @@ impl AppState {
             circuit_breakers,
             Some(usage_manager),
             cfg.max_retries,
-        );
+        )
+        .with_error_journal(error_journal);
         if cfg.adaptive_rate_limiter.enabled {
             let adaptive_rate_limiter = Arc::new(AdaptiveRateLimiterRegistry::new());
             client = client.with_adaptive_rate_limiter(adaptive_rate_limiter);

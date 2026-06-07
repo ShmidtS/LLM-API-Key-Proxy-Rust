@@ -18,7 +18,8 @@ use guardrails::{GuardrailDecision, RouteKind};
 use models::chat::ChatCompletionRequest;
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
@@ -37,6 +38,10 @@ async fn chat_completions(
             req.model
         ))
         .into_response());
+    }
+
+    if rotator::is_image_only_model(&req.model) {
+        return handle_image_only_request(state, req).await;
     }
 
     let provider = if is_openai_responses_model(&req.model) {
@@ -93,7 +98,16 @@ async fn chat_completions(
             let model = req.model.clone();
             let mut batcher = ChunkBatcher::new();
             let mut translator = AnthropicStreamTranslator::new(model.clone());
+            let metrics = state.rotator.metrics();
+            let provider_for_metrics = provider.clone();
+            let first_chunk_recorded = Arc::new(AtomicBool::new(false));
+            let stream_start = Instant::now();
             let stream = upstream.bytes_stream().map(move |result| {
+                if !first_chunk_recorded.swap(true, Ordering::Relaxed) {
+                    let latency_ms = stream_start.elapsed().as_millis() as u64;
+                    metrics.record_first_chunk_latency(&provider_for_metrics, latency_ms);
+                }
+                metrics.record_stream_chunk(&provider_for_metrics);
                 result
                     .map(|bytes| {
                         if is_anthropic {
@@ -693,6 +707,42 @@ async fn request_chat_upstream(
         "upstream chat completion response"
     );
     Ok(response)
+}
+
+async fn handle_image_only_request(
+    state: AppState,
+    req: ChatCompletionRequest,
+) -> Result<Response, AppError> {
+    let prompt = req
+        .messages
+        .iter()
+        .filter_map(|msg| msg.content.as_ref())
+        .map(|content| match content {
+            models::chat::ChatMessageContent::Text(text) => text.clone(),
+            models::chat::ChatMessageContent::Blocks(_) => String::new(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut image_body = json!({
+        "model": req.model,
+        "prompt": prompt,
+    });
+    if let Some(n) = req.extra.get("n").and_then(Value::as_u64) {
+        image_body["n"] = json!(n);
+    } else {
+        image_body["n"] = json!(1);
+    }
+    if let Some(size) = req.extra.get("size").and_then(Value::as_str) {
+        image_body["size"] = json!(size);
+    }
+    if let Some(quality) = req.extra.get("quality").and_then(Value::as_str) {
+        image_body["quality"] = json!(quality);
+    }
+    if let Some(style) = req.extra.get("style").and_then(Value::as_str) {
+        image_body["style"] = json!(style);
+    }
+    image_body["stream"] = json!(false);
+    crate::routes::images::proxy_image_request(state, "images/generations", image_body).await
 }
 
 fn is_openai_responses_model(model: &str) -> bool {

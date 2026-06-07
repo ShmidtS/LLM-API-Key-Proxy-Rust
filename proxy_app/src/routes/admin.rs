@@ -17,6 +17,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/stats", get(stats))
         .route("/admin/token_count", post(token_count))
         .route("/admin/cost_estimate", post(cost_estimate))
+        .route("/admin/errors", get(errors))
         .route(
             "/v1/quota-stats",
             get(quota_stats_get).post(quota_stats_post),
@@ -45,6 +46,17 @@ async fn stats(State(state): State<AppState>, body: Option<Json<Value>>) -> Json
 struct QuotaStatsQuery {
     provider: Option<String>,
     format: Option<String>,
+}
+
+async fn errors(State(state): State<AppState>) -> Response {
+    let json_str = if let Some(journal) = state.rotator.error_journal() {
+        journal.export_json()
+    } else {
+        "{}".to_owned()
+    };
+    let parsed = serde_json::from_str::<serde_json::Value>(&json_str)
+        .unwrap_or_else(|_| json!({"error": "invalid json"}));
+    Json(parsed).into_response()
 }
 
 async fn quota_stats_get(

@@ -92,7 +92,7 @@ async fn get_image(
     upstream_response(upstream).await
 }
 
-async fn proxy_image_request(
+pub async fn proxy_image_request(
     state: AppState,
     path: &str,
     mut req: Value,

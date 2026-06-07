@@ -109,3 +109,52 @@ fn log_model_response(
         message
     );
 }
+
+pub fn is_image_only_model(model: &str) -> bool {
+    let model_name = model.split('/').next_back().unwrap_or(model).to_lowercase();
+    matches!(
+        model_name.as_str(),
+        "dall-e-2" | "dall-e-3" | "dall-e-3-edit"
+    ) || model_name.starts_with("flux")
+        || model_name.starts_with("stable-diffusion")
+        || model_name.starts_with("kandinsky")
+        || model_name.starts_with("playground")
+        || model_name.starts_with("imagen")
+        || model_name.starts_with("ideogram")
+        || model_name.starts_with("recraft")
+        || model_name.starts_with("midjourney")
+        || model_name.starts_with("art")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_image_only_model() {
+        assert!(is_image_only_model("dall-e-3"));
+        assert!(is_image_only_model("dall-e-2"));
+        assert!(is_image_only_model("openai/dall-e-3"));
+        assert!(is_image_only_model("flux-dev"));
+        assert!(is_image_only_model("flux-schnell"));
+        assert!(is_image_only_model("stable-diffusion-xl"));
+        assert!(is_image_only_model("stable-diffusion-3"));
+        assert!(is_image_only_model("kandinsky-2"));
+        assert!(is_image_only_model("playground-v2.5"));
+        assert!(is_image_only_model("imagen-3"));
+        assert!(is_image_only_model("ideogram-v2"));
+        assert!(is_image_only_model("recraft-v3"));
+        assert!(is_image_only_model("midjourney-v6"));
+        assert!(is_image_only_model("artistic-model"));
+    }
+
+    #[test]
+    fn test_is_not_image_only_model() {
+        assert!(!is_image_only_model("gpt-4"));
+        assert!(!is_image_only_model("gpt-4o"));
+        assert!(!is_image_only_model("claude-3-opus"));
+        assert!(!is_image_only_model("openai/gpt-4"));
+        assert!(!is_image_only_model(""));
+        assert!(!is_image_only_model("dall-e"));
+    }
+}

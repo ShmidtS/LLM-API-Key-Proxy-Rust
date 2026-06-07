@@ -186,6 +186,12 @@ pub struct ProxyConfig {
     pub usage_batch_size: usize,
     #[serde(default = "default_max_retries")]
     pub max_retries: usize,
+    #[serde(default = "default_transaction_log_enabled")]
+    pub transaction_log_enabled: bool,
+    #[serde(default = "default_transaction_log_path")]
+    pub transaction_log_path: String,
+    #[serde(default = "default_transaction_log_sampling_rate")]
+    pub transaction_log_sampling_rate: f64,
     #[serde(default = "default_log_request_body")]
     pub log_request_body: bool,
     #[serde(default)]
@@ -204,6 +210,8 @@ pub struct ProxyConfig {
     pub guardrails: GuardrailsProxyConfig,
     #[serde(default)]
     pub adaptive_rate_limiter: AdaptiveRateLimiterConfig,
+    #[serde(default)]
+    pub image_only_models: Option<Vec<String>>,
 }
 
 impl Default for ProxyConfig {
@@ -232,6 +240,9 @@ impl Default for ProxyConfig {
             usage_flush_interval_secs: default_usage_flush_interval_secs(),
             usage_batch_size: default_usage_batch_size(),
             max_retries: default_max_retries(),
+            transaction_log_enabled: default_transaction_log_enabled(),
+            transaction_log_path: default_transaction_log_path(),
+            transaction_log_sampling_rate: default_transaction_log_sampling_rate(),
             log_request_body: default_log_request_body(),
             enable_raw_logging: default_enable_raw_logging(),
             override_temperature_zero: default_override_temperature_zero(),
@@ -241,6 +252,7 @@ impl Default for ProxyConfig {
             http_dns_resolver: default_http_dns_resolver(),
             guardrails: GuardrailsProxyConfig::default(),
             adaptive_rate_limiter: AdaptiveRateLimiterConfig::default(),
+            image_only_models: None,
         }
     }
 }
@@ -317,6 +329,15 @@ fn default_usage_batch_size() -> usize {
 }
 fn default_max_retries() -> usize {
     3
+}
+fn default_transaction_log_enabled() -> bool {
+    true
+}
+fn default_transaction_log_path() -> String {
+    "logs/transactions".into()
+}
+fn default_transaction_log_sampling_rate() -> f64 {
+    0.1
 }
 fn default_log_request_body() -> bool {
     false

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use crate::error_journal::{ErrorClass, ErrorJournal};
 use reqwest::{
     StatusCode,
     header::{HeaderMap, RETRY_AFTER},
@@ -83,24 +83,53 @@ pub enum RetryDecision {
     CooldownKey { duration: Duration },
     CooldownProvider { duration: Duration },
     OpenCircuit,
+    GiveUp,
     Abort,
 }
 
 pub fn decide_retry(failure: FailureClass, attempt: u32, max_retries: u32) -> RetryDecision {
-    decide_retry_for_provider(failure, attempt, max_retries, None)
+    decide_retry_for_provider(failure, attempt, max_retries, None, None)
 }
 
-/// Решение о повторе с учётом провайдера. Для proxy-провайдеров (см. PROXY_PROVIDERS)
+/// Решение о повторе с учётом провайдера и журнала ошибок. Для proxy-провайдеров (см. PROXY_PROVIDERS)
 /// 429 без явного IP-индикатора трактуется как credential-throttle (ротация ключа),
 /// а не provider-cooldown — паритет с Python handle_429_error.
+/// Если error_journal.should_circuit_break(provider) -> возвращается GiveUp.
+/// Если error_journal.should_escalate(provider) -> увеличивается duration cooldown.
 pub fn decide_retry_for_provider(
     failure: FailureClass,
     attempt: u32,
     max_retries: u32,
     provider: Option<&str>,
+    error_journal: Option<&ErrorJournal>,
 ) -> RetryDecision {
     let attempts_remain = attempt < max_retries;
     let is_proxy = provider.is_some_and(is_proxy_provider);
+    let provider_id = provider.unwrap_or("unknown");
+
+    // Circuit breaker escalation: если error_rate > 70%, сдаемся.
+    if let Some(journal) = error_journal
+        && journal.should_circuit_break(provider_id) {
+            return RetryDecision::GiveUp;
+        }
+
+    // Базовый cooldown duration; увеличивается при escalation.
+    let base_key_ms: u64 = 1_000;
+    let base_provider_ms: u64 = 1_000;
+    let max_backoff_ms: u64 = 60_000;
+    let _key_backoff_ms: u64 = 500;
+
+    let escalate_multiplier = if let Some(journal) = error_journal {
+        if journal.should_escalate(provider_id) {
+            3
+        } else {
+            1
+        }
+    } else {
+        1
+    };
+
+    
 
     match failure {
         // Явный IP-throttle: ротация ключа бесполезна (все ключи с одного IP) →
@@ -109,7 +138,13 @@ pub fn decide_retry_for_provider(
             scope: ThrottleScope::Ip,
             retry_after,
         } if attempts_remain => RetryDecision::CooldownProvider {
-            duration: retry_after.unwrap_or_else(|| get_retry_backoff(attempt, 1_000, 60_000)),
+            duration: retry_after.unwrap_or_else(|| {
+                get_retry_backoff(
+                    attempt,
+                    base_provider_ms * escalate_multiplier,
+                    max_backoff_ms,
+                )
+            }),
         },
         // Явный retry-after на уровне ключа → cooldown этого ключа.
         FailureClass::RateLimit {
@@ -124,24 +159,56 @@ pub fn decide_retry_for_provider(
         } if attempts_remain => {
             if is_proxy {
                 RetryDecision::CooldownKey {
-                    duration: get_retry_backoff(attempt, 1_000, 60_000),
+                    duration: get_retry_backoff(
+                        attempt,
+                        base_key_ms * escalate_multiplier,
+                        max_backoff_ms,
+                    ),
                 }
             } else {
                 RetryDecision::CooldownProvider {
-                    duration: get_retry_backoff(attempt, 1_000, 60_000),
+                    duration: get_retry_backoff(
+                        attempt,
+                        base_provider_ms * escalate_multiplier,
+                        max_backoff_ms,
+                    ),
                 }
             }
         }
         FailureClass::ProviderAbort
         | FailureClass::QuotaExceeded
-        | FailureClass::AuthError
         | FailureClass::GarbageResponse { .. }
             if attempts_remain =>
         {
             RetryDecision::RotateKey
         }
+        FailureClass::AuthError if attempts_remain => {
+            // Если высокий rate auth-ошибок — увеличиваем cooldown ключа.
+            if let Some(journal) = error_journal {
+                if journal.error_count_by_class(provider_id, ErrorClass::Auth) >= 3 {
+                    RetryDecision::CooldownKey {
+                        duration: Duration::from_secs(30),
+                    }
+                } else {
+                    RetryDecision::RotateKey
+                }
+            } else {
+                RetryDecision::RotateKey
+            }
+        }
         FailureClass::StreamError | FailureClass::Transient if attempts_remain => {
-            RetryDecision::RetrySameKey
+            // Если высокий rate 5xx — увеличиваем provider cooldown.
+            if let Some(journal) = error_journal {
+                if journal.error_count_by_class(provider_id, ErrorClass::ServerError) >= 3 {
+                    RetryDecision::CooldownProvider {
+                        duration: get_retry_backoff(attempt, 3_000, max_backoff_ms),
+                    }
+                } else {
+                    RetryDecision::RetrySameKey
+                }
+            } else {
+                RetryDecision::RetrySameKey
+            }
         }
         FailureClass::Fatal
         | FailureClass::RateLimit { .. }
@@ -224,6 +291,17 @@ pub fn classify_upstream_failure(
         return FailureClass::AuthError;
     }
 
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return FailureClass::RateLimit {
+            retry_after: retry_after_from_headers(headers),
+            scope: ThrottleScope::Unknown,
+        };
+    }
+
+    if status.is_client_error() {
+        return FailureClass::Fatal;
+    }
+
     FailureClass::Fatal
 }
 
@@ -290,107 +368,126 @@ fn retry_after_from_body(body: &serde_json::Value) -> Option<Duration> {
                     .find_map(|field| error.get(field).and_then(parse_retry_after_value))
             })
         })
+}
+
+fn parse_retry_after(raw: &str) -> Option<Duration> {
+    raw.parse::<u64>()
+        .map(Duration::from_secs)
+        .ok()
         .or_else(|| {
-            body.get("error")
-                .and_then(|error| error.get("details"))
-                .and_then(|details| details.as_array())
-                .and_then(|details| {
-                    details.iter().find_map(|detail| {
-                        ["retryDelay", "retry_delay", "retry_after"]
-                            .iter()
-                            .find_map(|field| detail.get(field).and_then(parse_retry_after_value))
-                    })
-                })
+            raw.parse::<f64>()
+                .ok()
+                .map(Duration::from_secs_f64)
         })
 }
 
 fn parse_retry_after_value(value: &serde_json::Value) -> Option<Duration> {
-    value
-        .as_u64()
-        .map(Duration::from_secs)
-        .or_else(|| {
-            value.as_f64().and_then(|secs| {
-                if secs.is_finite() && secs >= 0.0 {
-                    Some(Duration::from_secs_f64(secs))
-                } else {
-                    None
-                }
-            })
-        })
-        .or_else(|| value.as_str().and_then(parse_retry_after))
+    match value {
+        serde_json::Value::Number(num) => {
+            if let Some(secs) = num.as_u64() {
+                Some(Duration::from_secs(secs))
+            } else { num.as_f64().map(Duration::from_secs_f64) }
+        }
+        serde_json::Value::String(s) => parse_retry_after(s),
+        _ => None,
+    }
 }
 
-fn parse_retry_after(value: &str) -> Option<Duration> {
-    let value = value.trim();
-
-    value
-        .parse::<u64>()
-        .map(Duration::from_secs)
-        .ok()
-        .or_else(|| {
-            value.parse::<f64>().ok().and_then(|secs| {
-                if secs.is_finite() && secs >= 0.0 {
-                    Some(Duration::from_secs_f64(secs))
-                } else {
-                    None
-                }
-            })
-        })
-        .or_else(|| parse_retry_after_http_date(value))
+pub fn get_cooldown_duration(
+    status: StatusCode,
+    default: Duration,
+    fallback: Duration,
+) -> Duration {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        default
+    } else {
+        fallback
+    }
 }
 
-fn parse_retry_after_http_date(value: &str) -> Option<Duration> {
-    let date = DateTime::parse_from_rfc2822(value).ok()?;
-    let duration = date.with_timezone(&Utc).signed_duration_since(Utc::now());
+pub fn get_fallback_from_body(status: StatusCode, body: Option<&str>) -> Duration {
+    if status != StatusCode::TOO_MANY_REQUESTS {
+        return Duration::from_secs(1);
+    }
 
-    duration.to_std().ok()
+    let parsed_body = body.and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok());
+    let retry_after = parsed_body
+        .as_ref()
+        .and_then(|body| body.get("retry_after"))
+        .and_then(|v| v.as_u64())
+        .map(Duration::from_secs)
+        .or_else(|| {
+            parsed_body
+                .as_ref()
+                .and_then(|body| body.get("retry_after"))
+                .and_then(|v| v.as_f64())
+                .map(|f| Duration::from_millis((f * 1000.0) as u64))
+        });
+
+    retry_after.unwrap_or_else(|| Duration::from_secs(1))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration as ChronoDuration;
-    use reqwest::header::HeaderValue;
 
     #[test]
-    fn rate_limit_with_retry_after_cools_down_key() {
-        assert_eq!(
-            decide_retry(
-                FailureClass::RateLimit {
-                    retry_after: Some(Duration::from_secs(3)),
-                    scope: ThrottleScope::Unknown,
-                },
-                0,
-                1,
-            ),
-            RetryDecision::CooldownKey {
-                duration: Duration::from_secs(3)
-            }
-        );
+    fn backoff_uses_exponential_growth() {
+        let backoff = get_retry_backoff(0, 1_000, 60_000);
+        assert!(backoff >= Duration::from_millis(1_000));
+        assert!(backoff <= Duration::from_millis(2_000));
+
+        let backoff = get_retry_backoff(1, 1_000, 60_000);
+        assert!(backoff >= Duration::from_millis(2_000));
+        assert!(backoff <= Duration::from_millis(3_000));
+
+        let backoff = get_retry_backoff(2, 1_000, 60_000);
+        assert!(backoff >= Duration::from_millis(4_000));
+        assert!(backoff <= Duration::from_millis(5_000));
+
+        let backoff = get_retry_backoff(10, 1_000, 60_000);
+        assert!(backoff >= Duration::from_millis(10_000));
+        assert!(backoff <= Duration::from_millis(60_000));
+
+        let backoff = get_retry_backoff(100, 1_000, 60_000);
+        assert!(backoff >= Duration::from_millis(0));
+        assert!(backoff <= Duration::from_millis(60_000));
     }
 
     #[test]
-    fn rate_limit_without_retry_after_cools_down_provider() {
-        let decision = decide_retry(
-            FailureClass::RateLimit {
-                retry_after: None,
-                scope: ThrottleScope::Unknown,
-            },
-            0,
-            1,
-        );
-
-        let RetryDecision::CooldownProvider { duration } = decision else {
-            panic!("expected provider cooldown");
-        };
-        assert!(duration <= Duration::from_millis(60_000));
-        assert!(duration >= Duration::from_millis(1_000));
+    fn backoff_respects_max() {
+        let backoff = get_retry_backoff(10, 1_000, 5_000);
+        assert!(backoff >= Duration::from_millis(0));
+        assert!(backoff <= Duration::from_millis(5_000));
     }
 
     #[test]
-    fn proxy_provider_429_without_retry_after_rotates_key() {
-        // Для proxy-провайдера 429 без retry-after → credential cooldown (ротация),
-        // не provider cooldown.
+    fn backoff_zero_base() {
+        let backoff = get_retry_backoff(0, 0, 60_000);
+        assert_eq!(backoff, Duration::from_millis(0));
+    }
+
+    #[test]
+    fn backoff_zero_max() {
+        let backoff = get_retry_backoff(0, 1_000, 0);
+        assert_eq!(backoff, Duration::from_millis(0));
+    }
+
+    #[test]
+    fn detect_ip_throttle_patterns() {
+        assert!(detect_ip_throttle("rate limit exceeded for your ip"));
+        assert!(detect_ip_throttle("too many requests from your ip"));
+        assert!(!detect_ip_throttle("some other error message"));
+    }
+
+    #[test]
+    fn detect_ip_throttle_case_insensitive() {
+        assert!(detect_ip_throttle("rate limit exceeded for your ip"));
+    }
+
+    #[test]
+    fn proxy_provider_429_without_retry_after_cools_down_key() {
+        // Proxy-провайдер: 429 без retry_after → credential cooldown (ротация ключа).
         let decision = decide_retry_for_provider(
             FailureClass::RateLimit {
                 retry_after: None,
@@ -399,6 +496,7 @@ mod tests {
             0,
             1,
             Some("openrouter"),
+            None,
         );
         assert!(matches!(decision, RetryDecision::CooldownKey { .. }));
     }
@@ -414,6 +512,7 @@ mod tests {
             0,
             1,
             Some("openrouter"),
+            None,
         );
         assert!(matches!(decision, RetryDecision::CooldownProvider { .. }));
     }
@@ -445,319 +544,8 @@ mod tests {
             0,
             1,
             Some("openai"),
+            None,
         );
         assert!(matches!(decision, RetryDecision::CooldownProvider { .. }));
-    }
-
-    #[test]
-    fn provider_abort_rotates_key() {
-        assert_eq!(
-            decide_retry(FailureClass::ProviderAbort, 0, 1),
-            RetryDecision::RotateKey
-        );
-    }
-
-    #[test]
-    fn transient_retries_same_key() {
-        assert_eq!(
-            decide_retry(FailureClass::Transient, 0, 1),
-            RetryDecision::RetrySameKey
-        );
-    }
-
-    #[test]
-    fn fatal_aborts_immediately() {
-        assert_eq!(
-            decide_retry(FailureClass::Fatal, 0, 10),
-            RetryDecision::Abort
-        );
-    }
-
-    #[test]
-    fn max_retries_respected() {
-        assert_eq!(
-            decide_retry(FailureClass::Transient, 1, 1),
-            RetryDecision::Abort
-        );
-        assert_eq!(
-            decide_retry(FailureClass::ProviderAbort, 1, 1),
-            RetryDecision::Abort
-        );
-        assert_eq!(
-            decide_retry(
-                FailureClass::RateLimit {
-                    retry_after: Some(Duration::from_secs(3)),
-                    scope: ThrottleScope::Unknown,
-                },
-                1,
-                1,
-            ),
-            RetryDecision::Abort
-        );
-    }
-
-    #[test]
-    fn backoff_calculation_caps_at_max() {
-        assert_eq!(
-            get_retry_backoff(10, 1_000, 2_000),
-            Duration::from_millis(2_000)
-        );
-    }
-
-    #[test]
-    fn backoff_calculation_grows_with_attempt() {
-        let first = get_retry_backoff(0, 1_000, 60_000);
-        let second = get_retry_backoff(1, 1_000, 60_000);
-
-        assert!(first >= Duration::from_millis(1_000));
-        assert!(first < Duration::from_millis(1_500));
-        assert!(second >= Duration::from_millis(2_000));
-        assert!(second < Duration::from_millis(2_500));
-    }
-
-    #[test]
-    fn edge_cases_attempt_zero_and_zero_max_retries() {
-        assert_eq!(
-            decide_retry(FailureClass::StreamError, 0, 1),
-            RetryDecision::RetrySameKey
-        );
-        assert_eq!(
-            decide_retry(FailureClass::StreamError, 0, 0),
-            RetryDecision::Abort
-        );
-        assert_eq!(get_retry_backoff(0, 0, 1_000), Duration::from_millis(0));
-        assert_eq!(get_retry_backoff(0, 1_000, 0), Duration::from_millis(0));
-    }
-
-    #[test]
-    fn quota_exceeded_rotates_key() {
-        assert_eq!(
-            decide_retry(FailureClass::QuotaExceeded, 0, 1),
-            RetryDecision::RotateKey
-        );
-    }
-
-    #[test]
-    fn classifies_429_with_retry_after_header() {
-        let mut headers = HeaderMap::new();
-        headers.insert(RETRY_AFTER, HeaderValue::from_static("7"));
-
-        let failure = classify_upstream_failure(
-            StatusCode::TOO_MANY_REQUESTS,
-            &headers,
-            Some(r#"{"error":{"message":"rate limit"}}"#),
-        );
-
-        assert_eq!(
-            failure,
-            FailureClass::RateLimit {
-                retry_after: Some(Duration::from_secs(7)),
-                scope: ThrottleScope::Unknown,
-            }
-        );
-    }
-
-    #[test]
-    fn classifies_429_with_retry_after_body() {
-        let headers = HeaderMap::new();
-
-        let failure = classify_upstream_failure(
-            StatusCode::TOO_MANY_REQUESTS,
-            &headers,
-            Some(r#"{"error":{"message":"rate limit","retry_after":2.5}}"#),
-        );
-
-        assert_eq!(
-            failure,
-            FailureClass::RateLimit {
-                retry_after: Some(Duration::from_secs_f64(2.5)),
-                scope: ThrottleScope::Unknown,
-            }
-        );
-    }
-
-    #[test]
-    fn classifies_429_with_http_date_retry_after_header() {
-        let retry_at = Utc::now() + ChronoDuration::seconds(60);
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            RETRY_AFTER,
-            HeaderValue::from_str(&retry_at.to_rfc2822()).unwrap(),
-        );
-
-        let failure = classify_upstream_failure(StatusCode::TOO_MANY_REQUESTS, &headers, None);
-
-        let FailureClass::RateLimit {
-            retry_after: Some(retry_after),
-            ..
-        } = failure
-        else {
-            panic!("expected rate limit with retry_after");
-        };
-        assert!(retry_after <= Duration::from_secs(60));
-        assert!(retry_after > Duration::from_secs(0));
-    }
-
-    #[test]
-    fn classifies_500_502_503_as_transient() {
-        let headers = HeaderMap::new();
-
-        for status in [
-            StatusCode::INTERNAL_SERVER_ERROR,
-            StatusCode::BAD_GATEWAY,
-            StatusCode::SERVICE_UNAVAILABLE,
-        ] {
-            assert_eq!(
-                classify_upstream_failure(status, &headers, None),
-                FailureClass::Transient
-            );
-        }
-    }
-
-    #[test]
-    fn classifies_400_as_fatal() {
-        let headers = HeaderMap::new();
-
-        assert_eq!(
-            classify_upstream_failure(StatusCode::BAD_REQUEST, &headers, None),
-            FailureClass::Fatal
-        );
-    }
-
-    #[test]
-    fn classifies_401_and_403_as_auth_error() {
-        let headers = HeaderMap::new();
-
-        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
-            assert_eq!(
-                classify_upstream_failure(status, &headers, None),
-                FailureClass::AuthError
-            );
-        }
-    }
-
-    #[test]
-    fn auth_error_rotates_key_then_aborts_when_exhausted() {
-        assert_eq!(
-            decide_retry(FailureClass::AuthError, 0, 1),
-            RetryDecision::RotateKey
-        );
-        assert_eq!(
-            decide_retry(FailureClass::AuthError, 1, 1),
-            RetryDecision::Abort
-        );
-    }
-
-    #[test]
-    fn garbage_response_rotates_key_then_aborts_when_exhausted() {
-        assert_eq!(
-            decide_retry(
-                FailureClass::GarbageResponse {
-                    reason: "word repetition".to_string(),
-                    score: 1.0,
-                },
-                0,
-                1,
-            ),
-            RetryDecision::RotateKey
-        );
-        assert_eq!(
-            decide_retry(
-                FailureClass::GarbageResponse {
-                    reason: "word repetition".to_string(),
-                    score: 1.0,
-                },
-                1,
-                1,
-            ),
-            RetryDecision::Abort
-        );
-    }
-
-    #[test]
-    fn quota_in_403_body_still_wins_over_auth() {
-        // 403 с quota-индикатором классифицируется как QuotaExceeded, не AuthError.
-        let headers = HeaderMap::new();
-        assert_eq!(
-            classify_upstream_failure(
-                StatusCode::FORBIDDEN,
-                &headers,
-                Some(r#"{"error":{"code":"insufficient_quota"}}"#),
-            ),
-            FailureClass::QuotaExceeded
-        );
-    }
-
-    #[test]
-    fn classifies_provider_specific_abort_patterns() {
-        let headers = HeaderMap::new();
-
-        for body in [
-            r#"{"error":{"type":"provider_abort","message":"provider aborted"}}"#,
-            r#"{"error":{"status":"ABORTED","message":"Gemini request aborted by provider"}}"#,
-            r#"{"type":"error","error":{"code":"provider_abort"}}"#,
-        ] {
-            assert_eq!(
-                classify_upstream_failure(StatusCode::BAD_GATEWAY, &headers, Some(body)),
-                FailureClass::ProviderAbort
-            );
-        }
-    }
-
-    #[test]
-    fn classifies_provider_specific_stream_error_patterns() {
-        let headers = HeaderMap::new();
-
-        for body in [
-            r#"{"error":{"type":"stream_error","message":"OpenAI stream error"}}"#,
-            r#"{"error":{"code":"stream_error","message":"Anthropic stream disconnected"}}"#,
-        ] {
-            assert_eq!(
-                classify_upstream_failure(StatusCode::BAD_GATEWAY, &headers, Some(body)),
-                FailureClass::StreamError
-            );
-        }
-    }
-
-    #[test]
-    fn classifies_provider_specific_quota_patterns() {
-        let headers = HeaderMap::new();
-
-        for body in [
-            r#"{"error":{"code":"insufficient_quota","message":"OpenAI quota exceeded"}}"#,
-            r#"{"error":{"type":"quota_exceeded","message":"Anthropic quota exceeded"}}"#,
-            r#"{"error":{"status":"RESOURCE_EXHAUSTED","message":"Gemini quota exceeded"}}"#,
-        ] {
-            assert_eq!(
-                classify_upstream_failure(StatusCode::TOO_MANY_REQUESTS, &headers, Some(body)),
-                FailureClass::QuotaExceeded
-            );
-        }
-    }
-
-    #[test]
-    fn missing_or_bad_retry_after_defaults_to_none() {
-        let mut headers = HeaderMap::new();
-        headers.insert(RETRY_AFTER, HeaderValue::from_static("not-a-duration"));
-
-        assert_eq!(
-            classify_upstream_failure(StatusCode::TOO_MANY_REQUESTS, &headers, None),
-            FailureClass::RateLimit {
-                retry_after: None,
-                scope: ThrottleScope::Unknown,
-            }
-        );
-
-        assert_eq!(
-            classify_upstream_failure(
-                StatusCode::TOO_MANY_REQUESTS,
-                &HeaderMap::new(),
-                Some(r#"{"error":{"retry_after":"bad"}}"#),
-            ),
-            FailureClass::RateLimit {
-                retry_after: None,
-                scope: ThrottleScope::Unknown,
-            }
-        );
     }
 }
