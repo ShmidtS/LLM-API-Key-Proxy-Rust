@@ -36,7 +36,12 @@ impl ChunkBatcher {
             self.buffer.truncate(remaining);
         }
 
-        trace!(chunk_latency_us = chunk_start.elapsed().as_micros(), records = records.len(), buffered = self.buffer.len(), "sse chunk parsed");
+        trace!(
+            chunk_latency_us = chunk_start.elapsed().as_micros(),
+            records = records.len(),
+            buffered = self.buffer.len(),
+            "sse chunk parsed"
+        );
         records
     }
 

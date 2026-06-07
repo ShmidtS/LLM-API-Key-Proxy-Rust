@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use reqwest::{Client, ClientBuilder};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::{debug, error, warn};
@@ -88,7 +88,11 @@ impl HttpClientPool {
     }
 
     pub fn get_or_create_streaming(&self, provider: &str) -> Client {
-        self.get_or_create_with_timeout(&format!("{provider}:streaming"), self.streaming_timeout, true)
+        self.get_or_create_with_timeout(
+            &format!("{provider}:streaming"),
+            self.streaming_timeout,
+            true,
+        )
     }
 
     pub fn default_client(&self) -> Client {
@@ -119,7 +123,12 @@ impl HttpClientPool {
         })
     }
 
-    fn get_or_create_with_timeout(&self, key: &str, timeout: Duration, is_streaming: bool) -> Client {
+    fn get_or_create_with_timeout(
+        &self,
+        key: &str,
+        timeout: Duration,
+        is_streaming: bool,
+    ) -> Client {
         if let Some(client) = self.clients.get(key) {
             return client.client.clone();
         }

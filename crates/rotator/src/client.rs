@@ -189,7 +189,8 @@ impl RotatorClient {
                 .send()
                 .await;
             let dispatch_latency_ms = dispatch_started.elapsed().as_millis() as u64;
-            self.metrics.record_request_dispatch_latency(provider, dispatch_latency_ms);
+            self.metrics
+                .record_request_dispatch_latency(provider, dispatch_latency_ms);
             self.last_latency_ms
                 .insert(provider.to_owned(), started_at.elapsed().as_millis() as u64);
 
@@ -1126,22 +1127,25 @@ impl RotatorClient {
         if let Some(cached) = self.provider_cache.get(provider) {
             return cached.clone();
         }
-        let def = self.provider_registry.get(provider).unwrap_or_else(|| ProviderDefinition {
-            id: provider.to_owned(),
-            display_name: provider.to_owned(),
-            base_url: format!("https://api.{provider}.com/v1"),
-            auth_type: AuthType::Bearer,
-            model_patterns: Vec::new(),
-            compiled_patterns: Vec::new(),
-            endpoints: Vec::new(),
-            features: Vec::new(),
-            model_count: 0,
-            timeout_secs: 60,
-            default_headers: std::collections::HashMap::new(),
-            token_endpoint: None,
-            client_id: None,
-            client_secret: None,
-        });
+        let def = self
+            .provider_registry
+            .get(provider)
+            .unwrap_or_else(|| ProviderDefinition {
+                id: provider.to_owned(),
+                display_name: provider.to_owned(),
+                base_url: format!("https://api.{provider}.com/v1"),
+                auth_type: AuthType::Bearer,
+                model_patterns: Vec::new(),
+                compiled_patterns: Vec::new(),
+                endpoints: Vec::new(),
+                features: Vec::new(),
+                model_count: 0,
+                timeout_secs: 60,
+                default_headers: std::collections::HashMap::new(),
+                token_endpoint: None,
+                client_id: None,
+                client_secret: None,
+            });
         self.provider_cache.insert(provider.to_owned(), def.clone());
         def
     }
