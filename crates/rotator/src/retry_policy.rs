@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use crate::error_journal::{ErrorClass, ErrorJournal};
+use rand::Rng;
 use reqwest::{
     StatusCode,
     header::{HeaderMap, RETRY_AFTER},
@@ -227,26 +228,36 @@ pub fn get_retry_backoff(attempt: u32, base_ms: u64, max_ms: u64) -> Duration {
 
     let multiplier = 1_u64.checked_shl(attempt.min(63)).unwrap_or(u64::MAX);
     let exponential_ms = base_ms.saturating_mul(multiplier);
-    let jitter_ms = deterministic_jitter_ms(attempt, base_ms, max_ms);
+    let jitter_ms = random_jitter_ms(base_ms, max_ms);
     let backoff_ms = exponential_ms.saturating_add(jitter_ms).min(max_ms);
 
     Duration::from_millis(backoff_ms)
 }
 
-fn deterministic_jitter_ms(attempt: u32, base_ms: u64, max_ms: u64) -> u64 {
-    let jitter_bound = (base_ms / 2).max(1).min(max_ms);
-    let mut value = u64::from(attempt)
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(base_ms.rotate_left(13))
-        .wrapping_add(max_ms.rotate_right(7));
-
-    value ^= value >> 30;
-    value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    value ^= value >> 27;
-    value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
-    value ^= value >> 31;
-
-    value % jitter_bound
+/// Недетерминированный аддитивный jitter.
+///
+/// Диапазон: `[base_ms / 2, base_ms]` (с потолком max_ms, чтобы не превышать cap).
+///
+/// Почему аддитивный в `[base/2, base]`, а не полный `decorrelated`/`equal` jitter:
+/// - Соответствует OpenAI `wait_random_exponential`-стилю: экспонента + случайный
+///   разброс в каждой волне, а не чистая экспонента.
+/// - Каждый конкурентный запрос в одной attempt-волне теперь получает независимый
+///   jitter из CSPRNG (thread_rng), поэтому синхронные 429 больше не попадают в
+///   retry lockstep (thundering herd) — былая детерминированная функция зависела
+///   только от (attempt, base, max) и выдавала идентичный jitter всей волне.
+/// - Аддитивность в диапазоне длиной `base/2` сохраняет монотонность экспоненты и
+///   оставляет backoff в пределах `[exp + base/2, exp + base]`, что совместимо с
+///   существующими диапазонными тестами и удерживает cap max_ms.
+fn random_jitter_ms(base_ms: u64, max_ms: u64) -> u64 {
+    if max_ms == 0 {
+        return 0;
+    }
+    let low = (base_ms / 2).min(max_ms);
+    let high = base_ms.min(max_ms);
+    if high <= low {
+        return high;
+    }
+    rand::thread_rng().gen_range(low..=high)
 }
 
 pub fn classify_upstream_failure(
@@ -288,13 +299,6 @@ pub fn classify_upstream_failure(
 
     if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
         return FailureClass::AuthError;
-    }
-
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        return FailureClass::RateLimit {
-            retry_after: retry_after_from_headers(headers),
-            scope: ThrottleScope::Unknown,
-        };
     }
 
     if status.is_client_error() {

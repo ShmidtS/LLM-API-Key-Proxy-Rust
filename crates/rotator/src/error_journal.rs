@@ -110,11 +110,11 @@ impl ErrorJournal {
     }
 
     pub fn should_escalate(&self, provider: &str) -> bool {
-        self.error_rate_5min(provider) > 30.0
+        self.error_rate_5min(provider) > 50.0
     }
 
     pub fn should_circuit_break(&self, provider: &str) -> bool {
-        self.error_rate_5min(provider) > 70.0
+        self.error_rate_5min(provider) > 90.0
     }
 
     pub fn cleanup_task(&self) {

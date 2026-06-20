@@ -16,7 +16,7 @@ use std::{
 };
 
 const MODEL_CACHE_TTL: Duration = Duration::from_secs(60);
-const PROVIDER_MODEL_TIMEOUT: Duration = Duration::from_secs(5);
+const PROVIDER_MODEL_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Deserialize)]
 struct ModelsQuery {

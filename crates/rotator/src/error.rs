@@ -6,6 +6,8 @@ pub enum RotatorError {
     NoCredentials(String),
     #[error("all keys busy for provider: {0} (concurrent limit reached) — {1}")]
     AllKeysBusy(String, String),
+    #[error("all keys on cooldown for provider: {0} — {1}")]
+    AllKeysOnCooldown(String, String),
     #[error("garbage response, retrying: {reason} (score: {score})")]
     GarbageRetry { reason: String, score: f64 },
     #[error("circuit breaker open for provider: {0}")]

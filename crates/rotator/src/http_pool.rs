@@ -1,22 +1,22 @@
 use dashmap::DashMap;
 use reqwest::{Client, ClientBuilder};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::{debug, error, warn};
 
 pub const POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 pub const POOL_MAX_IDLE_PER_HOST: usize = 100;
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
-/// Thin wrapper around a `reqwest` client that tracks active and idle
-/// connection counts for metrics.
+/// User-Agent advertised to upstream providers, replacing reqwest's default.
+const USER_AGENT: &str = concat!("llm-proxy/", env!("CARGO_PKG_VERSION"));
+
+/// Thin wrapper around a `reqwest` client.
 #[derive(Debug, Clone)]
 pub struct PooledClient {
     pub client: Client,
     pub is_streaming: bool,
-    active: Arc<AtomicUsize>,
-    idle: Arc<AtomicUsize>,
 }
 
 impl PooledClient {
@@ -24,29 +24,7 @@ impl PooledClient {
         Self {
             client,
             is_streaming,
-            active: Arc::new(AtomicUsize::new(0)),
-            idle: Arc::new(AtomicUsize::new(0)),
         }
-    }
-
-    pub fn inc_active(&self) {
-        self.active.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn dec_active(&self) {
-        self.active.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    pub fn set_idle(&self, value: usize) {
-        self.idle.store(value, Ordering::Relaxed);
-    }
-
-    pub fn active_conns(&self) -> usize {
-        self.active.load(Ordering::Relaxed)
-    }
-
-    pub fn idle_conns(&self) -> usize {
-        self.idle.load(Ordering::Relaxed)
     }
 }
 
@@ -58,7 +36,7 @@ pub struct HttpClientPool {
     connect_timeout: Duration,
     pool_idle_timeout: Duration,
     pool_max_idle_per_host: usize,
-    metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
+    http2_enabled: bool,
 }
 
 impl HttpClientPool {
@@ -71,15 +49,24 @@ impl HttpClientPool {
             clients: Arc::new(DashMap::new()),
             default_timeout: Duration::from_secs(default_timeout_secs),
             streaming_timeout: Duration::from_secs(streaming_timeout_secs),
-            connect_timeout: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
             pool_idle_timeout: Duration::from_secs(POOL_IDLE_TIMEOUT_SECS),
             pool_max_idle_per_host: POOL_MAX_IDLE_PER_HOST,
-            metrics: None,
+            http2_enabled: false,
         }
     }
 
-    pub fn with_metrics(mut self, metrics: Arc<crate::metrics::ProxyMetrics>) -> Self {
-        self.metrics = Some(metrics);
+    /// Override the per-client TCP connect timeout (default 10s).
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    /// Force HTTP/2 prior knowledge: skip ALPN negotiation and assume the
+    /// upstream speaks HTTP/2. Only enable for hosts known to support h2,
+    /// since it disables HTTP/1.x fallback entirely.
+    pub fn with_http2_enabled(mut self, enabled: bool) -> Self {
+        self.http2_enabled = enabled;
         self
     }
 
@@ -101,6 +88,7 @@ impl HttpClientPool {
 
     fn build_client(&self, timeout: Duration, is_streaming: bool) -> Client {
         let mut builder = ClientBuilder::new()
+            .user_agent(USER_AGENT)
             .timeout(timeout)
             .connect_timeout(self.connect_timeout)
             .pool_idle_timeout(self.pool_idle_timeout)
@@ -110,6 +98,10 @@ impl HttpClientPool {
             .http2_keep_alive_interval(Duration::from_secs(30))
             .http2_keep_alive_timeout(Duration::from_secs(10))
             .use_rustls_tls();
+
+        if self.http2_enabled {
+            builder = builder.http2_prior_knowledge();
+        }
 
         if is_streaming {
             builder = builder.no_gzip().no_brotli();
@@ -165,17 +157,6 @@ impl HttpClientPool {
         while set.join_next().await.is_some() {}
     }
 
-    /// Synchronise connection counters with the metrics registry.
-    pub fn sync_metrics(&self) {
-        let Some(ref m) = self.metrics else { return };
-        for entry in self.clients.iter() {
-            let provider = entry.key();
-            let client = entry.value();
-            m.set_pool_active(provider, client.active_conns() as u64);
-            m.set_pool_idle(provider, client.idle_conns() as u64);
-        }
-    }
-
     /// Set the pool-wide idle timeout used when building new clients.
     pub fn set_pool_idle_timeout(&mut self, secs: u64) {
         self.pool_idle_timeout = Duration::from_secs(secs);
@@ -190,5 +171,47 @@ impl HttpClientPool {
 impl Default for HttpClientPool {
     fn default() -> Self {
         Self::new(30)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_use_tens_seconds_connect_timeout_and_http2_off() {
+        let pool = HttpClientPool::with_timeouts(120, 300);
+        assert_eq!(pool.connect_timeout, Duration::from_secs(10));
+        assert!(!pool.http2_enabled);
+    }
+
+    #[test]
+    fn with_connect_timeout_overrides_default() {
+        let pool =
+            HttpClientPool::with_timeouts(120, 300).with_connect_timeout(Duration::from_secs(7));
+        assert_eq!(pool.connect_timeout, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn with_http2_enabled_sets_flag() {
+        let pool = HttpClientPool::with_timeouts(120, 300).with_http2_enabled(true);
+        assert!(pool.http2_enabled);
+    }
+
+    #[test]
+    fn build_client_succeeds_with_custom_connect_timeout_and_http2() {
+        // Verifies the builder chain (user_agent + connect_timeout + http2_prior_knowledge)
+        // does not panic and yields a usable client.
+        let pool = HttpClientPool::with_timeouts(120, 300)
+            .with_connect_timeout(Duration::from_secs(5))
+            .with_http2_enabled(true);
+        let _client = pool.default_client();
+    }
+
+    #[test]
+    fn build_client_succeeds_with_http2_disabled() {
+        // Default path: ALPN negotiation via rustls, no forced h2.
+        let pool = HttpClientPool::with_timeouts(120, 300);
+        let _client = pool.default_client();
     }
 }

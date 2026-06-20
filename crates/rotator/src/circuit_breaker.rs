@@ -77,7 +77,16 @@ impl CircuitBreaker {
                     inner.half_open_calls = 0;
                 }
             }
-            CircuitState::Open | CircuitState::HalfOpen => {
+            CircuitState::Open => {
+                // Already open: keep the original `opened_at` so the recovery
+                // timeout actually elapses. Resetting it on every failure (e.g.
+                // journal-driven `record_failure` from concurrent 429s) made the
+                // breaker stay Open indefinitely — the 60s half-open window never
+                // expired because each failure restarted the clock.
+                inner.failure_count = self.failure_threshold.max(1);
+            }
+            CircuitState::HalfOpen => {
+                // A half-open probe failed: re-open with a fresh recovery window.
                 inner.state = CircuitState::Open;
                 inner.failure_count = self.failure_threshold.max(1);
                 inner.opened_at = Some(Instant::now());
@@ -254,6 +263,29 @@ mod tests {
         breaker.record_failure();
         assert_eq!(breaker.get_state(), CircuitState::Open);
         assert!(!breaker.is_allowed());
+    }
+
+    #[test]
+    fn open_failure_keeps_recovery_window_monotonic() {
+        // Regression: record_failure while Open used to reset `opened_at`,
+        // restarting the 60s recovery clock on every journal-driven failure
+        // (e.g. concurrent 429s) so the breaker never reached HalfOpen.
+        // With recovery_timeout_secs=0, Open must transition to HalfOpen on
+        // the next is_allowed() even after repeated record_failure calls.
+        let breaker = CircuitBreaker::new(1, 0, 1);
+
+        breaker.record_failure();
+        assert_eq!(breaker.get_state(), CircuitState::Open);
+
+        // Simulate concurrent 429s driving record_failure while already Open.
+        breaker.record_failure();
+        breaker.record_failure();
+        breaker.record_failure();
+        assert_eq!(breaker.get_state(), CircuitState::Open);
+
+        // Recovery timeout (0s) must still let the probe through.
+        assert!(breaker.is_allowed());
+        assert_eq!(breaker.get_state(), CircuitState::HalfOpen);
     }
 
     #[test]

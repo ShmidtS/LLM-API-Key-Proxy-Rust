@@ -42,7 +42,9 @@ impl AppState {
         let pool = HttpClientPool::with_timeouts(
             cfg.timeout_read_non_streaming_secs,
             cfg.timeout_read_streaming_secs,
-        );
+        )
+        .with_connect_timeout(Duration::from_secs(cfg.connect_timeout_secs))
+        .with_http2_enabled(cfg.http2_enabled);
         let mut registry = ProviderRegistry::new();
         registry.load_from_env();
         let registry = Arc::new(registry);

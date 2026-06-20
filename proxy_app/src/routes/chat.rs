@@ -619,6 +619,9 @@ fn sse_data_records(bytes: &[u8]) -> Vec<String> {
                 current_data.push('\n');
             }
             current_data.push_str(data);
+        } else if line.starts_with(':') {
+            // SSE comment line (e.g. DeepSeek `: keep-alive`): ignore per spec.
+            continue;
         }
     }
 
@@ -771,5 +774,49 @@ fn apply_temperature_override(body: &mut Value, override_temperature_zero: Optio
             body["temperature"] = serde_json::json!(1.0);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sse_data_records_skips_keep_alive_comments() {
+        let bytes = b": keep-alive\n\
+            data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n\
+            : keep-alive\n\
+            data: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\n\n\
+            data: [DONE]\n\n";
+
+        let records = sse_data_records(bytes);
+
+        assert_eq!(records.len(), 3);
+        assert!(records[0].contains("\"Hi\""));
+        assert!(records[1].contains("\"!\""));
+        assert_eq!(records[2], "[DONE]");
+    }
+
+    #[test]
+    fn sse_data_records_skips_keep_alive_comments_crlf() {
+        let bytes = b": keep-alive\r\n\
+            data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\r\n\r\n\
+            : keep-alive\r\n\
+            data: [DONE]\r\n\r\n";
+
+        let records = sse_data_records(bytes);
+
+        assert_eq!(records.len(), 2);
+        assert!(records[0].contains("\"Hi\""));
+        assert_eq!(records[1], "[DONE]");
+    }
+
+    #[test]
+    fn sse_data_records_ignores_lone_comment_without_data() {
+        let bytes = b": keep-alive\n\n: another comment\n\n";
+
+        let records = sse_data_records(bytes);
+
+        assert!(records.is_empty());
     }
 }

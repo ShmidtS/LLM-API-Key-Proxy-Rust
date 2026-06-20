@@ -130,7 +130,17 @@ async fn foundation_parity_x_api_key_works_for_proxy_routes() {
         .await
         .unwrap();
 
-    assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    // The proxy must accept the `x-api-key` and pass the request past the auth
+    // middleware. A subsequent 401 comes from the *upstream* provider (e.g. an
+    // invalid/expired OPENAI_API_KEY in the test env), not from our auth gate.
+    // Distinguish by error shape: proxy auth errors carry
+    // `type=authentication_error`; upstream errors do not.
+    let (status, body) = response_json(response).await;
+    assert_ne!(
+        body["error"]["type"],
+        "authentication_error",
+        "proxy auth middleware rejected a valid x-api-key (status={status})"
+    );
 }
 
 #[tokio::test]

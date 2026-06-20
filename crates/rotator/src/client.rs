@@ -47,7 +47,7 @@ pub struct RotatorClient {
     adaptive_rate_limiter: Option<Arc<AdaptiveRateLimiterRegistry>>,
     error_journal: Option<Arc<ErrorJournal>>,
     metrics: Arc<crate::metrics::ProxyMetrics>,
-    provider_cache: Arc<DashMap<String, ProviderDefinition>>,
+    provider_cache: Arc<DashMap<String, Arc<ProviderDefinition>>>,
 }
 
 impl RotatorClient {
@@ -162,7 +162,17 @@ impl RotatorClient {
                         .map(|(key, current, limit)| format!("{}: {}/{}", key, current, limit))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    return Err(RotatorError::AllKeysBusy(provider.to_string(), status_str));
+                    // acquire_least_loaded_where filters by cooldown.is_available;
+                    // if keys exist but none was acquired, distinguish cooldown
+                    // (keys idle 0/N) from a genuine concurrent-limit exhaustion.
+                    let any_busy = key_status
+                        .iter()
+                        .any(|(_, current, limit)| *current >= *limit);
+                    return Err(if any_busy {
+                        RotatorError::AllKeysBusy(provider.to_string(), status_str)
+                    } else {
+                        RotatorError::AllKeysOnCooldown(provider.to_string(), status_str)
+                    });
                 }
             };
             let permit =
@@ -555,7 +565,14 @@ impl RotatorClient {
                         .map(|(key, current, limit)| format!("{}: {}/{}", key, current, limit))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    return Err(RotatorError::AllKeysBusy(provider.to_string(), status_str));
+                    let any_busy = key_status
+                        .iter()
+                        .any(|(_, current, limit)| *current >= *limit);
+                    return Err(if any_busy {
+                        RotatorError::AllKeysBusy(provider.to_string(), status_str)
+                    } else {
+                        RotatorError::AllKeysOnCooldown(provider.to_string(), status_str)
+                    });
                 }
             };
             let permit =
@@ -1094,11 +1111,11 @@ impl RotatorClient {
         mut request: reqwest::RequestBuilder,
         token: &str,
     ) -> reqwest::RequestBuilder {
-        if provider == "gemini" {
-            request = request.query(&[("key", token)]);
-        }
         let definition = self.get_cached_provider(provider);
-        for (header_key, value) in definition.default_headers {
+        if provider == "gemini" {
+            request = request.header("x-goog-api-key", token);
+        }
+        for (header_key, value) in &definition.default_headers {
             request = request.header(header_key, value);
         }
         match definition.auth_type {
@@ -1115,17 +1132,18 @@ impl RotatorClient {
     }
 
     fn resolve_base_url(&self, provider: &str) -> String {
-        let base_url = self.get_cached_provider(provider).base_url;
+        let definition = self.get_cached_provider(provider);
+        let base_url = definition.base_url.as_str();
         if base_url.is_empty() {
             format!("https://api.{provider}.com/v1")
         } else {
-            base_url
+            base_url.to_owned()
         }
     }
 
-    fn get_cached_provider(&self, provider: &str) -> ProviderDefinition {
+    fn get_cached_provider(&self, provider: &str) -> Arc<ProviderDefinition> {
         if let Some(cached) = self.provider_cache.get(provider) {
-            return cached.clone();
+            return Arc::clone(cached.value());
         }
         let def = self
             .provider_registry
@@ -1146,7 +1164,9 @@ impl RotatorClient {
                 client_id: None,
                 client_secret: None,
             });
-        self.provider_cache.insert(provider.to_owned(), def.clone());
+        let def = Arc::new(def);
+        self.provider_cache
+            .insert(provider.to_owned(), Arc::clone(&def));
         def
     }
 }
@@ -1254,11 +1274,19 @@ mod tests {
         (registry, calls)
     }
 
-    async fn captured_path_provider(provider: &str) -> (Arc<ProviderRegistry>, Arc<Mutex<String>>) {
+    async fn captured_path_provider(
+        provider: &str,
+    ) -> (
+        Arc<ProviderRegistry>,
+        Arc<Mutex<String>>,
+        Arc<Mutex<Option<String>>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let captured_path = Arc::new(Mutex::new(String::new()));
+        let captured_header = Arc::new(Mutex::new(None));
         let server_path = captured_path.clone();
+        let server_header = captured_header.clone();
 
         tokio::spawn(async move {
             let Ok((mut socket, _)) = listener.accept().await else {
@@ -1275,6 +1303,12 @@ mod tests {
                 .and_then(|line| line.split_whitespace().nth(1))
             {
                 *server_path.lock().unwrap() = path.to_owned();
+            }
+            for line in request.lines() {
+                if let Some(value) = line.strip_prefix("x-goog-api-key:") {
+                    *server_header.lock().unwrap() = Some(value.trim().to_owned());
+                    break;
+                }
             }
             let body = "{}";
             let response = format!(
@@ -1303,12 +1337,12 @@ mod tests {
             client_secret: None,
         });
 
-        (registry, captured_path)
+        (registry, captured_path, captured_header)
     }
 
     #[tokio::test]
     async fn request_uses_gemini_native_chat_endpoint() {
-        let (registry, captured_path) = captured_path_provider("gemini").await;
+        let (registry, captured_path, captured_header) = captured_path_provider("gemini").await;
         let credentials = CredentialManager::new();
         credentials.register_keys("gemini".to_string(), vec!["key-1".to_string()], 1);
         let client = RotatorClient::new(
@@ -1332,9 +1366,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), 200);
+        // Gemini auth moved from `?key=` query param to `x-goog-api-key` header
+        // (parity with apply_auth_headers); the URL path no longer carries the key.
         assert_eq!(
             captured_path.lock().unwrap().as_str(),
-            "/v1beta/models/gemini-2.5-flash:generateContent?key=key-1"
+            "/v1beta/models/gemini-2.5-flash:generateContent"
+        );
+        assert_eq!(
+            captured_header.lock().unwrap().as_deref(),
+            Some("key-1"),
+            "gemini key must be sent via x-goog-api-key header"
         );
     }
 

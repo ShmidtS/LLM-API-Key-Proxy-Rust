@@ -44,8 +44,6 @@ pub struct ProxyMetrics {
     requests_total: DashMap<String, AtomicU64>,
     errors_total: DashMap<(String, String), AtomicU64>,
     retries_total: DashMap<String, AtomicU64>,
-    pool_active_connections: DashMap<String, AtomicU64>,
-    pool_idle_connections: DashMap<String, AtomicU64>,
     concurrent_requests: AtomicU64,
     chunk_latency_ms: Histogram,
     stream_chunks_total: DashMap<String, AtomicU64>,
@@ -101,20 +99,6 @@ impl ProxyMetrics {
         self.concurrent_requests.fetch_sub(1, Ordering::Relaxed);
     }
 
-    pub fn set_pool_active(&self, provider: &str, value: u64) {
-        self.pool_active_connections
-            .entry(provider.to_owned())
-            .and_modify(|v| v.store(value, Ordering::Relaxed))
-            .or_insert_with(|| AtomicU64::new(value));
-    }
-
-    pub fn set_pool_idle(&self, provider: &str, value: u64) {
-        self.pool_idle_connections
-            .entry(provider.to_owned())
-            .and_modify(|v| v.store(value, Ordering::Relaxed))
-            .or_insert_with(|| AtomicU64::new(value));
-    }
-
     pub fn export_prometheus(&self) -> String {
         let mut out = String::new();
 
@@ -154,26 +138,6 @@ impl ProxyMetrics {
             let provider = entry.key();
             out.push_str(&format!(
                 "proxy_retries_total{{provider=\"{provider}\"}} {v}\n"
-            ));
-        }
-
-        // pool_active_connections
-        out.push_str("# TYPE proxy_pool_active_connections gauge\n");
-        for entry in self.pool_active_connections.iter() {
-            let v = entry.value().load(Ordering::Relaxed);
-            let provider = entry.key();
-            out.push_str(&format!(
-                "proxy_pool_active_connections{{provider=\"{provider}\"}} {v}\n"
-            ));
-        }
-
-        // pool_idle_connections
-        out.push_str("# TYPE proxy_pool_idle_connections gauge\n");
-        for entry in self.pool_idle_connections.iter() {
-            let v = entry.value().load(Ordering::Relaxed);
-            let provider = entry.key();
-            out.push_str(&format!(
-                "proxy_pool_idle_connections{{provider=\"{provider}\"}} {v}\n"
             ));
         }
 
@@ -240,8 +204,6 @@ mod tests {
         m.record_retry("openai");
         m.record_stream_chunk("openai");
         m.record_first_chunk_latency("openai", 200);
-        m.set_pool_active("openai", 3);
-        m.set_pool_idle("openai", 5);
         m.inc_concurrent();
 
         let out = m.export_prometheus();
@@ -249,8 +211,6 @@ mod tests {
         assert!(out.contains("proxy_requests_total{provider=\"openai\"}"));
         assert!(out.contains("proxy_errors_total{provider=\"openai\",error_class=\"rate_limit\"}"));
         assert!(out.contains("proxy_retries_total{provider=\"openai\"}"));
-        assert!(out.contains("proxy_pool_active_connections{provider=\"openai\"} 3"));
-        assert!(out.contains("proxy_pool_idle_connections{provider=\"openai\"} 5"));
         assert!(out.contains("proxy_concurrent_requests 1"));
         assert!(out.contains("proxy_chunk_latency_ms"));
         assert!(out.contains("proxy_stream_chunks_total{provider=\"openai\"}"));

@@ -250,19 +250,26 @@ mod tests {
     use tokio::net::TcpListener;
 
     async fn embedding_server(expected_requests: usize) -> (String, Arc<Mutex<Vec<Value>>>) {
-        let (base_url, requests, _) = embedding_server_with_paths(expected_requests).await;
+        let (base_url, requests, _, _) = embedding_server_with_paths(expected_requests).await;
         (base_url, requests)
     }
 
     async fn embedding_server_with_paths(
         expected_requests: usize,
-    ) -> (String, Arc<Mutex<Vec<Value>>>, Arc<Mutex<Vec<String>>>) {
+    ) -> (
+        String,
+        Arc<Mutex<Vec<Value>>>,
+        Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Vec<Option<String>>>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let paths = Arc::new(Mutex::new(Vec::new()));
+        let headers = Arc::new(Mutex::new(Vec::new()));
         let server_requests = requests.clone();
         let server_paths = paths.clone();
+        let server_headers = headers.clone();
 
         tokio::spawn(async move {
             for _ in 0..expected_requests {
@@ -281,6 +288,11 @@ mod tests {
                 {
                     server_paths.lock().unwrap().push(path.to_owned());
                 }
+                let api_key_header = text.lines().find_map(|line| {
+                    line.strip_prefix("x-goog-api-key:")
+                        .map(|value| value.trim().to_owned())
+                });
+                server_headers.lock().unwrap().push(api_key_header);
                 let body = text.split("\r\n\r\n").nth(1).unwrap_or_default();
                 let request: Value = serde_json::from_str(body).unwrap();
                 server_requests.lock().unwrap().push(request.clone());
@@ -315,7 +327,7 @@ mod tests {
             }
         });
 
-        (format!("http://{addr}/v1"), requests, paths)
+        (format!("http://{addr}/v1"), requests, paths, headers)
     }
 
     fn batcher(base_url: String) -> EmbeddingBatcher {
@@ -401,7 +413,7 @@ mod tests {
 
     #[tokio::test]
     async fn gemini_embeddings_use_native_model_endpoint() {
-        let (base_url, _, paths) = embedding_server_with_paths(1).await;
+        let (base_url, _, paths, headers) = embedding_server_with_paths(1).await;
         let batcher = provider_batcher(
             "gemini",
             base_url,
@@ -419,9 +431,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), 200);
+        // Gemini auth moved from `?key=` query param to `x-goog-api-key` header;
+        // the URL path no longer carries the key.
         assert_eq!(
             paths.lock().unwrap()[0],
-            "/v1/models/gemini-embedding-001:embedContent?key=test-key"
+            "/v1/models/gemini-embedding-001:embedContent"
+        );
+        assert_eq!(
+            headers.lock().unwrap()[0].as_deref(),
+            Some("test-key"),
+            "gemini key must be sent via x-goog-api-key header"
         );
     }
 

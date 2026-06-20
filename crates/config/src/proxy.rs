@@ -204,6 +204,8 @@ pub struct ProxyConfig {
     pub http_ssl_verify_hosts: Vec<String>,
     #[serde(default = "default_http2_enabled")]
     pub http2_enabled: bool,
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
     #[serde(default, deserialize_with = "deserialize_optional_string")]
     pub http_dns_resolver: Option<String>,
     #[serde(default)]
@@ -249,6 +251,7 @@ impl Default for ProxyConfig {
             http_ssl_verify: default_http_ssl_verify(),
             http_ssl_verify_hosts: default_http_ssl_verify_hosts(),
             http2_enabled: default_http2_enabled(),
+            connect_timeout_secs: default_connect_timeout_secs(),
             http_dns_resolver: default_http_dns_resolver(),
             guardrails: GuardrailsProxyConfig::default(),
             adaptive_rate_limiter: AdaptiveRateLimiterConfig::default(),
@@ -357,6 +360,9 @@ fn default_http_ssl_verify_hosts() -> Vec<String> {
 fn default_http2_enabled() -> bool {
     false
 }
+fn default_connect_timeout_secs() -> u64 {
+    10
+}
 fn default_http_dns_resolver() -> Option<String> {
     None
 }
@@ -379,6 +385,8 @@ mod tests {
         assert_eq!(config.timeout_read_non_streaming_secs, 120);
         assert_eq!(config.timeout_read_streaming_secs, 300);
         assert_eq!(config.max_body_bytes, 10 * 1024 * 1024);
+        assert_eq!(config.connect_timeout_secs, 10);
+        assert!(!config.http2_enabled);
         assert_eq!(config.usage_path, "usage.json");
         assert_eq!(config.usage_flush_interval_secs, 60);
         assert_eq!(config.usage_batch_size, 100);
