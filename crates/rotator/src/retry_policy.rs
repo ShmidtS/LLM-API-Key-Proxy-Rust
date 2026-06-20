@@ -361,14 +361,28 @@ fn field_equals(body: Option<&serde_json::Value>, path: &[&str], expected: &str)
         .is_some_and(|value| value.eq_ignore_ascii_case(expected))
 }
 
-fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> {
+pub(crate) fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> {
     headers
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(parse_retry_after)
 }
 
-fn retry_after_from_body(body: &serde_json::Value) -> Option<Duration> {
+/// Resolve a backoff hint from a throttling response: prefer the `Retry-After`
+/// header, then fall back to `retry_after` / `retryAfter` /
+/// `retry_after_seconds` in a JSON error body. `pub(crate)` so the rotator
+/// client shares a single (panic-safe) parser instead of re-deriving it.
+pub(crate) fn retry_after_from_headers_and_body(
+    headers: &HeaderMap,
+    body: Option<&str>,
+) -> Option<Duration> {
+    retry_after_from_headers(headers).or_else(|| {
+        body.and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+            .and_then(|value| retry_after_from_body(&value))
+    })
+}
+
+pub(crate) fn retry_after_from_body(body: &serde_json::Value) -> Option<Duration> {
     ["retry_after", "retryAfter", "retry_after_seconds"]
         .iter()
         .find_map(|field| body.get(field).and_then(parse_retry_after_value))
@@ -381,11 +395,28 @@ fn retry_after_from_body(body: &serde_json::Value) -> Option<Duration> {
         })
 }
 
-fn parse_retry_after(raw: &str) -> Option<Duration> {
-    raw.parse::<u64>()
-        .map(Duration::from_secs)
-        .ok()
-        .or_else(|| raw.parse::<f64>().ok().map(Duration::from_secs_f64))
+/// Parse a `Retry-After` value (integer or fractional seconds) into a `Duration`.
+///
+/// Rejects values `Duration::from_secs_f64` would panic on (NaN, negative,
+/// infinite, or overflowing), so a malformed upstream header (e.g.
+/// `Retry-After: -1` or `nan`) can never crash the request task. `pub(crate)`
+/// so the rotator client reuses one safe parser.
+pub(crate) fn parse_retry_after(raw: &str) -> Option<Duration> {
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    duration_from_f64_secs(raw.parse::<f64>().ok()?)
+}
+
+/// Convert fractional seconds to a `Duration`, returning `None` for any value
+/// `from_secs_f64` would reject (and panic on): NaN, negative, infinite, or not
+/// representable as a `Duration`. The last case matters at the boundary —
+/// `u64::MAX + 1` (1.8446744073709552e19) equals `Duration::MAX.as_secs_f64()`
+/// but rounds past `Duration::MAX`, so a naive `secs <= MAX.as_secs_f64()` guard
+/// still panics. `try_from_secs_f64` returns `Result` and rejects all of these
+/// instead of panicking.
+fn duration_from_f64_secs(secs: f64) -> Option<Duration> {
+    Duration::try_from_secs_f64(secs).ok()
 }
 
 fn parse_retry_after_value(value: &serde_json::Value) -> Option<Duration> {
@@ -394,7 +425,7 @@ fn parse_retry_after_value(value: &serde_json::Value) -> Option<Duration> {
             if let Some(secs) = num.as_u64() {
                 Some(Duration::from_secs(secs))
             } else {
-                num.as_f64().map(Duration::from_secs_f64)
+                num.as_f64().and_then(duration_from_f64_secs)
             }
         }
         serde_json::Value::String(s) => parse_retry_after(s),
@@ -572,5 +603,75 @@ mod tests {
                 "status {status} should classify as AuthError (key-specific, rotates)"
             );
         }
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_values_that_would_panic() {
+        // Each of these reaches `f64::parse` (the u64 arm fails); previously the
+        // result was handed straight to Duration::from_secs_f64, which panics on
+        // NaN/negative/infinite/overflow. They must now yield None instead.
+        for raw in [
+            "nan",
+            "NaN",
+            "-1",
+            "-0.5",
+            "inf",
+            "infinity",
+            "1e400",
+            "abc",
+            "",
+            // Boundary: u64::MAX + 1 and its scientific form both equal
+            // Duration::MAX.as_secs_f64() yet round past Duration::MAX, so a
+            // naive `<= MAX.as_secs_f64()` guard still panics in from_secs_f64.
+            "18446744073709551616",
+            "1.8446744073709552e19",
+        ] {
+            assert_eq!(
+                parse_retry_after(raw),
+                None,
+                "{raw:?} must parse to None, not panic"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_retry_after_handles_integer_and_fractional_seconds() {
+        assert_eq!(parse_retry_after("60"), Some(Duration::from_secs(60)));
+        assert_eq!(parse_retry_after("1.5"), Some(Duration::from_millis(1500)));
+        assert_eq!(parse_retry_after("0"), Some(Duration::from_secs(0)));
+    }
+
+    #[test]
+    fn retry_after_prefers_header_then_body_without_panicking() {
+        // Header wins over body.
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, "30".parse().unwrap());
+        assert_eq!(
+            retry_after_from_headers_and_body(&headers, Some(r#"{"retry_after":99}"#)),
+            Some(Duration::from_secs(30))
+        );
+
+        // No header -> fall back to a JSON body field.
+        assert_eq!(
+            retry_after_from_headers_and_body(
+                &HeaderMap::new(),
+                Some(r#"{"error":{"retry_after_seconds":7}}"#)
+            ),
+            Some(Duration::from_secs(7))
+        );
+
+        // A malformed header must not panic; fall back to the body.
+        let mut bad = HeaderMap::new();
+        bad.insert(RETRY_AFTER, "nan".parse().unwrap());
+        assert_eq!(
+            retry_after_from_headers_and_body(&bad, Some(r#"{"retry_after":5}"#)),
+            Some(Duration::from_secs(5))
+        );
+
+        // Nothing parseable -> None.
+        assert_eq!(
+            retry_after_from_headers_and_body(&HeaderMap::new(), None),
+            None
+        );
     }
 }

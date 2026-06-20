@@ -261,6 +261,16 @@ impl CredentialManager {
             .unwrap_or(false)
     }
 
+    /// Number of credentials registered for `provider` (regardless of cooldown),
+    /// in O(1) and without materializing the status `Vec` that `get_key_status`
+    /// allocates. Used to bound request-level (412/422/451) rotation.
+    pub fn key_count(&self, provider: &str) -> usize {
+        self.credentials
+            .get(provider)
+            .map(|entries| entries.len())
+            .unwrap_or(0)
+    }
+
     pub fn acquire_least_loaded(&self, provider: &str) -> Option<CredentialEntry> {
         self.acquire_least_loaded_where(provider, |_| true)
     }

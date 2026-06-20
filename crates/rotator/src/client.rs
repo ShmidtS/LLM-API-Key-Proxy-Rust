@@ -13,7 +13,7 @@ use crate::rate_limiter::{AdaptiveRateLimiterRegistry, RateLimiterRegistry};
 use crate::request_sanitizer::{SanitizerContext, sanitize_request};
 use crate::retry_policy::{
     FailureClass, RetryDecision, classify_upstream_failure, decide_retry_for_provider,
-    get_retry_backoff,
+    get_retry_backoff, retry_after_from_headers_and_body,
 };
 use crate::usage::UsageManager;
 use dashmap::DashMap;
@@ -136,12 +136,27 @@ impl RotatorClient {
                 .resolve_endpoint_path(&route.provider_id, &route.action, &body);
         let url = normalize_upstream_url(&route.base_url, &upstream_path);
 
-        let key_count = self.credentials.get_key_status(provider).len();
+        let key_count = self.credentials.key_count(provider);
         let mut last_key: Option<String> = None;
         let mut tried_412_keys: Vec<String> = Vec::new();
+        // Retained 412/422/451 response so we can surface it to the client even if a
+        // later acquire finds no fresh key (e.g. some keys on cooldown) — otherwise a
+        // request-level rejection degrades to an opaque AllKeysOnCooldown error.
+        let mut pending_412 = None;
 
         for attempt in 0..=self.max_retries {
             if !self.circuit_breakers.is_allowed(provider) {
+                // Surface a retained request-level rejection (412/422/451) even if a
+                // concurrent failure tripped the provider circuit mid-rotation, instead
+                // of hiding it behind an opaque CircuitOpen.
+                if let Some((status, version, headers, body_text)) = pending_412.take() {
+                    let mut builder = http::Response::builder().status(status).version(version);
+                    *builder.headers_mut().expect("response builder is valid") = headers;
+                    return Ok(builder
+                        .body(bytes::Bytes::from(body_text))
+                        .expect("response body rebuild should not fail")
+                        .into());
+                }
                 return Err(RotatorError::CircuitOpen(provider.to_string()));
             }
 
@@ -155,6 +170,17 @@ impl RotatorClient {
             let cred = match cred {
                 Some(cred) => cred,
                 None => {
+                    // Mid-rotation through a request-level 412/422/451 with no fresh key
+                    // available (e.g. some keys on cooldown): surface the retained upstream
+                    // response instead of an opaque AllKeysOnCooldown error.
+                    if let Some((status, version, headers, body_text)) = pending_412.take() {
+                        let mut builder = http::Response::builder().status(status).version(version);
+                        *builder.headers_mut().expect("response builder is valid") = headers;
+                        return Ok(builder
+                            .body(bytes::Bytes::from(body_text))
+                            .expect("response body rebuild should not fail")
+                            .into());
+                    }
                     let has_any_keys = self.credentials.has_any_keys(provider);
                     if !has_any_keys {
                         return Err(RotatorError::NoCredentials(provider.to_string()));
@@ -178,6 +204,10 @@ impl RotatorClient {
                     });
                 }
             };
+            // We're about to try a fresh key, so a 412/422/451 retained from an earlier
+            // attempt is no longer the current signal — drop it. A subsequent 429/5xx/
+            // connection error must not be masked by a stale request-level rejection.
+            pending_412 = None;
             let permit =
                 CredentialPermit::new(self.credentials.clone(), provider, cred.key.clone());
 
@@ -291,22 +321,19 @@ impl RotatorClient {
                         .await;
                 }
                 Ok(resp) if resp.status().as_u16() == 429 => {
-                    // 429: rotate to another key without cooldown/journal/breaker.
-                    // A 429 follows the credential's quota, not the request, so rotation
-                    // is the right move — but burning keys into cooldown (and then into a
-                    // provider-wide circuit) turned a transient throttle into a 502 storm.
-                    // Honor Retry-After when present, otherwise short backoff.
+                    // 429 follows the credential's quota, not the request: rotate to
+                    // another key without cooldown/journal/breaker (burning the throttled
+                    // key into cooldown — then into a provider-wide circuit — turned a
+                    // transient throttle into a 502 storm). Keep feeding the adaptive
+                    // rate limiter so it can back off incoming traffic.
                     let headers = resp.headers().clone();
                     let body_text = resp.text().await.unwrap_or_default();
-                    let retry_after = headers
-                        .get(reqwest::header::RETRY_AFTER)
-                        .and_then(|value| value.to_str().ok())
-                        .and_then(|raw| {
-                            raw.parse::<u64>()
-                                .map(Duration::from_secs)
-                                .ok()
-                                .or_else(|| raw.parse::<f64>().ok().map(Duration::from_secs_f64))
-                        });
+                    if let Some(ref arl) = self.adaptive_rate_limiter {
+                        arl.record_429(provider, permit.key());
+                    }
+                    // Single panic-safe Retry-After parse (header, then JSON body) shared
+                    // with the rest of the crate — see retry_policy::parse_retry_after.
+                    let retry_after = retry_after_from_headers_and_body(&headers, Some(&body_text));
                     warn!(
                         provider,
                         attempt,
@@ -314,15 +341,14 @@ impl RotatorClient {
                         ?retry_after,
                         "429 throttled, rotating key"
                     );
-                    let _ = body_text;
                     if attempt < self.max_retries {
                         last_key = Some(permit.key().to_string());
                         drop(permit);
-                        tokio::time::sleep(
-                            retry_after
-                                .unwrap_or_else(|| get_retry_backoff(attempt as u32, 500, 60_000)),
-                        )
-                        .await;
+                        // Rotate quickly: only the throttled key's quota is exhausted, so
+                        // another key may serve immediately. Use a short backoff — NOT the
+                        // full (possibly huge) Retry-After — so a bad header can't stall the
+                        // task. The hint is surfaced in the terminal error below.
+                        tokio::time::sleep(get_retry_backoff(attempt as u32, 500, 60_000)).await;
                         continue;
                     }
                     return Err(RotatorError::RateLimited(
@@ -497,6 +523,10 @@ impl RotatorClient {
                         && tried_412_keys.len() < 3
                         && tried_412_keys.len() < key_count
                     {
+                        // Retain this response so a later acquire that finds no fresh key
+                        // (e.g. some keys on cooldown) surfaces the real upstream error via
+                        // pending_412 instead of degrading to an opaque AllKeysOnCooldown.
+                        pending_412 = Some((status, version, headers, body_text));
                         drop(permit);
                         tokio::time::sleep(get_retry_backoff(attempt as u32, 200, 60_000)).await;
                         continue;
@@ -531,6 +561,16 @@ impl RotatorClient {
                 }
             }
         }
+        // Loop exhausted without a definitive return. If a request-level rejection
+        // (412/422/451) was retained earlier, surface it instead of a generic Exhausted.
+        if let Some((status, version, headers, body_text)) = pending_412.take() {
+            let mut builder = http::Response::builder().status(status).version(version);
+            *builder.headers_mut().expect("response builder is valid") = headers;
+            return Ok(builder
+                .body(bytes::Bytes::from(body_text))
+                .expect("response body rebuild should not fail")
+                .into());
+        }
         if let Some(ref ej) = self.error_journal {
             ej.record_error(
                 provider,
@@ -549,12 +589,27 @@ impl RotatorClient {
         body: bytes::Bytes,
         content_type: &str,
     ) -> Result<reqwest::Response> {
-        let key_count = self.credentials.get_key_status(provider).len();
+        let key_count = self.credentials.key_count(provider);
         let mut last_key: Option<String> = None;
         let mut tried_412_keys: Vec<String> = Vec::new();
+        // Retained 412/422/451 response so we can surface it to the client even if a
+        // later acquire finds no fresh key (e.g. some keys on cooldown) — otherwise a
+        // request-level rejection degrades to an opaque AllKeysOnCooldown error.
+        let mut pending_412 = None;
 
         for attempt in 0..=self.max_retries {
             if !self.circuit_breakers.is_allowed(provider) {
+                // Surface a retained request-level rejection (412/422/451) even if a
+                // concurrent failure tripped the provider circuit mid-rotation, instead
+                // of hiding it behind an opaque CircuitOpen.
+                if let Some((status, version, headers, body_text)) = pending_412.take() {
+                    let mut builder = http::Response::builder().status(status).version(version);
+                    *builder.headers_mut().expect("response builder is valid") = headers;
+                    return Ok(builder
+                        .body(bytes::Bytes::from(body_text))
+                        .expect("response body rebuild should not fail")
+                        .into());
+                }
                 return Err(RotatorError::CircuitOpen(provider.to_string()));
             }
 
@@ -568,6 +623,17 @@ impl RotatorClient {
             let cred = match cred {
                 Some(cred) => cred,
                 None => {
+                    // Mid-rotation through a request-level 412/422/451 with no fresh key
+                    // available (e.g. some keys on cooldown): surface the retained upstream
+                    // response instead of an opaque AllKeysOnCooldown error.
+                    if let Some((status, version, headers, body_text)) = pending_412.take() {
+                        let mut builder = http::Response::builder().status(status).version(version);
+                        *builder.headers_mut().expect("response builder is valid") = headers;
+                        return Ok(builder
+                            .body(bytes::Bytes::from(body_text))
+                            .expect("response body rebuild should not fail")
+                            .into());
+                    }
                     let has_any_keys = self.credentials.has_any_keys(provider);
                     if !has_any_keys {
                         return Err(RotatorError::NoCredentials(provider.to_string()));
@@ -588,6 +654,10 @@ impl RotatorClient {
                     });
                 }
             };
+            // We're about to try a fresh key, so a 412/422/451 retained from an earlier
+            // attempt is no longer the current signal — drop it. A subsequent 429/5xx/
+            // connection error must not be masked by a stale request-level rejection.
+            pending_412 = None;
             let permit =
                 CredentialPermit::new(self.credentials.clone(), provider, cred.key.clone());
 
@@ -625,18 +695,14 @@ impl RotatorClient {
                         .await;
                 }
                 Ok(resp) if resp.status().as_u16() == 429 => {
-                    // 429: rotate to another key without cooldown/journal/breaker.
+                    // 429: rotate to another key without cooldown/journal/breaker, but keep
+                    // feeding the adaptive rate limiter and use a safe Retry-After parse.
                     let headers = resp.headers().clone();
                     let body_text = resp.text().await.unwrap_or_default();
-                    let retry_after = headers
-                        .get(reqwest::header::RETRY_AFTER)
-                        .and_then(|value| value.to_str().ok())
-                        .and_then(|raw| {
-                            raw.parse::<u64>()
-                                .map(Duration::from_secs)
-                                .ok()
-                                .or_else(|| raw.parse::<f64>().ok().map(Duration::from_secs_f64))
-                        });
+                    if let Some(ref arl) = self.adaptive_rate_limiter {
+                        arl.record_429(provider, permit.key());
+                    }
+                    let retry_after = retry_after_from_headers_and_body(&headers, Some(&body_text));
                     warn!(
                         provider,
                         attempt,
@@ -644,15 +710,11 @@ impl RotatorClient {
                         ?retry_after,
                         "429 throttled, rotating key"
                     );
-                    let _ = body_text;
                     if attempt < self.max_retries {
                         last_key = Some(permit.key().to_string());
                         drop(permit);
-                        tokio::time::sleep(
-                            retry_after
-                                .unwrap_or_else(|| get_retry_backoff(attempt as u32, 500, 60_000)),
-                        )
-                        .await;
+                        // Rotate on a short backoff, not the full Retry-After.
+                        tokio::time::sleep(get_retry_backoff(attempt as u32, 500, 60_000)).await;
                         continue;
                     }
                     return Err(RotatorError::RateLimited(
@@ -821,6 +883,10 @@ impl RotatorClient {
                         && tried_412_keys.len() < 3
                         && tried_412_keys.len() < key_count
                     {
+                        // Retain this response so a later acquire that finds no fresh key
+                        // (e.g. some keys on cooldown) surfaces the real upstream error via
+                        // pending_412 instead of degrading to an opaque AllKeysOnCooldown.
+                        pending_412 = Some((status, version, headers, body_text));
                         drop(permit);
                         tokio::time::sleep(get_retry_backoff(attempt as u32, 200, 60_000)).await;
                         continue;
@@ -854,6 +920,16 @@ impl RotatorClient {
                     return Err(RotatorError::Http(sanitized.to_string()));
                 }
             }
+        }
+        // Loop exhausted without a definitive return. If a request-level rejection
+        // (412/422/451) was retained earlier, surface it instead of a generic Exhausted.
+        if let Some((status, version, headers, body_text)) = pending_412.take() {
+            let mut builder = http::Response::builder().status(status).version(version);
+            *builder.headers_mut().expect("response builder is valid") = headers;
+            return Ok(builder
+                .body(bytes::Bytes::from(body_text))
+                .expect("response body rebuild should not fail")
+                .into());
         }
         if let Some(ref ej) = self.error_journal {
             ej.record_error(
