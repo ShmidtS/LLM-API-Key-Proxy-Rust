@@ -22,8 +22,8 @@ pub(crate) fn classify_throttle_with_headers(
 ) -> (ThrottleReason, Option<Duration>) {
     let reason = classify_reason(status, body);
     let retry_after = headers
-        .and_then(retry_after_from_headers)
-        .or_else(|| retry_after_from_body(body));
+        .and_then(crate::retry_policy::retry_after_from_headers)
+        .or_else(|| crate::retry_policy::retry_after_from_body(body));
 
     (reason, retry_after)
 }
@@ -43,41 +43,8 @@ fn classify_reason(status: u16, body: &serde_json::Value) -> ThrottleReason {
     }
 }
 
-fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    headers
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(parse_retry_after)
-}
-
-fn retry_after_from_body(body: &serde_json::Value) -> Option<Duration> {
-    ["retry_after", "retryAfter", "retry_after_seconds"]
-        .iter()
-        .find_map(|field| body.get(field).and_then(parse_retry_after_value))
-        .or_else(|| {
-            body.get("error").and_then(|error| {
-                ["retry_after", "retryAfter", "retry_after_seconds"]
-                    .iter()
-                    .find_map(|field| error.get(field).and_then(parse_retry_after_value))
-            })
-        })
-}
-
-fn parse_retry_after_value(value: &serde_json::Value) -> Option<Duration> {
-    value
-        .as_u64()
-        .map(Duration::from_secs)
-        .or_else(|| value.as_f64().map(Duration::from_secs_f64))
-        .or_else(|| value.as_str().and_then(parse_retry_after))
-}
-
-fn parse_retry_after(value: &str) -> Option<Duration> {
-    value
-        .parse::<u64>()
-        .map(Duration::from_secs)
-        .or_else(|_| value.parse::<f64>().map(Duration::from_secs_f64))
-        .ok()
-}
+// Retry-After parsing is shared (and panic-safe) via `retry_policy`; this module
+// no longer keeps its own copy, so the safety invariant holds everywhere.
 
 #[cfg(test)]
 mod tests {

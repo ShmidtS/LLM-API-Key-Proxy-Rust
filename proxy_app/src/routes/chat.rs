@@ -93,6 +93,15 @@ async fn chat_completions(
             let upstream =
                 request_chat_upstream(&state, &provider, upstream_path, upstream_body, &req.model)
                     .await?;
+            // Forward non-success upstream responses as-is instead of piping an error
+            // body through the SSE translator (which would mangle/empty it).
+            if !upstream.status().is_success() {
+                let mut response = upstream_response(upstream).await?;
+                response
+                    .headers_mut()
+                    .insert("x-input-tokens", input_tokens_header);
+                return Ok(response);
+            }
             let status = upstream.status();
             let headers = upstream.headers().clone();
             let model = req.model.clone();
@@ -174,6 +183,13 @@ async fn chat_completions(
                 &req.model,
             )
             .await?;
+            if !resp.status().is_success() {
+                let mut response = upstream_response(resp).await?;
+                response
+                    .headers_mut()
+                    .insert("x-input-tokens", input_tokens_header);
+                return Ok(response);
+            }
             let status = resp.status();
             let _headers = resp.headers().clone();
             let bytes = resp
@@ -264,20 +280,30 @@ async fn chat_completions(
             request_chat_upstream(&state, &provider, upstream_path, upstream_body, &req.model)
                 .await?;
         let mut response = if provider == "anthropic" {
-            let status = resp.status();
-            let headers = resp.headers().clone();
-            let data: Value = resp
-                .json()
-                .await
-                .map_err(|e| rotator::RotatorError::Http(e.to_string()))?;
-            let data = anthropic_to_openai_response(&data, &req.model);
-            let mut builder = Response::builder().status(status);
-            if let Some(ct) = headers.get(header::CONTENT_TYPE) {
-                builder = builder.header(header::CONTENT_TYPE, ct);
+            if !resp.status().is_success() {
+                // Forward upstream errors (412/422/451, etc.) as-is: translating an
+                // error body or forcing .json() would corrupt the status/body.
+                upstream_response(resp).await?
+            } else {
+                let status = resp.status();
+                let headers = resp.headers().clone();
+                let data: Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| rotator::RotatorError::Http(e.to_string()))?;
+                let data = anthropic_to_openai_response(&data, &req.model);
+                let mut builder = Response::builder().status(status);
+                if let Some(ct) = headers.get(header::CONTENT_TYPE) {
+                    builder = builder.header(header::CONTENT_TYPE, ct);
+                }
+                builder.body(Body::from(data.to_string())).unwrap()
             }
-            builder.body(Body::from(data.to_string())).unwrap()
         } else if is_responses_compat {
-            responses_sse_to_json_response(resp, &req.model).await?
+            if !resp.status().is_success() {
+                upstream_response(resp).await?
+            } else {
+                responses_sse_to_json_response(resp, &req.model).await?
+            }
         } else {
             upstream_response(resp).await?
         };
@@ -292,9 +318,13 @@ async fn chat_completions(
             request_chat_upstream(&state, &provider, upstream_path, upstream_body, &req.model)
                 .await?;
         let mut response = if provider == "anthropic" {
-            let (status, headers, response_json) =
-                buffer_chat_response(resp, is_anthropic, &req.model).await?;
-            buffered_json_response(status, &headers, response_json)
+            if !resp.status().is_success() {
+                upstream_response(resp).await?
+            } else {
+                let (status, headers, response_json) =
+                    buffer_chat_response(resp, is_anthropic, &req.model).await?;
+                buffered_json_response(status, &headers, response_json)
+            }
         } else {
             upstream_response(resp).await?
         };
@@ -342,6 +372,15 @@ async fn chat_completions(
             &req.model,
         )
         .await?;
+        if !resp.status().is_success() {
+            // Forward upstream errors as-is; buffer_chat_response would force .json()
+            // on a possibly non-JSON error body and drop the real status.
+            let mut response = upstream_response(resp).await?;
+            response
+                .headers_mut()
+                .insert("x-input-tokens", input_tokens_header);
+            return Ok(response);
+        }
         let (status, headers, response_json) =
             buffer_chat_response(resp, is_anthropic, &req.model).await?;
 

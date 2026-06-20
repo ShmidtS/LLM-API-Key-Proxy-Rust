@@ -3,7 +3,7 @@ use crate::compat::anthropic::{
 };
 use crate::compat::anthropic_streaming::{ChunkBatcher, OpenAiToAnthropicStreamTranslator};
 use crate::errors::AppError;
-use crate::routes::utils::normalize_model_in_body;
+use crate::routes::utils::{normalize_model_in_body, upstream_response};
 use crate::state::AppState;
 use axum::body::Body;
 use axum::http::header;
@@ -61,6 +61,11 @@ async fn create_message(
             status = %upstream.status(),
             "upstream anthropic message response"
         );
+        // Forward non-success upstream responses as-is instead of pumping an error
+        // body through the stream translator (which would drop/mangle it).
+        if !upstream.status().is_success() {
+            return upstream_response(upstream).await;
+        }
         let status = upstream.status();
         let headers = upstream.headers().clone();
         let mut batcher = ChunkBatcher::new();
@@ -104,6 +109,12 @@ async fn create_message(
         status = %resp.status(),
         "upstream anthropic message response"
     );
+    // Forward non-success upstream responses (e.g. 412/422/451 surfaced by the
+    // rotator) as-is. Forcing them through .json() + Json(data) would drop the
+    // status (200 with an error body) or 500 on a non-JSON error body.
+    if !resp.status().is_success() {
+        return upstream_response(resp).await;
+    }
     let data: Value = resp
         .json()
         .await
@@ -119,7 +130,7 @@ async fn create_message(
 async fn count_tokens(
     State(state): State<AppState>,
     Json(req): Json<AnthropicCountTokensRequest>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
     let mut body = serde_json::to_value(&req)?;
     let provider = resolve_anthropic_provider_for_body(&state, &body);
     normalize_model_in_body(&mut body, &provider);
@@ -145,11 +156,15 @@ async fn count_tokens(
         status = %resp.status(),
         "upstream anthropic count tokens response"
     );
-    let data = resp
+    if !resp.status().is_success() {
+        // Forward non-success upstream responses as-is (same policy as create_message).
+        return upstream_response(resp).await;
+    }
+    let data: Value = resp
         .json()
         .await
         .map_err(|e| rotator::RotatorError::Http(e.to_string()))?;
-    Ok(Json(data))
+    Ok(Json(data).into_response())
 }
 
 fn resolve_anthropic_provider_for_body(state: &AppState, body: &Value) -> String {

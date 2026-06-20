@@ -5,6 +5,7 @@ use rotator::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -427,4 +428,56 @@ async fn garbage_response_exhausts_keys_then_returns_original() {
     let keys_seen = server.keys_seen.lock().await;
     assert_eq!(keys_seen.len(), 2);
     assert_ne!(keys_seen[0], keys_seen[1]);
+}
+
+#[tokio::test]
+async fn surfaces_412_when_other_keys_on_cooldown() {
+    // key-2 is on cooldown, so only key-1 is acquirable. A provider-wide 412 on
+    // key-1 must surface the 412 to the client rather than degrade to an opaque
+    // AllKeysOnCooldown when the next acquire finds no fresh key.
+    let server = test_provider(vec![MockResponse::new(412)]).await;
+    let cooldown = Arc::new(CooldownManager::new());
+    cooldown.add_cooldown("test", "key-2", Duration::from_secs(60));
+    let client = test_client(
+        Arc::clone(&server.registry),
+        Arc::clone(&cooldown),
+        vec!["key-1", "key-2"],
+        2,
+    );
+
+    let result = send_request(&client).await;
+
+    let response = match result {
+        Ok(resp) => resp,
+        Err(e) => panic!("expected the 412 to be surfaced, got error: {e:?}"),
+    };
+    assert_eq!(response.status(), 412);
+    // key-1 412'd and key-2 was cooled: a single upstream call, then we surfaced it.
+    assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+    // 412 never burns the key into cooldown.
+    assert!(cooldown.is_available("test", "key-1"));
+}
+
+#[tokio::test]
+async fn malformed_retry_after_does_not_panic() {
+    // A malformed Retry-After (a value f64 accepts but Duration rejects) previously
+    // reached Duration::from_secs_f64 and panicked the task. It must now parse to
+    // None, fall through to backoff, and end in a terminal RateLimited.
+    let server = test_provider(vec![
+        MockResponse::new(429).with_header("Retry-After", "nan"),
+    ])
+    .await;
+    let client = test_client(
+        Arc::clone(&server.registry),
+        Arc::new(CooldownManager::new()),
+        vec!["key-1"],
+        1,
+    );
+
+    let result = send_request(&client).await;
+
+    assert!(
+        matches!(result, Err(RotatorError::RateLimited(ref p, None)) if p == "test"),
+        "expected RateLimited with no retry_after, got {result:?}"
+    );
 }
