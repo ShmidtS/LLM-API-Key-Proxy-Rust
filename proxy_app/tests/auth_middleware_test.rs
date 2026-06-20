@@ -82,8 +82,7 @@ async fn proxy_route_accepts_x_api_key() {
     // `type=authentication_error`; upstream errors do not.
     let (status, body) = response_json(response).await;
     assert_ne!(
-        body["error"]["type"],
-        "authentication_error",
+        body["error"]["type"], "authentication_error",
         "proxy auth middleware rejected a valid x-api-key (status={status})"
     );
 }

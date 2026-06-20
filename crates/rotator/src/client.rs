@@ -4,7 +4,6 @@ use crate::credentials::{CredentialManager, CredentialPermit};
 use crate::error::{Result, RotatorError};
 use crate::error_journal::{ErrorClass, ErrorJournal};
 use crate::http_pool::HttpClientPool;
-use crate::ip_throttle::{IPThrottleDetector, ThrottleAssessment};
 use crate::provider_registry::{AuthType, ProviderDefinition, ProviderRegistry};
 use crate::provider_runtime::normalize_upstream_url;
 use crate::provider_utils::extract_usage;
@@ -43,7 +42,6 @@ pub struct RotatorClient {
     max_retries: usize,
     oauth_manager: Arc<OAuthManager>,
     oauth_refresh_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    ip_throttle: Arc<IPThrottleDetector>,
     adaptive_rate_limiter: Option<Arc<AdaptiveRateLimiterRegistry>>,
     error_journal: Option<Arc<ErrorJournal>>,
     metrics: Arc<crate::metrics::ProxyMetrics>,
@@ -74,7 +72,6 @@ impl RotatorClient {
             max_retries,
             oauth_manager: Arc::new(OAuthManager::new()),
             oauth_refresh_locks: Arc::new(DashMap::new()),
-            ip_throttle: Arc::new(IPThrottleDetector::new()),
             adaptive_rate_limiter: None,
             error_journal: None,
             metrics: Arc::new(crate::metrics::ProxyMetrics::new()),
@@ -139,6 +136,10 @@ impl RotatorClient {
                 .resolve_endpoint_path(&route.provider_id, &route.action, &body);
         let url = normalize_upstream_url(&route.base_url, &upstream_path);
 
+        let key_count = self.credentials.get_key_status(provider).len();
+        let mut last_key: Option<String> = None;
+        let mut tried_412_keys: Vec<String> = Vec::new();
+
         for attempt in 0..=self.max_retries {
             if !self.circuit_breakers.is_allowed(provider) {
                 return Err(RotatorError::CircuitOpen(provider.to_string()));
@@ -148,6 +149,8 @@ impl RotatorClient {
                 .credentials
                 .acquire_least_loaded_where(provider, |key| {
                     self.cooldown.is_available(provider, key)
+                        && (key_count <= 1 || Some(key) != last_key.as_deref())
+                        && !tried_412_keys.iter().any(|k| k.as_str() == key)
                 });
             let cred = match cred {
                 Some(cred) => cred,
@@ -288,89 +291,44 @@ impl RotatorClient {
                         .await;
                 }
                 Ok(resp) if resp.status().as_u16() == 429 => {
-                    let status = resp.status();
+                    // 429: rotate to another key without cooldown/journal/breaker.
+                    // A 429 follows the credential's quota, not the request, so rotation
+                    // is the right move — but burning keys into cooldown (and then into a
+                    // provider-wide circuit) turned a transient throttle into a 502 storm.
+                    // Honor Retry-After when present, otherwise short backoff.
                     let headers = resp.headers().clone();
                     let body_text = resp.text().await.unwrap_or_default();
-                    if let Some(ref arl) = self.adaptive_rate_limiter {
-                        arl.record_429(provider, permit.key());
-                    }
-                    let failure = classify_upstream_failure(status, &headers, Some(&body_text));
-                    if let Some(ref ej) = self.error_journal {
-                        ej.record_error(provider, ErrorClass::RateLimit, Some(429), &body_text);
-                    }
-                    self.ip_throttle
-                        .record_429(permit.key(), &body_text, provider);
-                    let assessment = self.ip_throttle.assess_throttle(permit.key(), provider);
-                    let mut decision = decide_retry_for_provider(
-                        failure.clone(),
-                        attempt as u32,
-                        self.max_retries as u32,
-                        Some(provider),
-                        self.error_journal.as_deref(),
-                    );
-                    if assessment == ThrottleAssessment::Throttled {
-                        decision = RetryDecision::CooldownProvider {
-                            duration: get_retry_backoff(attempt as u32, 1_000, 60_000),
-                        };
-                    }
+                    let retry_after = headers
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|raw| {
+                            raw.parse::<u64>()
+                                .map(Duration::from_secs)
+                                .ok()
+                                .or_else(|| raw.parse::<f64>().ok().map(Duration::from_secs_f64))
+                        });
                     warn!(
                         provider,
                         attempt,
-                        ?failure,
-                        ?decision,
-                        ?assessment,
-                        "throttled, retrying..."
+                        key = %crate::transaction_log::credential_hash_prefix(permit.key()),
+                        ?retry_after,
+                        "429 throttled, rotating key"
                     );
-                    match decision {
-                        RetryDecision::CooldownKey { duration } => {
-                            self.cooldown.add_cooldown(provider, permit.key(), duration);
-                            drop(permit);
-                            tokio::time::sleep(duration).await;
-                            continue;
-                        }
-                        RetryDecision::CooldownProvider { duration } => {
-                            self.cooldown.add_provider_cooldown(provider, duration);
-                            drop(permit);
-                            tokio::time::sleep(duration).await;
-                            continue;
-                        }
-                        RetryDecision::RetrySameKey => {
-                            drop(permit);
-                            tokio::time::sleep(get_retry_backoff(attempt as u32, 500, 60_000))
-                                .await;
-                            continue;
-                        }
-                        RetryDecision::RotateKey => {
-                            self.cooldown.add_cooldown(
-                                provider,
-                                permit.key(),
-                                Duration::from_secs(5),
-                            );
-                            drop(permit);
-                            tokio::time::sleep(get_retry_backoff(attempt as u32, 500, 60_000))
-                                .await;
-                            continue;
-                        }
-                        RetryDecision::OpenCircuit => {
-                            self.circuit_breakers.record_failure(provider);
-                            return Err(RotatorError::CircuitOpen(provider.to_string()));
-                        }
-                        RetryDecision::GiveUp => {
-                            self.circuit_breakers.record_failure(provider);
-                            return Err(RotatorError::CircuitOpen(provider.to_string()));
-                        }
-                        RetryDecision::Abort => {
-                            return Err(RotatorError::RateLimited(
-                                provider.to_string(),
-                                match failure {
-                                    FailureClass::RateLimit { retry_after, .. } => {
-                                        retry_after.map(|duration| duration.as_secs())
-                                    }
-                                    _ => None,
-                                },
-                            ));
-                        }
+                    let _ = body_text;
+                    if attempt < self.max_retries {
+                        last_key = Some(permit.key().to_string());
+                        drop(permit);
+                        tokio::time::sleep(
+                            retry_after
+                                .unwrap_or_else(|| get_retry_backoff(attempt as u32, 500, 60_000)),
+                        )
+                        .await;
+                        continue;
                     }
+                    return Err(RotatorError::RateLimited(
+                        provider.to_string(),
+                        retry_after.map(|duration| duration.as_secs()),
+                    ));
                 }
                 Ok(resp) if resp.status().is_server_error() => {
                     let status = resp.status();
@@ -451,21 +409,17 @@ impl RotatorClient {
                         }
                     }
                 }
-                Ok(resp)
-                    if matches!(resp.status().as_u16(), 401 | 403 | 412 | 422 | 451)
-                        && self.max_retries > 0 =>
-                {
-                    // 401/403/412/422/451: provider rejects this credential/account
-                    // (auth, billing, quota, model access, region). Rotate to another
-                    // key (parity with Python authentication/forbidden rotation). On
-                    // exhaustion, return the original upstream response to the client.
+                Ok(resp) if matches!(resp.status().as_u16(), 401 | 403) && self.max_retries > 0 => {
+                    // 401/403: current credential is invalid/forbidden. Rotate to
+                    // another key (parity with Python authentication/forbidden rotation)
+                    // and cool down the offending key. On exhaustion, return the original
+                    // upstream response to the client.
                     let status = resp.status();
                     let version = resp.version();
                     let headers = resp.headers().clone();
                     let body_text = resp.text().await.unwrap_or_default();
                     let failure = classify_upstream_failure(status, &headers, Some(&body_text));
-                    let key_prefix =
-                        crate::transaction_log::credential_hash_prefix(permit.key());
+                    let key_prefix = crate::transaction_log::credential_hash_prefix(permit.key());
                     if let Some(ref ej) = self.error_journal {
                         ej.record_error(
                             provider,
@@ -517,21 +471,60 @@ impl RotatorClient {
                         }
                     }
                 }
+                Ok(resp) if matches!(resp.status().as_u16(), 412 | 422 | 451) => {
+                    // 412/422/451: provider rejects the *request* (model access, billing
+                    // state, region). These are NOT credential-specific in practice — every
+                    // key gets the same 412 for the same request. Rotating through the whole
+                    // pool and cooling every key down (then tripping the provider circuit)
+                    // turned a single bad model into a 502 storm. Instead: try at most 3
+                    // distinct keys without cooldown/journal/breaker, then surface the
+                    // upstream response to the client as-is so the caller sees the real error.
+                    let status = resp.status();
+                    let version = resp.version();
+                    let headers = resp.headers().clone();
+                    let body_text = resp.text().await.unwrap_or_default();
+                    let key_prefix = crate::transaction_log::credential_hash_prefix(permit.key());
+                    warn!(
+                        provider,
+                        attempt,
+                        status = %status,
+                        key = %key_prefix,
+                        tried = tried_412_keys.len(),
+                        "request-level upstream error (412/422/451)"
+                    );
+                    tried_412_keys.push(permit.key().to_string());
+                    if attempt < self.max_retries
+                        && tried_412_keys.len() < 3
+                        && tried_412_keys.len() < key_count
+                    {
+                        drop(permit);
+                        tokio::time::sleep(get_retry_backoff(attempt as u32, 200, 60_000)).await;
+                        continue;
+                    }
+                    let mut builder = http::Response::builder().status(status).version(version);
+                    *builder.headers_mut().expect("response builder is valid") = headers;
+                    return Ok(builder
+                        .body(bytes::Bytes::from(body_text))
+                        .expect("response body rebuild should not fail")
+                        .into());
+                }
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
-                    if e.is_timeout() {
-                        self.circuit_breakers.record_failure(provider);
-                        self.cooldown
-                            .add_cooldown(provider, permit.key(), Duration::from_secs(5));
-                    }
-                    if let Some(ref ej) = self.error_journal {
-                        ej.record_error(provider, ErrorClass::Network, None, e.to_string());
-                    }
+                    // Connection/timeout error: rotate to another key without
+                    // cooldown/journal/breaker — a network blip is not credential-
+                    // specific and must not burn the pool or open the circuit.
                     let sanitized = e.without_url();
-                    error!(provider, attempt, error = %sanitized, "request failed");
+                    warn!(
+                        provider,
+                        attempt,
+                        error = %sanitized,
+                        key = %crate::transaction_log::credential_hash_prefix(permit.key()),
+                        "connection error, rotating key"
+                    );
                     if attempt < self.max_retries {
+                        last_key = Some(permit.key().to_string());
                         drop(permit);
-                        tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 + 1))).await;
+                        tokio::time::sleep(get_retry_backoff(attempt as u32, 300, 60_000)).await;
                         continue;
                     }
                     return Err(RotatorError::Http(sanitized.to_string()));
@@ -556,6 +549,10 @@ impl RotatorClient {
         body: bytes::Bytes,
         content_type: &str,
     ) -> Result<reqwest::Response> {
+        let key_count = self.credentials.get_key_status(provider).len();
+        let mut last_key: Option<String> = None;
+        let mut tried_412_keys: Vec<String> = Vec::new();
+
         for attempt in 0..=self.max_retries {
             if !self.circuit_breakers.is_allowed(provider) {
                 return Err(RotatorError::CircuitOpen(provider.to_string()));
@@ -565,6 +562,8 @@ impl RotatorClient {
                 .credentials
                 .acquire_least_loaded_where(provider, |key| {
                     self.cooldown.is_available(provider, key)
+                        && (key_count <= 1 || Some(key) != last_key.as_deref())
+                        && !tried_412_keys.iter().any(|k| k.as_str() == key)
                 });
             let cred = match cred {
                 Some(cred) => cred,
@@ -626,78 +625,40 @@ impl RotatorClient {
                         .await;
                 }
                 Ok(resp) if resp.status().as_u16() == 429 => {
-                    let status = resp.status();
+                    // 429: rotate to another key without cooldown/journal/breaker.
                     let headers = resp.headers().clone();
                     let body_text = resp.text().await.unwrap_or_default();
-                    if let Some(ref arl) = self.adaptive_rate_limiter {
-                        arl.record_429(provider, permit.key());
-                    }
-                    let failure = classify_upstream_failure(status, &headers, Some(&body_text));
-                    if let Some(ref ej) = self.error_journal {
-                        ej.record_error(provider, ErrorClass::RateLimit, Some(429), &body_text);
-                    }
-                    self.ip_throttle
-                        .record_429(permit.key(), &body_text, provider);
-                    let assessment = self.ip_throttle.assess_throttle(permit.key(), provider);
-                    let mut decision = decide_retry_for_provider(
-                        failure.clone(),
-                        attempt as u32,
-                        self.max_retries as u32,
-                        Some(provider),
-                        self.error_journal.as_deref(),
-                    );
-                    if assessment == ThrottleAssessment::Throttled {
-                        decision = RetryDecision::CooldownProvider {
-                            duration: get_retry_backoff(attempt as u32, 1_000, 60_000),
-                        };
-                    }
+                    let retry_after = headers
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|raw| {
+                            raw.parse::<u64>()
+                                .map(Duration::from_secs)
+                                .ok()
+                                .or_else(|| raw.parse::<f64>().ok().map(Duration::from_secs_f64))
+                        });
                     warn!(
                         provider,
                         attempt,
-                        ?failure,
-                        ?decision,
-                        ?assessment,
-                        "throttled, retrying..."
+                        key = %crate::transaction_log::credential_hash_prefix(permit.key()),
+                        ?retry_after,
+                        "429 throttled, rotating key"
                     );
-                    match decision {
-                        RetryDecision::CooldownKey { duration } => {
-                            self.cooldown.add_cooldown(provider, permit.key(), duration);
-                            drop(permit);
-                            tokio::time::sleep(duration).await;
-                            continue;
-                        }
-                        RetryDecision::CooldownProvider { duration } => {
-                            self.cooldown.add_provider_cooldown(provider, duration);
-                            drop(permit);
-                            tokio::time::sleep(duration).await;
-                            continue;
-                        }
-                        RetryDecision::RetrySameKey | RetryDecision::RotateKey => {
-                            drop(permit);
-                            tokio::time::sleep(get_retry_backoff(attempt as u32, 500, 60_000))
-                                .await;
-                            continue;
-                        }
-                        RetryDecision::OpenCircuit => {
-                            self.circuit_breakers.record_failure(provider);
-                            return Err(RotatorError::CircuitOpen(provider.to_string()));
-                        }
-                        RetryDecision::GiveUp => {
-                            self.circuit_breakers.record_failure(provider);
-                            return Err(RotatorError::CircuitOpen(provider.to_string()));
-                        }
-                        RetryDecision::Abort => {
-                            return Err(RotatorError::RateLimited(
-                                provider.to_string(),
-                                match failure {
-                                    FailureClass::RateLimit { retry_after, .. } => {
-                                        retry_after.map(|duration| duration.as_secs())
-                                    }
-                                    _ => None,
-                                },
-                            ));
-                        }
+                    let _ = body_text;
+                    if attempt < self.max_retries {
+                        last_key = Some(permit.key().to_string());
+                        drop(permit);
+                        tokio::time::sleep(
+                            retry_after
+                                .unwrap_or_else(|| get_retry_backoff(attempt as u32, 500, 60_000)),
+                        )
+                        .await;
+                        continue;
                     }
+                    return Err(RotatorError::RateLimited(
+                        provider.to_string(),
+                        retry_after.map(|duration| duration.as_secs()),
+                    ));
                 }
                 Ok(resp) if resp.status().is_server_error() => {
                     let status = resp.status();
@@ -778,19 +739,15 @@ impl RotatorClient {
                         }
                     }
                 }
-                Ok(resp)
-                    if matches!(resp.status().as_u16(), 401 | 403 | 412 | 422 | 451)
-                        && self.max_retries > 0 =>
-                {
-                    // 401/403/412/422/451: provider rejects this credential/account.
-                    // Rotate to another key; on exhaustion return the upstream response.
+                Ok(resp) if matches!(resp.status().as_u16(), 401 | 403) && self.max_retries > 0 => {
+                    // 401/403: current credential is invalid/forbidden. Rotate to another
+                    // key and cool down the offending key; on exhaustion return upstream resp.
                     let status = resp.status();
                     let version = resp.version();
                     let headers = resp.headers().clone();
                     let body_text = resp.text().await.unwrap_or_default();
                     let failure = classify_upstream_failure(status, &headers, Some(&body_text));
-                    let key_prefix =
-                        crate::transaction_log::credential_hash_prefix(permit.key());
+                    let key_prefix = crate::transaction_log::credential_hash_prefix(permit.key());
                     if let Some(ref ej) = self.error_journal {
                         ej.record_error(
                             provider,
@@ -842,21 +799,56 @@ impl RotatorClient {
                         }
                     }
                 }
+                Ok(resp) if matches!(resp.status().as_u16(), 412 | 422 | 451) => {
+                    // 412/422/451: request-level rejection, not credential-specific.
+                    // Try at most 3 distinct keys without cooldown/journal/breaker,
+                    // then surface the upstream response to the client.
+                    let status = resp.status();
+                    let version = resp.version();
+                    let headers = resp.headers().clone();
+                    let body_text = resp.text().await.unwrap_or_default();
+                    let key_prefix = crate::transaction_log::credential_hash_prefix(permit.key());
+                    warn!(
+                        provider,
+                        attempt,
+                        status = %status,
+                        key = %key_prefix,
+                        tried = tried_412_keys.len(),
+                        "request-level upstream error (412/422/451)"
+                    );
+                    tried_412_keys.push(permit.key().to_string());
+                    if attempt < self.max_retries
+                        && tried_412_keys.len() < 3
+                        && tried_412_keys.len() < key_count
+                    {
+                        drop(permit);
+                        tokio::time::sleep(get_retry_backoff(attempt as u32, 200, 60_000)).await;
+                        continue;
+                    }
+                    let mut builder = http::Response::builder().status(status).version(version);
+                    *builder.headers_mut().expect("response builder is valid") = headers;
+                    return Ok(builder
+                        .body(bytes::Bytes::from(body_text))
+                        .expect("response body rebuild should not fail")
+                        .into());
+                }
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
-                    if e.is_timeout() {
-                        self.circuit_breakers.record_failure(provider);
-                        self.cooldown
-                            .add_cooldown(provider, permit.key(), Duration::from_secs(5));
-                    }
-                    if let Some(ref ej) = self.error_journal {
-                        ej.record_error(provider, ErrorClass::Network, None, e.to_string());
-                    }
+                    // Connection/timeout error: rotate to another key without
+                    // cooldown/journal/breaker — a network blip is not credential-
+                    // specific and must not burn the pool or open the circuit.
                     let sanitized = e.without_url();
-                    error!(provider, attempt, error = %sanitized, "request failed");
+                    warn!(
+                        provider,
+                        attempt,
+                        error = %sanitized,
+                        key = %crate::transaction_log::credential_hash_prefix(permit.key()),
+                        "connection error, rotating key"
+                    );
                     if attempt < self.max_retries {
+                        last_key = Some(permit.key().to_string());
                         drop(permit);
-                        tokio::time::sleep(Duration::from_millis(200 * (attempt as u64 + 1))).await;
+                        tokio::time::sleep(get_retry_backoff(attempt as u32, 300, 60_000)).await;
                         continue;
                     }
                     return Err(RotatorError::Http(sanitized.to_string()));

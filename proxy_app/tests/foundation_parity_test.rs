@@ -137,8 +137,7 @@ async fn foundation_parity_x_api_key_works_for_proxy_routes() {
     // `type=authentication_error`; upstream errors do not.
     let (status, body) = response_json(response).await;
     assert_ne!(
-        body["error"]["type"],
-        "authentication_error",
+        body["error"]["type"], "authentication_error",
         "proxy auth middleware rejected a valid x-api-key (status={status})"
     );
 }

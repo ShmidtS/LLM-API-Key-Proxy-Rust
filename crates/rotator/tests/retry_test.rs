@@ -221,7 +221,13 @@ async fn rotates_key_on_quota_exhausted() {
     let keys_seen = server.keys_seen.lock().await;
     assert_eq!(keys_seen.len(), 2);
     assert_ne!(keys_seen[0], keys_seen[1]);
-    assert!(!cooldown.is_available("test", "key-1"));
+    // 429 rotation must NOT cool down the key — a throttle follows the
+    // credential's quota and clears on its own; burning keys into cooldown (and
+    // then into a provider circuit) turned a transient 429 into a 502 storm.
+    assert!(
+        cooldown.is_available("test", "key-1"),
+        "429 must not cool down the key, just rotate"
+    );
 }
 
 #[tokio::test]
@@ -304,9 +310,11 @@ async fn rotates_key_on_401_auth_error() {
 
 #[tokio::test]
 async fn rotates_key_on_412_precondition_failed() {
-    // 412 (Precondition Failed) is a key/account-specific rejection (billing,
-    // quota, model access). The proxy must rotate to another credential instead
-    // of aborting, and cool down the offending key.
+    // 412 (Precondition Failed) is a request-level rejection (model access,
+    // billing state, region), not credential-specific — every key gets the same
+    // 412 for the same request. The proxy rotates to up to 3 distinct keys
+    // WITHOUT cooling them down or tripping the circuit, then surfaces the
+    // upstream response if none succeed. Here the second key succeeds.
     let server = test_provider(vec![MockResponse::new(412), MockResponse::new(200)]).await;
     let cooldown = Arc::new(CooldownManager::new());
     let client = test_client(
@@ -323,9 +331,11 @@ async fn rotates_key_on_412_precondition_failed() {
     let keys_seen = server.keys_seen.lock().await;
     assert_eq!(keys_seen.len(), 2);
     assert_ne!(keys_seen[0], keys_seen[1]);
+    // 412 rotation must NOT burn the offending key into cooldown — otherwise a
+    // provider-wide 412 exhausts the whole pool and trips the circuit (502 storm).
     assert!(
-        !cooldown.is_available("test", "key-1"),
-        "offending key must be cooled down"
+        cooldown.is_available("test", "key-1"),
+        "412 must not cool down the key (request-level, not credential-specific)"
     );
 }
 

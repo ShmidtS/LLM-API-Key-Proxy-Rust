@@ -10,7 +10,6 @@ pub mod error;
 pub mod error_journal;
 pub mod garbage_detection;
 pub mod http_pool;
-pub mod ip_throttle;
 pub mod metrics;
 pub mod model_filter;
 pub mod model_info;
@@ -43,7 +42,6 @@ pub use error_journal::{
     ErrorClass, ErrorEntry, ErrorJournal, classify_reqwest_error, classify_status_code,
 };
 pub use http_pool::HttpClientPool;
-pub use ip_throttle::{IPThrottleDetector, ThrottleAssessment};
 pub use metrics::ProxyMetrics;
 pub use model_filter::{ModelFilterEngine, ModelFilterRule, ModelFilterStatus};
 pub use model_info::{ModelInfoService, ModelMetadata};
