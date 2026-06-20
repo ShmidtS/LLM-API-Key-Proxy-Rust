@@ -303,6 +303,33 @@ async fn rotates_key_on_401_auth_error() {
 }
 
 #[tokio::test]
+async fn rotates_key_on_412_precondition_failed() {
+    // 412 (Precondition Failed) is a key/account-specific rejection (billing,
+    // quota, model access). The proxy must rotate to another credential instead
+    // of aborting, and cool down the offending key.
+    let server = test_provider(vec![MockResponse::new(412), MockResponse::new(200)]).await;
+    let cooldown = Arc::new(CooldownManager::new());
+    let client = test_client(
+        Arc::clone(&server.registry),
+        Arc::clone(&cooldown),
+        vec!["key-1", "key-2"],
+        1,
+    );
+
+    let response = send_request(&client).await.unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    let keys_seen = server.keys_seen.lock().await;
+    assert_eq!(keys_seen.len(), 2);
+    assert_ne!(keys_seen[0], keys_seen[1]);
+    assert!(
+        !cooldown.is_available("test", "key-1"),
+        "offending key must be cooled down"
+    );
+}
+
+#[tokio::test]
 async fn auth_error_exhausts_keys_then_stops_retrying() {
     let server = test_provider(vec![MockResponse::new(403)]).await;
     let client = test_client(

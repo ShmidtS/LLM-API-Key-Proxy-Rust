@@ -157,10 +157,12 @@ async fn models_route_returns_static_models_when_upstream_fails() {
 
 #[tokio::test]
 async fn models_route_returns_static_models_when_upstream_times_out() {
+    // Delay exceeds PROVIDER_MODEL_TIMEOUT (15s) so the slow upstream times out
+    // and the route falls back to static models.
     let (slow_openai_url, _) = delayed_model_server(
         StatusCode::OK,
         r#"{"data":[{"id":"slow-live-model"}]}"#,
-        Duration::from_secs(6),
+        Duration::from_secs(16),
     )
     .await;
     let (gemini_url, _) = model_server(
@@ -182,7 +184,7 @@ async fn models_route_returns_static_models_when_upstream_times_out() {
         .map(|model| model["id"].as_str().unwrap())
         .collect();
 
-    assert!(started.elapsed() < Duration::from_secs(20));
+    assert!(started.elapsed() < Duration::from_secs(30));
     assert!(ids.contains(&"openai/gpt-4o"));
     assert!(ids.contains(&"gemini/models/gemini-live"));
     assert!(!ids.contains(&"openai/slow-live-model"));

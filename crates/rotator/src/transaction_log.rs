@@ -97,7 +97,7 @@ fn gxhash64(data: &[u8], seed: u64) -> u64 {
 }
 
 // Helper to get a redacted hash prefix (first 4 chars of the sha256 hex).
-fn credential_hash_prefix(key: &str) -> String {
+pub fn credential_hash_prefix(key: &str) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(key.as_bytes());
     let hex = format!("{:x}", hash);

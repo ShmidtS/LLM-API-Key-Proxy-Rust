@@ -301,6 +301,14 @@ pub fn classify_upstream_failure(
         return FailureClass::AuthError;
     }
 
+    // 412 Precondition Failed, 422 Unprocessable Entity, 451 Unavailable For Legal
+    // Reasons: provider rejects this credential/account (billing, quota, model access,
+    // region). These are key-specific — rotating to another credential may succeed, so
+    // treat them like an auth error rather than a fatal client error that aborts.
+    if matches!(status.as_u16(), 412 | 422 | 451) {
+        return FailureClass::AuthError;
+    }
+
     if status.is_client_error() {
         return FailureClass::Fatal;
     }
@@ -548,5 +556,21 @@ mod tests {
             None,
         );
         assert!(matches!(decision, RetryDecision::CooldownProvider { .. }));
+    }
+
+    #[test]
+    fn classifies_412_422_451_as_key_specific_auth_error() {
+        let headers = HeaderMap::new();
+        for status in [412u16, 422, 451] {
+            let failure = classify_upstream_failure(
+                StatusCode::from_u16(status).unwrap(),
+                &headers,
+                Some("{}"),
+            );
+            assert!(
+                matches!(failure, FailureClass::AuthError),
+                "status {status} should classify as AuthError (key-specific, rotates)"
+            );
+        }
     }
 }

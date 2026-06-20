@@ -74,5 +74,5 @@ pub use rate_limiter::{
 pub use request_sanitizer::{SanitizerAction, SanitizerContext, SanitizerRule, sanitize_request};
 pub use throttle::{ThrottleReason, classify_throttle};
 pub use token_calculator::{TokenCalculator, calculate_max_tokens};
-pub use transaction_log::{TokenUsage, TransactionLog, TransactionLogger};
+pub use transaction_log::{TokenUsage, TransactionLog, TransactionLogger, credential_hash_prefix};
 pub use usage::{UsageEntry, UsageManager};

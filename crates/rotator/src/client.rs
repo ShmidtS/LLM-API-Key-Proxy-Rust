@@ -451,15 +451,21 @@ impl RotatorClient {
                         }
                     }
                 }
-                Ok(resp) if matches!(resp.status().as_u16(), 401 | 403) && self.max_retries > 0 => {
-                    // 401/403: текущий ключ невалиден/запрещён. Ротируем на другой ключ
-                    // (паритет с Python authentication/forbidden rotation). При исчерпании
-                    // попыток возвращаем исходный ответ upstream клиенту.
+                Ok(resp)
+                    if matches!(resp.status().as_u16(), 401 | 403 | 412 | 422 | 451)
+                        && self.max_retries > 0 =>
+                {
+                    // 401/403/412/422/451: provider rejects this credential/account
+                    // (auth, billing, quota, model access, region). Rotate to another
+                    // key (parity with Python authentication/forbidden rotation). On
+                    // exhaustion, return the original upstream response to the client.
                     let status = resp.status();
                     let version = resp.version();
                     let headers = resp.headers().clone();
                     let body_text = resp.text().await.unwrap_or_default();
                     let failure = classify_upstream_failure(status, &headers, Some(&body_text));
+                    let key_prefix =
+                        crate::transaction_log::credential_hash_prefix(permit.key());
                     if let Some(ref ej) = self.error_journal {
                         ej.record_error(
                             provider,
@@ -475,7 +481,15 @@ impl RotatorClient {
                         Some(provider),
                         self.error_journal.as_deref(),
                     );
-                    warn!(provider, attempt, status = %status, ?failure, ?decision, "auth error, rotating key...");
+                    warn!(
+                        provider,
+                        attempt,
+                        status = %status,
+                        key = %key_prefix,
+                        ?failure,
+                        ?decision,
+                        "key-specific upstream error, rotating key..."
+                    );
                     match decision {
                         RetryDecision::RotateKey => {
                             self.cooldown.add_cooldown(
@@ -754,6 +768,70 @@ impl RotatorClient {
                                 permit.key(),
                                 Duration::from_secs(5),
                             );
+                            let mut builder =
+                                http::Response::builder().status(status).version(version);
+                            *builder.headers_mut().expect("response builder is valid") = headers;
+                            return Ok(builder
+                                .body(bytes::Bytes::from(body_text))
+                                .expect("response body rebuild should not fail")
+                                .into());
+                        }
+                    }
+                }
+                Ok(resp)
+                    if matches!(resp.status().as_u16(), 401 | 403 | 412 | 422 | 451)
+                        && self.max_retries > 0 =>
+                {
+                    // 401/403/412/422/451: provider rejects this credential/account.
+                    // Rotate to another key; on exhaustion return the upstream response.
+                    let status = resp.status();
+                    let version = resp.version();
+                    let headers = resp.headers().clone();
+                    let body_text = resp.text().await.unwrap_or_default();
+                    let failure = classify_upstream_failure(status, &headers, Some(&body_text));
+                    let key_prefix =
+                        crate::transaction_log::credential_hash_prefix(permit.key());
+                    if let Some(ref ej) = self.error_journal {
+                        ej.record_error(
+                            provider,
+                            ErrorClass::Auth,
+                            Some(status.as_u16()),
+                            &body_text,
+                        );
+                    }
+                    let decision = decide_retry_for_provider(
+                        failure.clone(),
+                        attempt as u32,
+                        self.max_retries as u32,
+                        Some(provider),
+                        self.error_journal.as_deref(),
+                    );
+                    warn!(
+                        provider,
+                        attempt,
+                        status = %status,
+                        key = %key_prefix,
+                        ?failure,
+                        ?decision,
+                        "key-specific upstream error, rotating key..."
+                    );
+                    match decision {
+                        RetryDecision::RotateKey => {
+                            self.cooldown.add_cooldown(
+                                provider,
+                                permit.key(),
+                                Duration::from_secs(5),
+                            );
+                            drop(permit);
+                            tokio::time::sleep(get_retry_backoff(attempt as u32, 300, 60_000))
+                                .await;
+                            continue;
+                        }
+                        RetryDecision::GiveUp => {
+                            self.circuit_breakers.record_failure(provider);
+                            return Err(RotatorError::CircuitOpen(provider.to_string()));
+                        }
+                        _ => {
                             let mut builder =
                                 http::Response::builder().status(status).version(version);
                             *builder.headers_mut().expect("response builder is valid") = headers;
