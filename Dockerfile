@@ -30,7 +30,9 @@ RUN mkdir -p proxy_app/src crates/config/src crates/models/src crates/rotator/sr
 COPY proxy_app ./proxy_app
 COPY crates ./crates
 
-RUN cargo build --release -p proxy_app
+RUN find proxy_app crates -name '*.rs' -exec touch {} + \
+    && rm -f target/release/proxy_app target/release/deps/proxy_app-* \
+    && cargo build --release -p proxy_app
 
 FROM debian:bookworm-slim AS runtime
 
@@ -43,9 +45,9 @@ RUN apt-get update \
 
 COPY --from=builder /app/target/release/proxy_app /proxy_app
 
-EXPOSE 8000
+EXPOSE 8998
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8000/ || exit 1
+    CMD curl -fsS http://127.0.0.1:8998/ || exit 1
 
 ENTRYPOINT ["/proxy_app"]
