@@ -727,7 +727,11 @@ fn default_provider_definitions() -> Vec<ProviderDefinition> {
             "openrouter",
             "https://openrouter.ai/api/v1",
             AuthType::Bearer,
-            &[r"^openrouter/.*"],
+            // OpenRouter hosts models under publisher namespaces (e.g. `google/`,
+            // `meta-llama/`) that have no native provider in this proxy. Routing
+            // bare `google/*` IDs to OpenRouter directly — instead of falling
+            // through to the openai default — lets users address them as-is.
+            &[r"^openrouter/.*", r"^google/.*"],
             60,
             &[],
         ),
