@@ -23,6 +23,7 @@ pub mod providers;
 pub mod rate_limiter;
 pub mod request_sanitizer;
 pub mod retry_policy;
+pub mod stale_retry;
 pub mod throttle;
 pub mod token_calculator;
 pub mod tokenizer;
@@ -35,7 +36,8 @@ pub use client::RotatorClient;
 pub use cooldown::{CooldownEntry, CooldownManager};
 pub use costs::estimate_cost;
 pub use credential_store::{export_credentials, import_credentials};
-pub use credentials::{CredentialManager, CredentialPermit};
+pub use credentials::{CredentialManager, CredentialPermit, SelectionStrategy};
+pub use stale_retry::is_stale_connection_error;
 pub use dynamic_provider::{DynamicProviderConfig, DynamicProviderEnvNames};
 pub use error::{Result, RotatorError};
 pub use error_journal::{

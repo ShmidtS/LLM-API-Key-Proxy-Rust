@@ -65,7 +65,8 @@ Provider registry поддерживает 20+ providers, включая `openai
 
 ## Provider behavior
 
-- Credential rotation выбирает наименее загруженный key через `acquire_least_loaded` и CAS loop.
+- Credential rotation выбирает наименее загруженный key через `acquire_least_loaded` и CAS loop. Стратегия выбора key конфигурируется через `PROXY_SELECTION_STRATEGY` (`least-loaded` по умолчанию, либо `round-robin` / `weighted-random`) — вдохновлено bifrost `core/keyselectors`.
+- Stale/dead pooled-connection retry: transport-ошибки до коммита upstream (dead keep-alive conn, connect failure, reset/broken pipe) прозрачно повторяются тем же key до `PROXY_MAX_STALE_CONNECTION_RETRIES` раз перед ротацией — вдохновлено bifrost `StaleConnectionRetryIfErr`.
 - Token bucket rate limiter работает per key.
 - Cooldown manager временно исключает проблемные credentials.
 - Circuit breaker поддерживает состояния `closed`, `open`, `half-open`.

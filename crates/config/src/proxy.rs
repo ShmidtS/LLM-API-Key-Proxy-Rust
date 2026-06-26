@@ -208,6 +208,10 @@ pub struct ProxyConfig {
     pub connect_timeout_secs: u64,
     #[serde(default, deserialize_with = "deserialize_optional_string")]
     pub http_dns_resolver: Option<String>,
+    #[serde(default = "default_max_stale_connection_retries")]
+    pub max_stale_connection_retries: u32,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    pub selection_strategy: Option<String>,
     #[serde(default)]
     pub guardrails: GuardrailsProxyConfig,
     #[serde(default)]
@@ -253,6 +257,8 @@ impl Default for ProxyConfig {
             http2_enabled: default_http2_enabled(),
             connect_timeout_secs: default_connect_timeout_secs(),
             http_dns_resolver: default_http_dns_resolver(),
+            max_stale_connection_retries: default_max_stale_connection_retries(),
+            selection_strategy: None,
             guardrails: GuardrailsProxyConfig::default(),
             adaptive_rate_limiter: AdaptiveRateLimiterConfig::default(),
             image_only_models: None,
@@ -366,6 +372,9 @@ fn default_connect_timeout_secs() -> u64 {
 fn default_http_dns_resolver() -> Option<String> {
     None
 }
+fn default_max_stale_connection_retries() -> u32 {
+    3
+}
 
 #[cfg(test)]
 mod tests {
@@ -409,6 +418,8 @@ mod tests {
             config.guardrails.context_compaction.compact_above_ratio,
             0.0
         );
+        assert_eq!(config.max_stale_connection_retries, 3);
+        assert_eq!(config.selection_strategy, None);
     }
 
     #[test]

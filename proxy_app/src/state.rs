@@ -3,7 +3,7 @@ use proxy_config::ProxyConfig;
 use rotator::{
     AdaptiveRateLimiterRegistry, CircuitBreakerRegistry, CooldownManager, CredentialManager,
     EmbeddingBatcher, ErrorJournal, HttpClientPool, ModelInfoService, ProviderRegistry,
-    RateLimiterRegistry, RotatorClient, UsageManager,
+    RateLimiterRegistry, RotatorClient, SelectionStrategy, UsageManager,
 };
 use std::{
     collections::HashMap,
@@ -39,6 +39,14 @@ impl AppState {
 
     pub fn from_config(cfg: ProxyConfig) -> Self {
         let creds = CredentialManager::from_env();
+        if let Some(raw) = cfg.selection_strategy.as_deref()
+            && let Some(strategy) = SelectionStrategy::parse(raw)
+        {
+            tracing::info!(strategy = raw, "applying default credential selection strategy");
+            creds.set_default_strategy(strategy);
+        } else if let Some(raw) = cfg.selection_strategy.as_deref() {
+            tracing::warn!(value = raw, "ignoring unrecognized PROXY_SELECTION_STRATEGY");
+        }
         let pool = HttpClientPool::with_timeouts(
             cfg.timeout_read_non_streaming_secs,
             cfg.timeout_read_streaming_secs,
@@ -68,7 +76,8 @@ impl AppState {
             Some(usage_manager),
             cfg.max_retries,
         )
-        .with_error_journal(error_journal);
+        .with_error_journal(error_journal)
+        .with_max_stale_retries(cfg.max_stale_connection_retries);
         if cfg.adaptive_rate_limiter.enabled {
             let adaptive_rate_limiter = Arc::new(AdaptiveRateLimiterRegistry::new());
             client = client.with_adaptive_rate_limiter(adaptive_rate_limiter);
