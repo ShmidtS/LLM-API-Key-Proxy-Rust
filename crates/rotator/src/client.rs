@@ -29,6 +29,12 @@ fn oauth_cache_key(provider: &str, key: &str) -> String {
     format!("{}:{}", provider, hasher.finish())
 }
 
+/// Default same-key retries on stale/dead pooled connections. Matches bifrost's
+/// `maxStaleConnRetries` (core/network/http.go): lets a request walk past a few
+/// dead keep-alive connections to a live one while staying well under the pool's
+/// internal attempt cap.
+const DEFAULT_MAX_STALE_RETRIES: u32 = 3;
+
 #[derive(Debug, Clone)]
 pub struct RotatorClient {
     pub credentials: Arc<CredentialManager>,
@@ -40,6 +46,10 @@ pub struct RotatorClient {
     usage_manager: Option<Arc<UsageManager>>,
     last_latency_ms: Arc<DashMap<String, u64>>,
     max_retries: usize,
+    /// Extra same-key attempts on stale/dead pooled connections before falling
+    /// back to credential rotation. Mirrors bifrost's `maxStaleConnRetries`
+    /// (default 3). See `stale_retry::is_stale_connection_error`.
+    max_stale_retries: u32,
     oauth_manager: Arc<OAuthManager>,
     oauth_refresh_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     adaptive_rate_limiter: Option<Arc<AdaptiveRateLimiterRegistry>>,
@@ -70,6 +80,7 @@ impl RotatorClient {
             usage_manager,
             last_latency_ms: Arc::new(DashMap::new()),
             max_retries,
+            max_stale_retries: DEFAULT_MAX_STALE_RETRIES,
             oauth_manager: Arc::new(OAuthManager::new()),
             oauth_refresh_locks: Arc::new(DashMap::new()),
             adaptive_rate_limiter: None,
@@ -92,6 +103,13 @@ impl RotatorClient {
         self
     }
 
+    /// Override the number of same-key retries performed on stale/dead pooled
+    /// connections before falling back to credential rotation.
+    pub fn with_max_stale_retries(mut self, max_stale_retries: u32) -> Self {
+        self.max_stale_retries = max_stale_retries;
+        self
+    }
+
     pub fn error_journal(&self) -> Option<Arc<ErrorJournal>> {
         self.error_journal.clone()
     }
@@ -102,6 +120,55 @@ impl RotatorClient {
 
     pub fn metrics(&self) -> Arc<crate::metrics::ProxyMetrics> {
         self.metrics.clone()
+    }
+
+    /// Dispatch a POST, transparently retrying on stale/dead pooled-connection
+    /// errors using the SAME credential — no rotation, no cooldown, no circuit
+    /// update. Mirrors bifrost's `StaleConnectionRetryIfErr`: a dead pooled
+    /// connection is not credential-specific, and these errors occur before the
+    /// upstream commits the request, so re-issuing the POST is safe (no
+    /// duplicate inference). Only persistent transport errors propagate to the
+    /// caller, which then rotates keys exactly as before.
+    async fn dispatch_with_stale_retry(
+        &self,
+        provider: &str,
+        client: &reqwest::Client,
+        url: &str,
+        token: &str,
+        body: bytes::Bytes,
+        content_type: &str,
+    ) -> std::result::Result<reqwest::Response, reqwest::Error> {
+        let mut stale_attempt: u32 = 0;
+        loop {
+            let request = self
+                .apply_auth_headers(provider, client.post(url), token)
+                .header(reqwest::header::CONTENT_TYPE, content_type)
+                .body(reqwest::Body::from(body.clone()));
+            match request.send().await {
+                Ok(resp) => return Ok(resp),
+                Err(err) => {
+                    // Retry only while budget remains AND the failure is a
+                    // pre-commit stale/dead connection (never a read timeout).
+                    if stale_attempt < self.max_stale_retries
+                        && crate::stale_retry::is_stale_connection_error(&err)
+                    {
+                        // Log only safe kind flags — reqwest's Display can embed
+                        // the request URL, so we avoid `%err` here. The final
+                        // persistent error is logged (URL-stripped) by the caller.
+                        tracing::debug!(
+                            provider,
+                            stale_attempt,
+                            connect = err.is_connect(),
+                            timeout = err.is_timeout(),
+                            "stale/dead pooled connection, retrying same key"
+                        );
+                        stale_attempt += 1;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
     }
 
     pub async fn request(
@@ -162,7 +229,7 @@ impl RotatorClient {
 
             let cred = self
                 .credentials
-                .acquire_least_loaded_where(provider, |key| {
+                .acquire_where(provider, |key| {
                     self.cooldown.is_available(provider, key)
                         && (key_count <= 1 || Some(key) != last_key.as_deref())
                         && !tried_412_keys.iter().any(|k| k.as_str() == key)
@@ -223,13 +290,17 @@ impl RotatorClient {
                 self.http_pool.get_or_create(provider)
             };
             let token = self.resolve_auth_token(provider, permit.key()).await?;
-            let request = self.apply_auth_headers(provider, client.post(&url), &token);
             let dispatch_started = Instant::now();
             let started_at = dispatch_started;
-            let result = request
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(reqwest::Body::from(body_bytes.clone()))
-                .send()
+            let result = self
+                .dispatch_with_stale_retry(
+                    provider,
+                    &client,
+                    &url,
+                    &token,
+                    body_bytes.clone(),
+                    "application/json",
+                )
                 .await;
             let dispatch_latency_ms = dispatch_started.elapsed().as_millis() as u64;
             self.metrics
@@ -615,7 +686,7 @@ impl RotatorClient {
 
             let cred = self
                 .credentials
-                .acquire_least_loaded_where(provider, |key| {
+                .acquire_where(provider, |key| {
                     self.cooldown.is_available(provider, key)
                         && (key_count <= 1 || Some(key) != last_key.as_deref())
                         && !tried_412_keys.iter().any(|k| k.as_str() == key)
@@ -674,12 +745,9 @@ impl RotatorClient {
                 path.trim_start_matches('/')
             );
             let token = self.resolve_auth_token(provider, permit.key()).await?;
-            let request = self.apply_auth_headers(provider, client.post(&url), &token);
             let started_at = Instant::now();
-            let result = request
-                .header(reqwest::header::CONTENT_TYPE, content_type)
-                .body(reqwest::Body::from(body.clone()))
-                .send()
+            let result = self
+                .dispatch_with_stale_retry(provider, &client, &url, &token, body.clone(), content_type)
                 .await;
             self.last_latency_ms
                 .insert(provider.to_owned(), started_at.elapsed().as_millis() as u64);
@@ -1522,6 +1590,83 @@ mod tests {
             captured_header.lock().unwrap().as_deref(),
             Some("key-1"),
             "gemini key must be sent via x-goog-api-key header"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_recovers_from_dead_pooled_connection_via_stale_retry() {
+        // Outer retries are disabled (max_retries = 0). The upstream drops the
+        // first two connections without sending an HTTP response — the same
+        // signature as a dead keep-alive connection pulled from the pool. Only
+        // the inner same-key stale-connection retry can recover this; without
+        // it the request would fail immediately (transport error, no outer
+        // retry budget).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let server_accepts = accepts.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let n = server_accepts.fetch_add(1, Ordering::SeqCst);
+                let mut buffer = [0; 4096];
+                let _ = socket.read(&mut buffer).await;
+                if n < 2 {
+                    // Dead connection: close before returning any HTTP response.
+                    continue;
+                }
+                let body = r#"{"choices":[]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let registry = Arc::new(ProviderRegistry::default());
+        registry.register(ProviderDefinition {
+            id: "test".to_string(),
+            display_name: "test".to_string(),
+            base_url: format!("http://{addr}/v1"),
+            auth_type: AuthType::ApiKey,
+            model_patterns: Vec::new(),
+            compiled_patterns: Vec::new(),
+            endpoints: vec!["/chat/completions".to_string()],
+            features: vec!["chat".to_string()],
+            model_count: 1,
+            timeout_secs: 60,
+            default_headers: HashMap::new(),
+            token_endpoint: None,
+            client_id: None,
+            client_secret: None,
+        });
+        let credentials = CredentialManager::new();
+        credentials.register_keys("test".to_string(), vec!["key-1".to_string()], 1);
+        let client = RotatorClient::new(
+            credentials,
+            HttpClientPool::new(30),
+            registry,
+            Arc::new(RateLimiterRegistry::new()),
+            Arc::new(CooldownManager::new()),
+            Arc::new(CircuitBreakerRegistry::new()),
+            None,
+            0, // max_retries = 0: only the inner stale retry can recover
+        )
+        .with_max_stale_retries(3);
+
+        let response = client
+            .request("test", "chat/completions", serde_json::json!({}))
+            .await
+            .expect("stale-connection retry should recover the request");
+        assert_eq!(response.status(), 200);
+        // Two dropped connections were transparently retried before success.
+        assert!(
+            accepts.load(Ordering::SeqCst) >= 3,
+            "expected at least 3 upstream connections (2 stale + 1 success)"
         );
     }
 

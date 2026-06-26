@@ -1,5 +1,6 @@
 use crate::error::{Result, RotatorError};
 use dashmap::DashMap;
+use rand::Rng;
 use regex::Regex;
 use std::collections::HashMap;
 use std::path::Path;
@@ -14,10 +15,42 @@ pub struct CredentialEntry {
     pub current_requests: Arc<AtomicUsize>,
 }
 
+/// Strategy for choosing a credential among several eligible keys for a
+/// provider. Mirrors bifrost's `core/keyselectors`: least-loaded balances by
+/// in-flight concurrency (the long-standing default), round-robin spreads
+/// requests evenly in registration order, and weighted-random picks uniformly
+/// at random (the zero-weight fallback of bifrost's `WeightedRandom`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectionStrategy {
+    #[default]
+    LeastLoaded,
+    RoundRobin,
+    WeightedRandom,
+}
+
+impl SelectionStrategy {
+    /// Parse a human-friendly strategy name (case-insensitive, accepts `-`/`_`).
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "least-loaded" | "least_loaded" | "leastloaded" | "least" => Some(Self::LeastLoaded),
+            "round-robin" | "round_robin" | "roundrobin" | "round" => Some(Self::RoundRobin),
+            "weighted-random" | "weighted_random" | "weightedrandom" | "weighted" | "random" => {
+                Some(Self::WeightedRandom)
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CredentialManager {
     pub credentials: Arc<DashMap<String, Vec<CredentialEntry>>>,
     key_index: Arc<DashMap<String, DashMap<String, usize>>>,
+    /// Per-provider selection strategy. The empty-string key holds the
+    /// configured default applied to any provider without an explicit entry.
+    strategies: Arc<DashMap<String, SelectionStrategy>>,
+    /// Round-robin cursor per provider (monotonic; index derived via modulo).
+    rr_counters: Arc<DashMap<String, AtomicUsize>>,
 }
 
 #[derive(Debug)]
@@ -308,6 +341,120 @@ impl CredentialManager {
         }
     }
 
+    /// Effective strategy for `provider`: an explicit per-provider entry, else
+    /// the configured default (stored under the empty key), else LeastLoaded.
+    pub fn strategy(&self, provider: &str) -> SelectionStrategy {
+        if let Some(strategy) = self.strategies.get(provider) {
+            return *strategy.value();
+        }
+        if let Some(strategy) = self.strategies.get("") {
+            return *strategy.value();
+        }
+        SelectionStrategy::default()
+    }
+
+    /// Set the selection strategy for a single provider.
+    pub fn set_strategy(&self, provider: &str, strategy: SelectionStrategy) {
+        self.strategies.insert(provider.to_string(), strategy);
+    }
+
+    /// Set the default strategy applied to every provider without an explicit
+    /// override. Stored under the empty-string key so the field still derives
+    /// `Default` (DashMap-only storage, no extra field type).
+    pub fn set_default_strategy(&self, strategy: SelectionStrategy) {
+        self.strategies.insert(String::new(), strategy);
+    }
+
+    /// Strategy-aware acquisition with no extra predicate.
+    pub fn acquire(&self, provider: &str) -> Option<CredentialEntry> {
+        self.acquire_where(provider, |_| true)
+    }
+
+    /// Strategy-aware acquisition: dispatches to least-loaded / round-robin /
+    /// weighted-random based on the configured strategy, then applies
+    /// `is_available` (cooldown / last-key / request-level exclusions).
+    pub fn acquire_where<F>(&self, provider: &str, is_available: F) -> Option<CredentialEntry>
+    where
+        F: Fn(&str) -> bool,
+    {
+        match self.strategy(provider) {
+            SelectionStrategy::LeastLoaded => {
+                self.acquire_least_loaded_where(provider, is_available)
+            }
+            SelectionStrategy::RoundRobin => {
+                self.acquire_sequential_where(provider, &is_available, false)
+            }
+            SelectionStrategy::WeightedRandom => {
+                self.acquire_sequential_where(provider, &is_available, true)
+            }
+        }
+    }
+
+    /// Shared core for round-robin / weighted-random. Starts at a per-call
+    /// offset (monotonic counter for round-robin, random for weighted-random)
+    /// and scans forward (wrapping) for the first eligible key it can
+    /// CAS-acquire. A few sweeps absorb contention so a momentarily-contended
+    /// key is not mistaken for "all busy".
+    fn acquire_sequential_where<F>(
+        &self,
+        provider: &str,
+        is_available: &F,
+        random_start: bool,
+    ) -> Option<CredentialEntry>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let entries = self.credentials.get(provider)?;
+        let n = entries.len();
+        if n == 0 {
+            return None;
+        }
+        let start = if random_start {
+            rand::thread_rng().gen_range(0..n)
+        } else {
+            // Round-robin start hint, read from the per-provider cursor. The
+            // cursor is reduced modulo n immediately, so `start + offset < 2n`
+            // cannot overflow. It is advanced to the actually-acquired index
+            // below, keeping rotation balanced even when earlier keys were on
+            // cooldown or at capacity.
+            self.rr_counters
+                .entry(provider.to_string())
+                .or_default()
+                .load(Ordering::Relaxed)
+                % n
+        };
+
+        let sweeps = n.max(3);
+        for _ in 0..sweeps {
+            for offset in 0..n {
+                let idx = (start + offset) % n;
+                let entry = &entries[idx];
+                let current = entry.current_requests.load(Ordering::Acquire);
+                if current >= entry.concurrent_limit || !is_available(&entry.key) {
+                    continue;
+                }
+                if entry
+                    .current_requests
+                    .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    // Advance the cursor just past the key we actually acquired,
+                    // so rotation stays balanced when earlier keys were skipped.
+                    // Best-effort under concurrency (Relaxed); weighted-random
+                    // ignores the cursor entirely.
+                    if !random_start
+                        && let Some(cursor) = self.rr_counters.get(provider)
+                    {
+                        cursor.store((idx + 1) % n, Ordering::Relaxed);
+                    }
+                    return Some(entry.clone());
+                }
+                // Contended with another acquirer — try the next eligible key.
+            }
+        }
+        None
+    }
+
     pub fn increment(&self, provider: &str, key: &str) {
         if let Some(index_map) = self.key_index.get(provider)
             && let Some(index) = index_map.get(key)
@@ -395,6 +542,133 @@ mod tests {
         let selected = manager.get_least_loaded("openai").unwrap();
 
         assert_eq!(selected.key, "key-1");
+    }
+
+    #[test]
+    fn selection_strategy_parse_accepts_documented_aliases() {
+        assert_eq!(
+            SelectionStrategy::parse("least-loaded"),
+            Some(SelectionStrategy::LeastLoaded)
+        );
+        assert_eq!(
+            SelectionStrategy::parse("ROUND_ROBIN"),
+            Some(SelectionStrategy::RoundRobin)
+        );
+        assert_eq!(
+            SelectionStrategy::parse("weighted-random"),
+            Some(SelectionStrategy::WeightedRandom)
+        );
+        assert_eq!(SelectionStrategy::parse("random"), Some(SelectionStrategy::WeightedRandom));
+        assert_eq!(SelectionStrategy::parse("nope"), None);
+    }
+
+    #[test]
+    fn default_strategy_is_least_loaded() {
+        // With no strategy configured, acquire_where behaves exactly like the
+        // historical least-loaded path (no behavior change unless opted in).
+        let manager = CredentialManager::new();
+        manager.register_keys(
+            "openai".to_string(),
+            vec!["key-0".to_string(), "key-1".to_string()],
+            1,
+        );
+        assert_eq!(manager.strategy("openai"), SelectionStrategy::LeastLoaded);
+
+        manager.increment("openai", "key-0");
+        let selected = manager.acquire_where("openai", |_| true).unwrap();
+        assert_eq!(selected.key, "key-1");
+    }
+
+    #[test]
+    fn round_robin_cycles_through_keys_in_order() {
+        let manager = CredentialManager::new();
+        manager.register_keys(
+            "openai".to_string(),
+            vec!["key-0".to_string(), "key-1".to_string(), "key-2".to_string()],
+            50,
+        );
+        manager.set_default_strategy(SelectionStrategy::RoundRobin);
+
+        let a = manager.acquire_where("openai", |_| true).unwrap();
+        let b = manager.acquire_where("openai", |_| true).unwrap();
+        let c = manager.acquire_where("openai", |_| true).unwrap();
+        // Permits are held (not dropped), so the monotonic cursor advances 0..1..2.
+        assert_eq!(a.key, "key-0");
+        assert_eq!(b.key, "key-1");
+        assert_eq!(c.key, "key-2");
+    }
+
+    #[test]
+    fn round_robin_skips_excluded_keys_without_drift() {
+        // An earlier key is excluded (e.g. on cooldown). Round-robin must skip it
+        // and resume rotation just past the key it actually acquires, not drift
+        // toward the tail of the list.
+        let manager = CredentialManager::new();
+        manager.register_keys(
+            "openai".to_string(),
+            vec!["key-0".to_string(), "key-1".to_string(), "key-2".to_string()],
+            50,
+        );
+        manager.set_default_strategy(SelectionStrategy::RoundRobin);
+
+        let first = manager.acquire_where("openai", |k| k != "key-0").unwrap();
+        assert_eq!(first.key, "key-1");
+        manager.decrement("openai", &first.key);
+
+        let second = manager.acquire_where("openai", |k| k != "key-0").unwrap();
+        assert_eq!(second.key, "key-2");
+        manager.decrement("openai", &second.key);
+
+        // Wraps past the excluded key-0 back to key-1.
+        let third = manager.acquire_where("openai", |k| k != "key-0").unwrap();
+        assert_eq!(third.key, "key-1");
+    }
+
+    #[test]
+    fn weighted_random_only_returns_eligible_keys_and_covers_all() {
+        let manager = CredentialManager::new();
+        manager.register_keys(
+            "openai".to_string(),
+            vec!["key-0".to_string(), "key-1".to_string(), "key-2".to_string()],
+            50,
+        );
+        manager.set_default_strategy(SelectionStrategy::WeightedRandom);
+
+        // Exclude key-1 via the predicate; every acquisition must skip it.
+        // Release each permit so the concurrency counters don't saturate.
+        for _ in 0..50 {
+            let selected = manager
+                .acquire_where("openai", |k| k != "key-1")
+                .expect("an eligible key exists");
+            assert_ne!(selected.key, "key-1");
+            manager.decrement("openai", &selected.key);
+        }
+
+        // With no exclusions and enough samples, every key is reachable.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let key = manager.acquire_where("openai", |_| true).unwrap().key;
+            manager.decrement("openai", &key);
+            seen.insert(key);
+        }
+        assert!(seen.contains("key-0"));
+        assert!(seen.contains("key-1"));
+        assert!(seen.contains("key-2"));
+    }
+
+    #[test]
+    fn per_provider_strategy_overrides_default() {
+        let manager = CredentialManager::new();
+        manager.register_keys(
+            "openai".to_string(),
+            vec!["key-0".to_string(), "key-1".to_string()],
+            50,
+        );
+        manager.set_default_strategy(SelectionStrategy::RoundRobin);
+        manager.set_strategy("openai", SelectionStrategy::WeightedRandom);
+
+        assert_eq!(manager.strategy("openai"), SelectionStrategy::WeightedRandom);
+        assert_eq!(manager.strategy("anthropic"), SelectionStrategy::RoundRobin);
     }
 
     #[test]
