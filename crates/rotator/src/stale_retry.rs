@@ -130,6 +130,9 @@ mod tests {
             }
             current = e.source();
         }
-        assert!(found, "chain walker must surface inner stale-connection text");
+        assert!(
+            found,
+            "chain walker must surface inner stale-connection text"
+        );
     }
 }

@@ -124,6 +124,22 @@ pub async fn add_request_id(request: Request, next: Next) -> Response {
     response
 }
 
+pub async fn forward_user_agent(request: Request, next: Next) -> Response {
+    let ua = request
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    if ua.is_empty() {
+        next.run(request).await
+    } else {
+        rotator::FORWARDED_USER_AGENT
+            .scope(ua, next.run(request))
+            .await
+    }
+}
+
 pub async fn log_requests(
     State(app_state): State<AppState>,
     request: Request,

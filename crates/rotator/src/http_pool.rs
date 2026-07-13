@@ -9,8 +9,8 @@ pub const POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 pub const POOL_MAX_IDLE_PER_HOST: usize = 100;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
-/// User-Agent advertised to upstream providers, replacing reqwest's default.
-const USER_AGENT: &str = concat!("llm-proxy/", env!("CARGO_PKG_VERSION"));
+/// Default User-Agent used when no forwarded client User-Agent is available.
+const DEFAULT_USER_AGENT: &str = concat!("llm-proxy/", env!("CARGO_PKG_VERSION"));
 
 /// Thin wrapper around a `reqwest` client.
 #[derive(Debug, Clone)]
@@ -37,6 +37,7 @@ pub struct HttpClientPool {
     pool_idle_timeout: Duration,
     pool_max_idle_per_host: usize,
     http2_enabled: bool,
+    user_agent: Option<String>,
 }
 
 impl HttpClientPool {
@@ -53,7 +54,17 @@ impl HttpClientPool {
             pool_idle_timeout: Duration::from_secs(POOL_IDLE_TIMEOUT_SECS),
             pool_max_idle_per_host: POOL_MAX_IDLE_PER_HOST,
             http2_enabled: false,
+            user_agent: None,
         }
+    }
+
+    pub fn with_user_agent(mut self, user_agent: Option<String>) -> Self {
+        self.user_agent = user_agent;
+        self
+    }
+
+    pub fn has_custom_user_agent(&self) -> bool {
+        self.user_agent.is_some()
     }
 
     /// Override the per-client TCP connect timeout (default 10s).
@@ -87,8 +98,9 @@ impl HttpClientPool {
     }
 
     fn build_client(&self, timeout: Duration, is_streaming: bool) -> Client {
+        let ua = self.user_agent.as_deref().unwrap_or(DEFAULT_USER_AGENT);
         let mut builder = ClientBuilder::new()
-            .user_agent(USER_AGENT)
+            .user_agent(ua)
             .timeout(timeout)
             .connect_timeout(self.connect_timeout)
             .pool_idle_timeout(self.pool_idle_timeout)

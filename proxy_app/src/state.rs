@@ -42,17 +42,24 @@ impl AppState {
         if let Some(raw) = cfg.selection_strategy.as_deref()
             && let Some(strategy) = SelectionStrategy::parse(raw)
         {
-            tracing::info!(strategy = raw, "applying default credential selection strategy");
+            tracing::info!(
+                strategy = raw,
+                "applying default credential selection strategy"
+            );
             creds.set_default_strategy(strategy);
         } else if let Some(raw) = cfg.selection_strategy.as_deref() {
-            tracing::warn!(value = raw, "ignoring unrecognized PROXY_SELECTION_STRATEGY");
+            tracing::warn!(
+                value = raw,
+                "ignoring unrecognized PROXY_SELECTION_STRATEGY"
+            );
         }
         let pool = HttpClientPool::with_timeouts(
             cfg.timeout_read_non_streaming_secs,
             cfg.timeout_read_streaming_secs,
         )
         .with_connect_timeout(Duration::from_secs(cfg.connect_timeout_secs))
-        .with_http2_enabled(cfg.http2_enabled);
+        .with_http2_enabled(cfg.http2_enabled)
+        .with_user_agent(cfg.user_agent.clone());
         let mut registry = ProviderRegistry::new();
         registry.load_from_env();
         let registry = Arc::new(registry);

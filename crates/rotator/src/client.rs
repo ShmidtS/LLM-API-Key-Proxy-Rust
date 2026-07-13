@@ -140,10 +140,15 @@ impl RotatorClient {
     ) -> std::result::Result<reqwest::Response, reqwest::Error> {
         let mut stale_attempt: u32 = 0;
         loop {
-            let request = self
+            let mut request = self
                 .apply_auth_headers(provider, client.post(url), token)
                 .header(reqwest::header::CONTENT_TYPE, content_type)
                 .body(reqwest::Body::from(body.clone()));
+            if !self.http_pool.has_custom_user_agent() {
+                if let Ok(ua) = crate::FORWARDED_USER_AGENT.try_get() {
+                    request = request.header(reqwest::header::USER_AGENT, ua.as_str());
+                }
+            }
             match request.send().await {
                 Ok(resp) => return Ok(resp),
                 Err(err) => {
@@ -227,13 +232,11 @@ impl RotatorClient {
                 return Err(RotatorError::CircuitOpen(provider.to_string()));
             }
 
-            let cred = self
-                .credentials
-                .acquire_where(provider, |key| {
-                    self.cooldown.is_available(provider, key)
-                        && (key_count <= 1 || Some(key) != last_key.as_deref())
-                        && !tried_412_keys.iter().any(|k| k.as_str() == key)
-                });
+            let cred = self.credentials.acquire_where(provider, |key| {
+                self.cooldown.is_available(provider, key)
+                    && (key_count <= 1 || Some(key) != last_key.as_deref())
+                    && !tried_412_keys.iter().any(|k| k.as_str() == key)
+            });
             let cred = match cred {
                 Some(cred) => cred,
                 None => {
@@ -684,13 +687,11 @@ impl RotatorClient {
                 return Err(RotatorError::CircuitOpen(provider.to_string()));
             }
 
-            let cred = self
-                .credentials
-                .acquire_where(provider, |key| {
-                    self.cooldown.is_available(provider, key)
-                        && (key_count <= 1 || Some(key) != last_key.as_deref())
-                        && !tried_412_keys.iter().any(|k| k.as_str() == key)
-                });
+            let cred = self.credentials.acquire_where(provider, |key| {
+                self.cooldown.is_available(provider, key)
+                    && (key_count <= 1 || Some(key) != last_key.as_deref())
+                    && !tried_412_keys.iter().any(|k| k.as_str() == key)
+            });
             let cred = match cred {
                 Some(cred) => cred,
                 None => {
@@ -747,7 +748,14 @@ impl RotatorClient {
             let token = self.resolve_auth_token(provider, permit.key()).await?;
             let started_at = Instant::now();
             let result = self
-                .dispatch_with_stale_retry(provider, &client, &url, &token, body.clone(), content_type)
+                .dispatch_with_stale_retry(
+                    provider,
+                    &client,
+                    &url,
+                    &token,
+                    body.clone(),
+                    content_type,
+                )
                 .await;
             self.last_latency_ms
                 .insert(provider.to_owned(), started_at.elapsed().as_millis() as u64);

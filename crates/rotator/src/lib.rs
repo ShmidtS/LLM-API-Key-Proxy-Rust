@@ -37,7 +37,6 @@ pub use cooldown::{CooldownEntry, CooldownManager};
 pub use costs::estimate_cost;
 pub use credential_store::{export_credentials, import_credentials};
 pub use credentials::{CredentialManager, CredentialPermit, SelectionStrategy};
-pub use stale_retry::is_stale_connection_error;
 pub use dynamic_provider::{DynamicProviderConfig, DynamicProviderEnvNames};
 pub use error::{Result, RotatorError};
 pub use error_journal::{
@@ -72,7 +71,15 @@ pub use rate_limiter::{
     TokenBucket,
 };
 pub use request_sanitizer::{SanitizerAction, SanitizerContext, SanitizerRule, sanitize_request};
+pub use stale_retry::is_stale_connection_error;
 pub use throttle::{ThrottleReason, classify_throttle};
 pub use token_calculator::{TokenCalculator, calculate_max_tokens};
 pub use transaction_log::{TokenUsage, TransactionLog, TransactionLogger, credential_hash_prefix};
 pub use usage::{UsageEntry, UsageManager};
+
+tokio::task_local! {
+    /// When set, this client User-Agent is forwarded to the upstream provider
+    /// instead of the pool's default. Set by proxy middleware from the incoming
+    /// request's `User-Agent` header.
+    pub static FORWARDED_USER_AGENT: String;
+}

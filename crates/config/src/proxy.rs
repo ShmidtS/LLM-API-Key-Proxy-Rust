@@ -212,6 +212,8 @@ pub struct ProxyConfig {
     pub max_stale_connection_retries: u32,
     #[serde(default, deserialize_with = "deserialize_optional_string")]
     pub selection_strategy: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    pub user_agent: Option<String>,
     #[serde(default)]
     pub guardrails: GuardrailsProxyConfig,
     #[serde(default)]
@@ -259,6 +261,7 @@ impl Default for ProxyConfig {
             http_dns_resolver: default_http_dns_resolver(),
             max_stale_connection_retries: default_max_stale_connection_retries(),
             selection_strategy: None,
+            user_agent: None,
             guardrails: GuardrailsProxyConfig::default(),
             adaptive_rate_limiter: AdaptiveRateLimiterConfig::default(),
             image_only_models: None,

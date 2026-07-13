@@ -156,6 +156,7 @@ pub fn build_app_with_state(app_state: state::AppState) -> Router {
             .compress_when(DefaultPredicate::new().and(NotForContentType::SSE)),
     )
     .layer(from_fn(middleware::add_request_id))
+    .layer(from_fn(middleware::forward_user_agent))
     .layer(RequestBodyLimitLayer::new(config.max_body_bytes))
     .layer(from_fn_with_state(
         app_state.clone(),

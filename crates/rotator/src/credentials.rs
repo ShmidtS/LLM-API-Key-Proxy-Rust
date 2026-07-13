@@ -442,9 +442,7 @@ impl CredentialManager {
                     // so rotation stays balanced when earlier keys were skipped.
                     // Best-effort under concurrency (Relaxed); weighted-random
                     // ignores the cursor entirely.
-                    if !random_start
-                        && let Some(cursor) = self.rr_counters.get(provider)
-                    {
+                    if !random_start && let Some(cursor) = self.rr_counters.get(provider) {
                         cursor.store((idx + 1) % n, Ordering::Relaxed);
                     }
                     return Some(entry.clone());
@@ -558,7 +556,10 @@ mod tests {
             SelectionStrategy::parse("weighted-random"),
             Some(SelectionStrategy::WeightedRandom)
         );
-        assert_eq!(SelectionStrategy::parse("random"), Some(SelectionStrategy::WeightedRandom));
+        assert_eq!(
+            SelectionStrategy::parse("random"),
+            Some(SelectionStrategy::WeightedRandom)
+        );
         assert_eq!(SelectionStrategy::parse("nope"), None);
     }
 
@@ -584,7 +585,11 @@ mod tests {
         let manager = CredentialManager::new();
         manager.register_keys(
             "openai".to_string(),
-            vec!["key-0".to_string(), "key-1".to_string(), "key-2".to_string()],
+            vec![
+                "key-0".to_string(),
+                "key-1".to_string(),
+                "key-2".to_string(),
+            ],
             50,
         );
         manager.set_default_strategy(SelectionStrategy::RoundRobin);
@@ -606,7 +611,11 @@ mod tests {
         let manager = CredentialManager::new();
         manager.register_keys(
             "openai".to_string(),
-            vec!["key-0".to_string(), "key-1".to_string(), "key-2".to_string()],
+            vec![
+                "key-0".to_string(),
+                "key-1".to_string(),
+                "key-2".to_string(),
+            ],
             50,
         );
         manager.set_default_strategy(SelectionStrategy::RoundRobin);
@@ -629,7 +638,11 @@ mod tests {
         let manager = CredentialManager::new();
         manager.register_keys(
             "openai".to_string(),
-            vec!["key-0".to_string(), "key-1".to_string(), "key-2".to_string()],
+            vec![
+                "key-0".to_string(),
+                "key-1".to_string(),
+                "key-2".to_string(),
+            ],
             50,
         );
         manager.set_default_strategy(SelectionStrategy::WeightedRandom);
@@ -667,7 +680,10 @@ mod tests {
         manager.set_default_strategy(SelectionStrategy::RoundRobin);
         manager.set_strategy("openai", SelectionStrategy::WeightedRandom);
 
-        assert_eq!(manager.strategy("openai"), SelectionStrategy::WeightedRandom);
+        assert_eq!(
+            manager.strategy("openai"),
+            SelectionStrategy::WeightedRandom
+        );
         assert_eq!(manager.strategy("anthropic"), SelectionStrategy::RoundRobin);
     }
 
