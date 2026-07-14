@@ -29,6 +29,7 @@ pub mod token_calculator;
 pub mod tokenizer;
 pub mod transaction_log;
 pub mod usage;
+pub mod zai_quota;
 
 pub use batcher::EmbeddingBatcher;
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerRegistry, CircuitState};
@@ -76,6 +77,10 @@ pub use throttle::{ThrottleReason, classify_throttle};
 pub use token_calculator::{TokenCalculator, calculate_max_tokens};
 pub use transaction_log::{TokenUsage, TransactionLog, TransactionLogger, credential_hash_prefix};
 pub use usage::{UsageEntry, UsageManager};
+pub use zai_quota::{
+    EXHAUSTED_COOLDOWN_CAP, EXHAUSTED_COOLDOWN_FALLBACK, QUOTA_CACHE_TTL, ZaiQuotaCache,
+    ZaiQuotaStatus,
+};
 
 tokio::task_local! {
     /// When set, this client User-Agent is forwarded to the upstream provider

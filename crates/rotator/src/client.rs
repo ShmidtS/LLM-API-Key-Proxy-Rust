@@ -16,6 +16,7 @@ use crate::retry_policy::{
     get_retry_backoff, retry_after_from_headers_and_body,
 };
 use crate::usage::UsageManager;
+use crate::zai_quota::{ZaiQuotaCache, ZaiQuotaStatus};
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -56,6 +57,13 @@ pub struct RotatorClient {
     error_journal: Option<Arc<ErrorJournal>>,
     metrics: Arc<crate::metrics::ProxyMetrics>,
     provider_cache: Arc<DashMap<String, Arc<ProviderDefinition>>>,
+    /// Per-key TTL cache of zai quota verdicts. Probed before dispatch so an
+    /// exhausted key is rotated past instead of surfacing an upstream 429.
+    zai_quota_cache: Arc<ZaiQuotaCache>,
+    /// Dedicated short-timeout client for zai quota probes. Kept separate from
+    /// the upstream pool so a slow monitor endpoint cannot starve inference
+    /// keep-alive slots.
+    quota_probe_client: reqwest::Client,
 }
 
 impl RotatorClient {
@@ -87,6 +95,12 @@ impl RotatorClient {
             error_journal: None,
             metrics: Arc::new(crate::metrics::ProxyMetrics::new()),
             provider_cache: Arc::new(DashMap::new()),
+            zai_quota_cache: Arc::new(ZaiQuotaCache::new()),
+            quota_probe_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .connect_timeout(Duration::from_secs(5))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
@@ -108,6 +122,36 @@ impl RotatorClient {
     pub fn with_max_stale_retries(mut self, max_stale_retries: u32) -> Self {
         self.max_stale_retries = max_stale_retries;
         self
+    }
+
+    /// Blocking zai quota preflight for `key`. Probes the monitor endpoint
+    /// (cached per key for `QUOTA_CACHE_TTL`); if the key is exhausted it is
+    /// placed on cooldown for `EXHAUSTED_COOLDOWN` and `false` is returned so
+    /// the caller rotates to the next key. Non-zai providers short-circuit to
+    /// `true`. Must be awaited *before* dispatching the client request.
+    async fn ensure_zai_key_available(&self, provider: &str, key: &str) -> bool {
+        if provider != "zai" {
+            return true;
+        }
+        let status = crate::zai_quota::cached_quota_status(
+            &self.zai_quota_cache,
+            &self.quota_probe_client,
+            key,
+        )
+        .await;
+        match status {
+            ZaiQuotaStatus::Available { remaining } => {
+                if let Some(remaining) = remaining {
+                    tracing::debug!(target: "zai_quota", key = %crate::transaction_log::credential_hash_prefix(key), remaining, "zai key available");
+                }
+                true
+            }
+            ZaiQuotaStatus::Exhausted { cooldown } => {
+                tracing::info!(target: "zai_quota", key = %crate::transaction_log::credential_hash_prefix(key), cooldown_secs = cooldown.as_secs(), "zai key quota exhausted, cooling down");
+                self.cooldown.add_cooldown(provider, key, cooldown);
+                false
+            }
+        }
     }
 
     pub fn error_journal(&self) -> Option<Arc<ErrorJournal>> {
@@ -144,10 +188,10 @@ impl RotatorClient {
                 .apply_auth_headers(provider, client.post(url), token)
                 .header(reqwest::header::CONTENT_TYPE, content_type)
                 .body(reqwest::Body::from(body.clone()));
-            if !self.http_pool.has_custom_user_agent() {
-                if let Ok(ua) = crate::FORWARDED_USER_AGENT.try_get() {
-                    request = request.header(reqwest::header::USER_AGENT, ua.as_str());
-                }
+            if !self.http_pool.has_custom_user_agent()
+                && let Ok(ua) = crate::FORWARDED_USER_AGENT.try_with(|ua| ua.clone())
+            {
+                request = request.header(reqwest::header::USER_AGENT, ua.as_str());
             }
             match request.send().await {
                 Ok(resp) => return Ok(resp),
@@ -278,6 +322,14 @@ impl RotatorClient {
             // attempt is no longer the current signal — drop it. A subsequent 429/5xx/
             // connection error must not be masked by a stale request-level rejection.
             pending_412 = None;
+            // zai quota preflight (blocking): probe the monitor endpoint before
+            // dispatching the client request. An exhausted key is cooled down and
+            // skipped so rotation advances to the next available key rather than
+            // surfacing an upstream 429. Cached per key to bound probe latency.
+            if !self.ensure_zai_key_available(provider, &cred.key).await {
+                drop(cred);
+                continue;
+            }
             let permit =
                 CredentialPermit::new(self.credentials.clone(), provider, cred.key.clone());
 
@@ -730,6 +782,14 @@ impl RotatorClient {
             // attempt is no longer the current signal — drop it. A subsequent 429/5xx/
             // connection error must not be masked by a stale request-level rejection.
             pending_412 = None;
+            // zai quota preflight (blocking): probe the monitor endpoint before
+            // dispatching the client request. An exhausted key is cooled down and
+            // skipped so rotation advances to the next available key rather than
+            // surfacing an upstream 429. Cached per key to bound probe latency.
+            if !self.ensure_zai_key_available(provider, &cred.key).await {
+                drop(cred);
+                continue;
+            }
             let permit =
                 CredentialPermit::new(self.credentials.clone(), provider, cred.key.clone());
 
