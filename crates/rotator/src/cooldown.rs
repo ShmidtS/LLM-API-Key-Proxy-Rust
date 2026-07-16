@@ -73,6 +73,18 @@ impl CooldownManager {
             .remove(&(provider.to_owned(), key.to_owned()));
     }
 
+    /// Time until the nearest per-key cooldown for `provider` expires.
+    /// `None` when no key of this provider is on cooldown. Used by the request
+    /// loop to wait out a full-cooldown window instead of failing fast.
+    pub fn next_expiry(&self, provider: &str) -> Option<Duration> {
+        let now = Instant::now();
+        self.cooldowns
+            .iter()
+            .filter(|entry| entry.value().provider == provider)
+            .filter_map(|entry| entry.value().expires_at.checked_duration_since(now))
+            .min()
+    }
+
     pub fn cleanup_expired(&self) {
         let now = Instant::now();
         self.cooldowns.retain(|_, entry| entry.expires_at > now);

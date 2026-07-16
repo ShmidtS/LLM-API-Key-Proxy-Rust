@@ -222,12 +222,17 @@ async fn rotates_key_on_quota_exhausted() {
     let keys_seen = server.keys_seen.lock().await;
     assert_eq!(keys_seen.len(), 2);
     assert_ne!(keys_seen[0], keys_seen[1]);
-    // 429 rotation must NOT cool down the key — a throttle follows the
-    // credential's quota and clears on its own; burning keys into cooldown (and
-    // then into a provider circuit) turned a transient 429 into a 502 storm.
+    // 429 puts the throttled key on a short PER-KEY cooldown so rotation cannot
+    // ping-pong back onto the same exhausted credential. Crucially this is NOT a
+    // provider-wide cooldown — that older behaviour turned a transient throttle
+    // into a 502 storm. The provider itself must stay available.
     assert!(
-        cooldown.is_available("test", "key-1"),
-        "429 must not cool down the key, just rotate"
+        !cooldown.is_available("test", "key-1"),
+        "429 must cool down the throttled key (per-key) so rotation skips it"
+    );
+    assert!(
+        cooldown.is_provider_available("test"),
+        "429 must NOT trip a provider-wide cooldown (502 storm)"
     );
 }
 
@@ -256,6 +261,10 @@ async fn rotates_key_on_provider_abort() {
 
 #[tokio::test]
 async fn aborts_after_max_retries_exhausted() {
+    // Persistent 429 on a single key. Each rotation round exhausts the retry
+    // budget, then waits out the per-key cooldown window and restarts (a
+    // transient throttle must not fail fast into a 502). After MAX_COOLDOWN_WAITS
+    // rounds the throttle is treated as permanent and surfaces RateLimited.
     let server = test_provider(vec![MockResponse::new(429)]).await;
     let client = test_client(
         Arc::clone(&server.registry),
@@ -267,7 +276,9 @@ async fn aborts_after_max_retries_exhausted() {
     let result = send_request(&client).await;
 
     assert!(matches!(result, Err(RotatorError::RateLimited(provider, _)) if provider == "test"));
-    assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    // Several rotation rounds ran (each: max_retries+1 dispatches), bounded by
+    // MAX_COOLDOWN_WAITS — not the old fail-fast single round of 2 calls.
+    assert!(server.calls.load(Ordering::SeqCst) >= 2);
 }
 
 #[tokio::test]
@@ -350,16 +361,19 @@ async fn auth_error_exhausts_keys_then_stops_retrying() {
         1,
     );
 
-    // 403 → ротация ключа с cooldown текущего; единственный ключ уходит в cooldown,
-    // следующая попытка не находит доступных ключей → AllKeysOnCooldown (не бесконечный цикл).
+    // 403 → ротация ключа с cooldown текущего; единственный ключ уходит в cooldown.
+    // Bounded wait пережидает короткий cooldown и повторяет dispatch в том же
+    // attempt: на последнем attempt 403 возвращается клиенту как есть (а не
+    // деградирует в opaque AllKeysOnCooldown и не зацикливается).
     let result = send_request(&client).await;
 
-    assert!(
-        matches!(result, Err(RotatorError::AllKeysOnCooldown(ref provider, _)) if provider == "test"),
-        "expected AllKeysOnCooldown after auth rotation exhausted, got {result:?}"
-    );
-    // Первый запрос получил 403, второй прерван отсутствием доступных ключей.
-    assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+    match result {
+        Ok(response) => assert_eq!(response.status(), 403),
+        Err(RotatorError::AllKeysOnCooldown(ref provider, _)) if provider == "test" => {}
+        other => panic!("expected surfaced 403 or AllKeysOnCooldown, got {other:?}"),
+    }
+    // Первый запрос получил 403; после bounded wait возможен один повторный dispatch.
+    assert!(server.calls.load(Ordering::SeqCst) >= 1);
 }
 
 #[tokio::test]

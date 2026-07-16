@@ -365,8 +365,20 @@ fn anthropic_message_to_openai_messages(message: &Value) -> Vec<Value> {
 }
 
 fn anthropic_blocks_to_openai_messages(role: &str, blocks: &[Value]) -> Vec<Value> {
-    if let Some(tool_result) = anthropic_tool_result_message(blocks) {
-        return vec![tool_result];
+    let tool_results = anthropic_tool_result_messages(blocks);
+    if !tool_results.is_empty() {
+        let mut messages = tool_results;
+        // Preserve any non-tool_result content (e.g. text the user typed
+        // alongside tool results) as a follow-up message so it is not lost.
+        let parts = blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) != Some("tool_result"))
+            .filter_map(anthropic_content_block_to_openai_part)
+            .collect::<Vec<_>>();
+        if !parts.is_empty() {
+            messages.push(json!({"role": role, "content": openai_content_from_parts(parts)}));
+        }
+        return messages;
     }
 
     let parts = blocks
@@ -457,26 +469,29 @@ fn anthropic_tool_use_calls(blocks: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-fn anthropic_tool_result_message(blocks: &[Value]) -> Option<Value> {
-    let block = blocks
+fn anthropic_tool_result_messages(blocks: &[Value]) -> Vec<Value> {
+    blocks
         .iter()
-        .find(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))?;
-    let content = match block.get("content").unwrap_or(&Value::Null) {
-        Value::String(text) => text.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join(" "),
-        Value::Null => String::new(),
-        other => other.to_string(),
-    };
-    Some(json!({
-        "role": "tool",
-        "tool_call_id": block.get("tool_use_id").and_then(Value::as_str).unwrap_or_default(),
-        "content": content,
-    }))
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+        .map(|block| {
+            let content = match block.get("content").unwrap_or(&Value::Null) {
+                Value::String(text) => text.clone(),
+                Value::Array(parts) => parts
+                    .iter()
+                    .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            json!({
+                "role": "tool",
+                "tool_call_id": block.get("tool_use_id").and_then(Value::as_str).unwrap_or_default(),
+                "content": content,
+            })
+        })
+        .collect()
 }
 
 fn openai_finish_reason_to_anthropic(reason: Option<&str>) -> Value {
@@ -1165,6 +1180,62 @@ mod tests {
         assert_eq!(
             output[1],
             json!({"role": "tool", "tool_call_id": "toolu_1", "content": "sunny"})
+        );
+    }
+
+    #[test]
+    fn converts_all_parallel_tool_results_to_tool_messages() {
+        // Regression: Claude Code sends parallel tool calls; the user message
+        // then carries one tool_result block per tool_use. Dropping all but the
+        // first made upstream reject the request with
+        // "tool_call_ids did not have response messages: Bash:2".
+        let input = json!([{
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "Bash:1", "name": "Bash", "input": {"command": "ls"}},
+                {"type": "tool_use", "id": "Bash:2", "name": "Bash", "input": {"command": "pwd"}}
+            ]
+        }, {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "Bash:1", "content": [{"type": "text", "text": "file.txt"}]},
+                {"type": "tool_result", "tool_use_id": "Bash:2", "content": [{"type": "text", "text": "/tmp"}]}
+            ]
+        }]);
+
+        let output = anthropic_to_openai_messages(&input);
+
+        assert_eq!(output[0]["role"], "assistant");
+        assert_eq!(output[0]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            output[1],
+            json!({"role": "tool", "tool_call_id": "Bash:1", "content": "file.txt"})
+        );
+        assert_eq!(
+            output[2],
+            json!({"role": "tool", "tool_call_id": "Bash:2", "content": "/tmp"})
+        );
+    }
+
+    #[test]
+    fn keeps_text_blocks_alongside_tool_results() {
+        let input = json!([{
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "Bash:1", "content": [{"type": "text", "text": "ok"}]},
+                {"type": "text", "text": "now continue"}
+            ]
+        }]);
+
+        let output = anthropic_to_openai_messages(&input);
+
+        assert_eq!(
+            output[0],
+            json!({"role": "tool", "tool_call_id": "Bash:1", "content": "ok"})
+        );
+        assert_eq!(
+            output[1],
+            json!({"role": "user", "content": "now continue"})
         );
     }
 

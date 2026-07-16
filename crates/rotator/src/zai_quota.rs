@@ -101,6 +101,13 @@ impl ZaiQuotaCache {
             },
         );
     }
+
+    /// Drop the cached verdict for `key`. Called when upstream signals the
+    /// quota state changed (e.g. a 429 despite a cached "Available"), so the
+    /// next preflight re-probes instead of trusting the stale entry.
+    pub fn invalidate(&self, key: &str) {
+        self.entries.remove(key);
+    }
 }
 
 /// Wire shapes for `GET /api/monitor/usage/quota/limit`.
