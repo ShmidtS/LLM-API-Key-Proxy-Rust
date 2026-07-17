@@ -828,6 +828,27 @@ impl RotatorClient {
                                 .await;
                             continue;
                         }
+                        // Retry budget exhausted on connection errors. A network blip
+                        // is transient — wait out the nearest cooldown window (keys may
+                        // be on per-key cooldown from earlier 429s) and restart the
+                        // rotation round instead of failing fast into a 502.
+                        if cooldown_waits < MAX_COOLDOWN_WAITS
+                            && let Some(wait) = self.cooldown.next_expiry(provider)
+                        {
+                            let wait = wait.min(Duration::from_secs(120));
+                            cooldown_waits += 1;
+                            warn!(
+                                provider,
+                                attempt,
+                                wait_ms = wait.as_millis() as u64,
+                                cooldown_waits,
+                                "connection-error budget exhausted, waiting out cooldown window and retrying"
+                            );
+                            drop(permit);
+                            tokio::time::sleep(wait + Duration::from_millis(50)).await;
+                            restart_rotation = true;
+                            break;
+                        }
                         return Err(RotatorError::Http(sanitized.to_string()));
                     }
                 }
@@ -1302,6 +1323,24 @@ impl RotatorClient {
                             tokio::time::sleep(get_retry_backoff(attempt as u32, 300, 60_000))
                                 .await;
                             continue;
+                        }
+                        // Retry budget exhausted on connection errors (see request()).
+                        if cooldown_waits < MAX_COOLDOWN_WAITS
+                            && let Some(wait) = self.cooldown.next_expiry(provider)
+                        {
+                            let wait = wait.min(Duration::from_secs(120));
+                            cooldown_waits += 1;
+                            warn!(
+                                provider,
+                                attempt,
+                                wait_ms = wait.as_millis() as u64,
+                                cooldown_waits,
+                                "connection-error budget exhausted, waiting out cooldown window and retrying"
+                            );
+                            drop(permit);
+                            tokio::time::sleep(wait + Duration::from_millis(50)).await;
+                            restart_rotation = true;
+                            break;
                         }
                         return Err(RotatorError::Http(sanitized.to_string()));
                     }
