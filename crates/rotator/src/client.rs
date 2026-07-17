@@ -40,7 +40,13 @@ const DEFAULT_MAX_STALE_RETRIES: u32 = 3;
 /// full-cooldown window to lift. Each wait is additionally capped at 120s, so
 /// even a permanently throttled provider surfaces an error within a few
 /// minutes instead of parking the task until the client gives up.
-const MAX_COOLDOWN_WAITS: u32 = 3;
+const MAX_COOLDOWN_WAITS: u32 = 5;
+
+/// zai rate-limits by request frequency (per-minute), not just window quota.
+/// A 429 with no Retry-After on a key the quota probe still calls "Available"
+/// is a rate-limit hit: cool the key for one full rate window so it does not
+/// re-enter rotation too early and catch another 429.
+const ZAI_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct RotatorClient {
@@ -547,17 +553,24 @@ impl RotatorClient {
                         // A 429 contradicts a cached "Available" quota verdict — drop it so
                         // the next zai preflight re-probes instead of trusting stale state.
                         self.zai_quota_cache.invalidate(permit.key());
-                        // Prefer zai's exact reset horizon (nextResetTime) over the clamped
-                        // Retry-After guess: zai's quota window can be days, and only the
-                        // API knows when the key actually recovers. Fall back to the clamp
-                        // for non-zai providers or when the probe has no horizon.
-                        let key_cooldown =
+                        // Determine the per-key cooldown:
+                        // - zai + no Retry-After: a rate-limit hit (the quota probe would
+                        //   still say "Available" — probing only wastes an HTTP round-trip).
+                        //   Cool for one full rate window so the key does not re-enter too
+                        //   early and catch another 429.
+                        // - zai + Retry-After present: probe for the exact nextResetTime
+                        //   (zai's quota window can be days; only the API knows the horizon).
+                        // - non-zai: clamped Retry-After guess as before.
+                        let key_cooldown = if provider == "zai" && retry_after.is_none() {
+                            ZAI_RATE_LIMIT_COOLDOWN
+                        } else {
                             match self.zai_exact_cooldown_on_429(provider, permit.key()).await {
                                 Some(exact) => exact,
                                 None => retry_after
                                     .unwrap_or(Duration::from_secs(30))
                                     .clamp(Duration::from_secs(5), Duration::from_secs(300)),
-                            };
+                            }
+                        };
                         self.cooldown
                             .add_cooldown(provider, permit.key(), key_cooldown);
                         warn!(
@@ -1034,15 +1047,17 @@ impl RotatorClient {
                         let retry_after =
                             retry_after_from_headers_and_body(&headers, Some(&body_text));
                         self.zai_quota_cache.invalidate(permit.key());
-                        // Prefer zai's exact reset horizon over the clamped guess (see
-                        // the request() branch for the rationale).
-                        let key_cooldown =
+                        // zai rate-limit vs quota cooldown (see request() branch).
+                        let key_cooldown = if provider == "zai" && retry_after.is_none() {
+                            ZAI_RATE_LIMIT_COOLDOWN
+                        } else {
                             match self.zai_exact_cooldown_on_429(provider, permit.key()).await {
                                 Some(exact) => exact,
                                 None => retry_after
                                     .unwrap_or(Duration::from_secs(30))
                                     .clamp(Duration::from_secs(5), Duration::from_secs(300)),
-                            };
+                            }
+                        };
                         self.cooldown
                             .add_cooldown(provider, permit.key(), key_cooldown);
                         warn!(
