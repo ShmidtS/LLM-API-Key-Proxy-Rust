@@ -46,6 +46,13 @@ impl ResponseIdFactory {
     }
 
     pub fn function_call_id(&self, tool_call_id: &str) -> String {
+        Self::ensure_fc_prefix(tool_call_id)
+    }
+
+    /// Ensure a tool-call id meets OpenAI's Responses-API requirement: the `id`
+    /// field of a `function_call` input/output item must begin with `fc_`.
+    /// Clients (e.g. Roo Code) send ids like `search_files_101` — prefix them.
+    pub fn ensure_fc_prefix(tool_call_id: &str) -> String {
         if tool_call_id.starts_with("fc_") {
             tool_call_id.to_owned()
         } else {

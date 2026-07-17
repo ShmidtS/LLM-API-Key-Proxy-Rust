@@ -40,13 +40,20 @@ const DEFAULT_MAX_STALE_RETRIES: u32 = 3;
 /// full-cooldown window to lift. Each wait is additionally capped at 120s, so
 /// even a permanently throttled provider surfaces an error within a few
 /// minutes instead of parking the task until the client gives up.
-const MAX_COOLDOWN_WAITS: u32 = 5;
+const MAX_COOLDOWN_WAITS: u32 = 3;
 
 /// zai rate-limits by request frequency (per-minute), not just window quota.
 /// A 429 with no Retry-After on a key the quota probe still calls "Available"
 /// is a rate-limit hit: cool the key for one full rate window so it does not
 /// re-enter rotation too early and catch another 429.
 const ZAI_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// When every key of a provider is on cooldown and the nearest expiry is
+/// longer than this, do not bother waiting — surface the error so the client
+/// can fall back to another provider. zai's per-minute rate window is 60s, so
+/// a wait longer than that is likely to exceed the client timeout (opencode
+/// ~120-180s) without helping.
+const MAX_USEFUL_WAIT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone)]
 pub struct RotatorClient {
@@ -376,7 +383,7 @@ impl RotatorClient {
                     // Bounded: at most a few waits per request, each capped.
                     let waited = if cooldown_waits < MAX_COOLDOWN_WAITS {
                         self.cooldown.next_expiry(provider).map(|wait| {
-                            let wait = wait.min(Duration::from_secs(120));
+                            let wait = wait.min(MAX_USEFUL_WAIT);
                             cooldown_waits += 1;
                             warn!(
                                 provider,
@@ -600,7 +607,7 @@ impl RotatorClient {
                         if cooldown_waits < MAX_COOLDOWN_WAITS
                             && let Some(wait) = self.cooldown.next_expiry(provider)
                         {
-                            let wait = wait.min(Duration::from_secs(120));
+                            let wait = wait.min(MAX_USEFUL_WAIT);
                             cooldown_waits += 1;
                             warn!(
                                 provider,
@@ -835,7 +842,7 @@ impl RotatorClient {
                         if cooldown_waits < MAX_COOLDOWN_WAITS
                             && let Some(wait) = self.cooldown.next_expiry(provider)
                         {
-                            let wait = wait.min(Duration::from_secs(120));
+                            let wait = wait.min(MAX_USEFUL_WAIT);
                             cooldown_waits += 1;
                             warn!(
                                 provider,
@@ -977,7 +984,7 @@ impl RotatorClient {
                     // far longer than the cooldown window. Bounded per request.
                     let waited = if cooldown_waits < MAX_COOLDOWN_WAITS {
                         self.cooldown.next_expiry(provider).map(|wait| {
-                            let wait = wait.min(Duration::from_secs(120));
+                            let wait = wait.min(MAX_USEFUL_WAIT);
                             cooldown_waits += 1;
                             warn!(
                                 provider,
@@ -1102,7 +1109,7 @@ impl RotatorClient {
                         if cooldown_waits < MAX_COOLDOWN_WAITS
                             && let Some(wait) = self.cooldown.next_expiry(provider)
                         {
-                            let wait = wait.min(Duration::from_secs(120));
+                            let wait = wait.min(MAX_USEFUL_WAIT);
                             cooldown_waits += 1;
                             warn!(
                                 provider,
@@ -1328,7 +1335,7 @@ impl RotatorClient {
                         if cooldown_waits < MAX_COOLDOWN_WAITS
                             && let Some(wait) = self.cooldown.next_expiry(provider)
                         {
-                            let wait = wait.min(Duration::from_secs(120));
+                            let wait = wait.min(MAX_USEFUL_WAIT);
                             cooldown_waits += 1;
                             warn!(
                                 provider,

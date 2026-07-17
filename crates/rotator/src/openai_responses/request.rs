@@ -9,6 +9,7 @@ use models::responses::{
 use serde_json::Value;
 
 use super::error::Result;
+use super::id::ResponseIdFactory;
 use super::input::response_input_item_to_chat_message;
 use super::tools::{
     response_text_config_to_chat_response_format, response_tool_choice_to_chat_tool_choice,
@@ -97,9 +98,10 @@ pub fn chat_request_to_responses_request(
                     });
                 }
                 for tool_call in tool_calls {
+                    let fc_id = ResponseIdFactory::ensure_fc_prefix(&tool_call.id);
                     input.push(ResponseInputItem::FunctionCall {
-                        id: tool_call.id.clone(),
-                        call_id: tool_call.id.clone(),
+                        id: fc_id.clone(),
+                        call_id: fc_id,
                         name: tool_call.function.name.clone(),
                         arguments: tool_call.function.arguments.clone(),
                         type_: "function_call".to_owned(),
@@ -109,7 +111,9 @@ pub fn chat_request_to_responses_request(
             "tool" => {
                 let text = response_input_content_to_text(&content);
                 input.push(ResponseInputItem::FunctionCallOutput {
-                    call_id: message.tool_call_id.clone().unwrap_or_default(),
+                    call_id: ResponseIdFactory::ensure_fc_prefix(
+                        &message.tool_call_id.clone().unwrap_or_default(),
+                    ),
                     output: text,
                     type_: "function_call_output".to_owned(),
                 });
