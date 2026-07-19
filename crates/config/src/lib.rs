@@ -27,6 +27,9 @@ pub fn load_from_env() -> Result<proxy::ProxyConfig, ConfigError> {
         let loaded = dotenvy::from_path(&path);
         if loaded.is_ok() {
             tracing::info!(path = %path.display(), "loaded .env file");
+        } else if let Err(err) = &loaded {
+            tracing::warn!(path = %path.display(), error = %err, "dotenvy failed to parse .env; falling back to manual loader");
+            load_env_file_lenient(&path);
         }
     }
 
@@ -110,6 +113,50 @@ pub fn load_from_env() -> Result<proxy::ProxyConfig, ConfigError> {
     )?;
 
     Ok(config)
+}
+
+/// Lenient `.env` loader used as a fallback when `dotenvy` rejects the file
+/// (e.g. unquoted values containing spaces like `USER_AGENT=codex_cli_rs/0.1 (Win x86_64)`).
+///
+/// Mirrors `dotenvy` semantics for the subset we actually need:
+/// - `KEY=VALUE` (VALUE may contain `=`, spaces, and any other char)
+/// - `#` starts a comment only at line start (after optional whitespace)
+/// - surrounding quotes (`"` or `'`) are stripped
+/// - empty values are kept (override semantics same as `from_path_override`)
+/// - lines that don't match `KEY=VALUE` are skipped silently
+///
+/// This is deliberately permissive — a single malformed line must not block
+/// the whole registry from loading credentials and provider URLs.
+fn load_env_file_lenient(path: &Path) {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for raw in contents.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, mut value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || key.contains(char::is_whitespace) {
+            continue;
+        }
+        value = value.trim();
+        if (value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\''))
+        {
+            value = &value[1..value.len() - 1];
+        }
+        // Override semantics: always set, even if already present in std::env.
+        // SAFETY: env::set_var is process-wide; called only during startup
+        // before any concurrent access. Mirrors dotenvy::from_path_override.
+        #[allow(unsafe_code)]
+        unsafe {
+            env::set_var(key, value);
+        }
+    }
 }
 
 pub fn find_env_file() -> Option<PathBuf> {
@@ -196,7 +243,7 @@ fn apply_vec_env(key: &str, target: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::load_from_env;
+    use super::{load_env_file_lenient, load_from_env};
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -270,5 +317,52 @@ mod tests {
             std::env::remove_var("PROXY__GUARDRAILS__CHAT__VALIDATE_TOOLS");
             std::env::remove_var("PROXY__GUARDRAILS__CONTEXT_COMPACTION__COMPACT_ABOVE_RATIO");
         }
+    }
+
+    #[test]
+    fn load_env_file_lenient_parses_unquoted_spaces_and_skips_bad_lines() {
+        let dir = std::env::temp_dir().join("config_lenient_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
+        std::fs::write(
+            &path,
+            // Mirrors the real-world .env that broke dotenvy:
+            // - unquoted value with spaces and parens (USER_AGENT)
+            // - a value containing `=`
+            // - quoted value
+            // - comment-only line
+            // - malformed line (no `=`) that must be skipped
+            "# comment line\n\
+             USER_AGENT=codex_cli_rs/0.144.3 ai-sdk/4.0.23 (Windows 11; x86_64)\n\
+             BAIDU_API_BASE=https://qianfan.baidubce.com/v2\n\
+             FOO=bar=baz\n\
+             QUOTED=\"hello world\"\n\
+             malformed line without equals\n\
+             EMPTY=\n",
+        )
+        .unwrap();
+
+        load_env_file_lenient(&path);
+
+        assert_eq!(
+            std::env::var("USER_AGENT").unwrap(),
+            "codex_cli_rs/0.144.3 ai-sdk/4.0.23 (Windows 11; x86_64)"
+        );
+        assert_eq!(
+            std::env::var("BAIDU_API_BASE").unwrap(),
+            "https://qianfan.baidubce.com/v2"
+        );
+        assert_eq!(std::env::var("FOO").unwrap(), "bar=baz");
+        assert_eq!(std::env::var("QUOTED").unwrap(), "hello world");
+        assert_eq!(std::env::var("EMPTY").unwrap(), "");
+
+        unsafe {
+            std::env::remove_var("USER_AGENT");
+            std::env::remove_var("BAIDU_API_BASE");
+            std::env::remove_var("FOO");
+            std::env::remove_var("QUOTED");
+            std::env::remove_var("EMPTY");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

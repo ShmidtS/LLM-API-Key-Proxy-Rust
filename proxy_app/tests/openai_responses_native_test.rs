@@ -269,8 +269,8 @@ async fn chat_openai_gpt5_converts_tool_calls_and_outputs() {
         json!([
             {"type": "message", "role": "user", "content": "weather"},
             {"type": "message", "role": "assistant", "content": "checking"},
-            {"type": "function_call", "id": "call_1", "call_id": "call_1", "name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
-            {"type": "function_call_output", "call_id": "call_1", "output": "sunny"}
+            {"type": "function_call", "id": "fc_call_1", "call_id": "fc_call_1", "name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+            {"type": "function_call_output", "call_id": "fc_call_1", "output": "sunny"}
         ])
     );
     assert_eq!(upstream_json["tools"][0]["type"], "function");
