@@ -62,14 +62,15 @@ pub fn normalize_model_in_body(body: &mut Value, provider: &str) {
         return;
     };
     let normalized = strip_provider_prefix(model, provider);
-    if provider != "openai" && normalized != model {
+    if normalized != model {
         body["model"] = Value::String(normalized);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::strip_provider_prefix;
+    use super::{normalize_model_in_body, strip_provider_prefix};
+    use serde_json::json;
 
     #[test]
     fn strip_provider_prefix_removes_matching_provider_prefix() {
@@ -88,5 +89,33 @@ mod tests {
             strip_provider_prefix("anthropic/claude-3-5-sonnet", "openai"),
             "anthropic/claude-3-5-sonnet"
         );
+    }
+
+    #[test]
+    fn normalize_model_in_body_strips_openai_prefix_for_openai_provider() {
+        let mut body = json!({"model": "openai/gpt-4o", "messages": []});
+        normalize_model_in_body(&mut body, "openai");
+        assert_eq!(body["model"], "gpt-4o");
+    }
+
+    #[test]
+    fn normalize_model_in_body_keeps_bare_openai_model() {
+        let mut body = json!({"model": "gpt-4o", "messages": []});
+        normalize_model_in_body(&mut body, "openai");
+        assert_eq!(body["model"], "gpt-4o");
+    }
+
+    #[test]
+    fn normalize_model_in_body_strips_provider_prefix_for_non_openai_provider() {
+        let mut body = json!({"model": "anthropic/claude-3-5-sonnet", "messages": []});
+        normalize_model_in_body(&mut body, "anthropic");
+        assert_eq!(body["model"], "claude-3-5-sonnet");
+    }
+
+    #[test]
+    fn normalize_model_in_body_leaves_non_matching_prefix_intact() {
+        let mut body = json!({"model": "anthropic/claude-3-5-sonnet", "messages": []});
+        normalize_model_in_body(&mut body, "openai");
+        assert_eq!(body["model"], "anthropic/claude-3-5-sonnet");
     }
 }
