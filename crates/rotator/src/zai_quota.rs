@@ -46,6 +46,10 @@ const RESET_MARGIN: Duration = Duration::from_secs(60);
 /// budget, not the token limits on units 3/6).
 const WINDOW_LIMIT_UNIT: i64 = 5;
 
+/// `TOKENS_LIMIT` unit for the weekly/monthly token budget. At `percentage`
+/// 100 the key is exhausted and zai answers with a `1310` 429.
+const TOKEN_LIMIT_UNIT: i64 = 6;
+
 /// Remaining-quota verdict for a single zai key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZaiQuotaStatus {
@@ -137,6 +141,11 @@ struct QuotaLimit {
     usage: Option<i64>,
     #[serde(default, rename = "currentValue")]
     current_value: Option<i64>,
+    /// Percentage of the window budget consumed (0-100). A `TOKENS_LIMIT`
+    /// at 100 means the token budget is exhausted — the real cause of zai's
+    /// `1310` (Weekly/Monthly Limit Exhausted) 429s.
+    #[serde(default)]
+    percentage: Option<i64>,
     /// Epoch milliseconds at which the window resets.
     #[serde(default, rename = "nextResetTime")]
     next_reset_time: Option<i64>,
@@ -171,6 +180,18 @@ fn epoch_ms_now() -> i64 {
 /// flaky monitor endpoint must not take a working key out of rotation. Only
 /// an explicit API signal (`code != 200` or window remaining <= 0) marks a
 /// key exhausted, with the cooldown set to the API's `nextResetTime`.
+///
+/// zai reports two independent budgets in `limits`:
+/// - `TIME_LIMIT unit=5` — the per-window request budget (the historical
+///   signal this module watched).
+/// - `TOKENS_LIMIT unit=6` — the weekly/monthly token budget. When its
+///   `percentage` reaches 100 the key is exhausted and zai answers chat
+///   requests with a `1310` (Weekly/Monthly Limit Exhausted) 429. This is
+///   **not** visible in the `TIME_LIMIT` entry (which still reports
+///   headroom), so a key that only tripped the token budget would otherwise
+///   be treated as available and re-enter rotation to catch another 429.
+///   We therefore treat a `TOKENS_LIMIT unit=6` at `percentage >= 100` as
+///   exhausted, cooling down until its `nextResetTime`.
 pub async fn check_quota(client: &reqwest::Client, key: &str) -> ZaiQuotaStatus {
     let response = match client
         .get(QUOTA_ENDPOINT)
@@ -204,6 +225,23 @@ pub async fn check_quota(client: &reqwest::Client, key: &str) -> ZaiQuotaStatus 
     let Some(data) = parsed.data else {
         return ZaiQuotaStatus::Available { remaining: None };
     };
+
+    // The weekly/monthly token budget (`TOKENS_LIMIT unit=6`) is the real
+    // cause of zai's `1310` (Weekly/Monthly Limit Exhausted) 429s. When its
+    // `percentage` reaches 100 the key is exhausted even though the
+    // `TIME_LIMIT unit=5` entry still reports headroom — so check it first
+    // and cool down until its `nextResetTime`.
+    for limit in &data.limits {
+        if limit.kind == "TOKENS_LIMIT"
+            && limit.unit == TOKEN_LIMIT_UNIT
+            && limit.percentage.is_some_and(|p| p >= 100)
+        {
+            tracing::info!(target: "zai_quota", "zai token budget exhausted, cooling down until reset");
+            return ZaiQuotaStatus::Exhausted {
+                cooldown: cooldown_until_reset(limit.next_reset_time),
+            };
+        }
+    }
 
     for limit in data.limits {
         if limit.kind == "TIME_LIMIT" && limit.unit == WINDOW_LIMIT_UNIT {
@@ -259,6 +297,16 @@ mod tests {
         let Some(data) = parsed.data else {
             return ZaiQuotaStatus::Available { remaining: None };
         };
+        for limit in &data.limits {
+            if limit.kind == "TOKENS_LIMIT"
+                && limit.unit == TOKEN_LIMIT_UNIT
+                && limit.percentage.is_some_and(|p| p >= 100)
+            {
+                return ZaiQuotaStatus::Exhausted {
+                    cooldown: cooldown_until_reset(limit.next_reset_time),
+                };
+            }
+        }
         for limit in data.limits {
             if limit.kind == "TIME_LIMIT" && limit.unit == WINDOW_LIMIT_UNIT {
                 let remaining =
@@ -377,6 +425,50 @@ mod tests {
                 cooldown: EXHAUSTED_COOLDOWN_FALLBACK
             }
         );
+    }
+
+    #[test]
+    fn token_budget_exhausted_marks_exhausted() {
+        // Real 1310 shape: TOKENS_LIMIT unit=6 at percentage 100 (exhausted),
+        // while TIME_LIMIT unit=5 still reports headroom. The key must be
+        // cooled down until the token budget's nextResetTime.
+        let reset = epoch_ms_now() + 3_600_000;
+        let status = parse(
+            200,
+            json!([
+                { "type": "TOKENS_LIMIT", "unit": 3, "number": 5, "percentage": 0 },
+                { "type": "TOKENS_LIMIT", "unit": 6, "number": 1, "percentage": 100,
+                  "nextResetTime": reset },
+                { "type": "TIME_LIMIT", "unit": 5, "number": 1, "usage": 1000,
+                  "currentValue": 0, "remaining": 1000, "percentage": 0,
+                  "nextResetTime": epoch_ms_now() + 7_200_000 }
+            ]),
+        );
+        assert!(!status.is_available());
+        match status {
+            ZaiQuotaStatus::Exhausted { cooldown } => {
+                // Cooldown tracks the token budget reset, not the TIME_LIMIT one.
+                assert!(cooldown > Duration::from_secs(3500));
+                assert!(cooldown <= EXHAUSTED_COOLDOWN_CAP);
+            }
+            _ => panic!("expected exhausted"),
+        }
+    }
+
+    #[test]
+    fn token_budget_below_100_stays_available() {
+        // TOKENS_LIMIT unit=6 below 100 must not mark the key exhausted.
+        let status = parse(
+            200,
+            json!([
+                { "type": "TOKENS_LIMIT", "unit": 6, "number": 1, "percentage": 68,
+                  "nextResetTime": epoch_ms_now() + 3_600_000 },
+                { "type": "TIME_LIMIT", "unit": 5, "number": 1, "usage": 4000,
+                  "currentValue": 0, "remaining": 4000, "percentage": 0,
+                  "nextResetTime": epoch_ms_now() + 7_200_000 }
+            ]),
+        );
+        assert!(status.is_available());
     }
 
     #[test]
