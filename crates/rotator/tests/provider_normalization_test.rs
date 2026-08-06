@@ -3,8 +3,9 @@ use rotator::{normalize_model_ref, normalize_provider_id, public_model_id, strip
 #[test]
 fn normalizes_provider_aliases_to_canonical_ids() {
     assert_eq!(normalize_provider_id("nano-gpt"), "nanogpt");
-    assert_eq!(normalize_provider_id("together"), "together_ai");
-    assert_eq!(normalize_provider_id("together_ai"), "together_ai");
+    assert_eq!(normalize_provider_id("together"), "together");
+    assert_eq!(normalize_provider_id("together_ai"), "together");
+    assert_eq!(normalize_provider_id("together-ai"), "together");
 }
 
 #[test]

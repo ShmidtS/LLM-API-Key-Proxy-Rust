@@ -18,8 +18,8 @@ pub const PROVIDER_ALIASES: &[ProviderAlias] = &[
         aliases: &["nano-gpt"],
     },
     ProviderAlias {
-        canonical: "together_ai",
-        aliases: &["together", "together-ai"],
+        canonical: "together",
+        aliases: &["together_ai", "together-ai"],
     },
 ];
 
