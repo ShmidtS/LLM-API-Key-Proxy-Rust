@@ -508,9 +508,37 @@ impl OpenAiToAnthropicStreamTranslator {
             )));
         }
 
+        let mut emitted_tool_calls = false;
         if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for tool_call in tool_calls {
                 self.translate_tool_call_delta(tool_call, &mut events);
+            }
+            emitted_tool_calls = !tool_calls.is_empty();
+        }
+
+        // Fallback: some OpenAI-compatible providers buffer tool calls and emit
+        // them in the final chunk's `message.tool_calls` (non-delta) instead of
+        // streaming `delta.tool_calls`. Without this branch the translated stream
+        // surfaces `finish_reason=tool_calls` as `stop_reason=tool_use` with no
+        // `tool_use` content block, so the client ends the turn with nothing to
+        // execute and stalls waiting for the user to nudge it.
+        if !emitted_tool_calls
+            && let Some(tool_calls) = chunk
+                .pointer("/choices/0/message/tool_calls")
+                .and_then(Value::as_array)
+        {
+            tracing::debug!(
+                count = tool_calls.len(),
+                "anthropic_streaming: emitting tool_use blocks from message.tool_calls fallback"
+            );
+            for (position, tool_call) in tool_calls.iter().enumerate() {
+                let mut tool_call = tool_call.clone();
+                // Message-format tool_calls carry no `index`; assign one per
+                // position so multiple calls do not collide on index 0.
+                if tool_call.get("index").is_none() {
+                    tool_call["index"] = Value::from(position as u64);
+                }
+                self.translate_tool_call_delta(&tool_call, &mut events);
             }
         }
 
@@ -1023,6 +1051,103 @@ mod tests {
             .collect();
 
         assert_eq!(text, "Hello");
+    }
+
+    #[test]
+    fn emits_tool_use_blocks_from_non_delta_message_tool_calls() {
+        let mut translator = OpenAiToAnthropicStreamTranslator::new("kimi-k3");
+
+        // Provider buffers the tool call into the final chunk's `message` object
+        // (no delta.tool_calls) and signals finish_reason=tool_calls in the same
+        // chunk. The translator must still surface a tool_use block so the client
+        // receives a real tool call instead of a bare tool_use stop_reason.
+        let record = SseRecord {
+            event: None,
+            data: json!({
+                "id": "chatcmpl_1",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "message": {
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "read",
+                                "arguments": "{\"path\":\"/tmp/x\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            })
+            .to_string(),
+        };
+
+        let joined = translator.translate_sse_record_to_sse(&record).join("");
+
+        assert!(
+            joined.contains("\"type\":\"tool_use\""),
+            "expected tool_use block: {joined}"
+        );
+        assert!(
+            joined.contains("\"name\":\"read\""),
+            "expected tool name: {joined}"
+        );
+        assert!(
+            joined.contains("input_json_delta"),
+            "expected arguments delta: {joined}"
+        );
+        assert!(
+            joined.contains("\"stop_reason\":\"tool_use\""),
+            "expected tool_use stop_reason: {joined}"
+        );
+    }
+
+    #[test]
+    fn prefers_delta_tool_calls_over_message_tool_calls() {
+        let mut translator = OpenAiToAnthropicStreamTranslator::new("kimi-k3");
+
+        // Both delta.tool_calls and message.tool_calls present: only the delta
+        // copy must be emitted (no duplicate tool_use blocks).
+        let record = SseRecord {
+            event: None,
+            data: json!({
+                "id": "chatcmpl_2",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": "{}"}
+                        }]
+                    },
+                    "message": {
+                        "tool_calls": [{
+                            "id": "call_dup",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": "{}"}
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            })
+            .to_string(),
+        };
+
+        let joined = translator.translate_sse_record_to_sse(&record).join("");
+
+        let tool_use_starts = joined.matches("\"type\":\"tool_use\"").count();
+        assert_eq!(
+            tool_use_starts, 1,
+            "expected exactly one tool_use block: {joined}"
+        );
+        assert!(
+            !joined.contains("call_dup"),
+            "message fallback must not fire: {joined}"
+        );
     }
 
     #[test]
