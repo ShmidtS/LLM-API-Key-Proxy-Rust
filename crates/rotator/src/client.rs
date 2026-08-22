@@ -308,7 +308,7 @@ impl RotatorClient {
         // throttled keys) waits out the cooldown window and restarts the rotation.
         loop {
             for attempt in 0..=self.max_retries {
-                if !self.circuit_breakers.is_allowed(provider) {
+                if provider != "local" && !self.circuit_breakers.is_allowed(provider) {
                     // Surface a retained request-level rejection (412/422/451) even if a
                     // concurrent failure tripped the provider circuit mid-rotation, instead
                     // of hiding it behind an opaque CircuitOpen.
@@ -474,8 +474,9 @@ impl RotatorClient {
                             .map_err(|e| RotatorError::Http(e.to_string()))?;
                         let body_text = String::from_utf8_lossy(&bytes);
 
-                        if let Err(garbage_err) =
-                            crate::garbage_detection::validate_response(&body_text)
+                        if provider != "local"
+                            && let Err(garbage_err) =
+                                crate::garbage_detection::validate_response(&body_text)
                         {
                             if let Some(ref ej) = self.error_journal {
                                 ej.record_error(
@@ -913,7 +914,7 @@ impl RotatorClient {
         // Outer loop: normally runs once; restarted by a terminal 429 (see request()).
         loop {
             for attempt in 0..=self.max_retries {
-                if !self.circuit_breakers.is_allowed(provider) {
+                if provider != "local" && !self.circuit_breakers.is_allowed(provider) {
                     // Surface a retained request-level rejection (412/422/451) even if a
                     // concurrent failure tripped the provider circuit mid-rotation, instead
                     // of hiding it behind an opaque CircuitOpen.
